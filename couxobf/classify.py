@@ -160,7 +160,9 @@ def classify_module(module: IRModule, config: Config, rng: Rng) -> Classificatio
             reason = f"score {value:.1f}"
 
         proto.virtualization = level
-        proto.vm_family = config.vm_family.value if level > 0 else None
+        proto.vm_family = (
+            getattr(config.vm_family, "value", config.vm_family)
+            if level > 0 else None)
         result.levels[proto.proto_id] = level
         result.families[proto.proto_id] = proto.vm_family
         result.decisions.append(

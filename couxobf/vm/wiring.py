@@ -27,6 +27,7 @@ from ..ir import FuncIR
 from ..names import make_name_generator
 from ..rng import Rng
 from . import encode, runtime
+from .families import FAMILIES
 from .isa import OpcodeMap
 
 #: ``lower_back`` owns these; the interpreter calls them rather than shipping
@@ -51,6 +52,8 @@ class VMPlan:
     protos: Set[int] = field(default_factory=set)
     #: Name of the table holding the per-prototype descriptors.
     table: str = ""
+    #: Operand discipline -- see :mod:`couxobf.vm.families`.
+    family: str = "register"
 
     def selects(self, proto: FuncIR) -> bool:
         return proto.proto_id in self.protos
@@ -69,21 +72,27 @@ def _fresh_names(rng: Rng, count: int) -> List[str]:
 
 
 def make_plan(rng: Rng, protos: Iterable[int],
-              opmap: Optional[OpcodeMap] = None) -> VMPlan:
+              opmap: Optional[OpcodeMap] = None,
+              family: str = "register") -> VMPlan:
     """Build a :class:`VMPlan` from the build's ``vm`` randomness stream.
 
     ``rng`` should be the domain-separated stream for VM generation, not the
     identifier stream: reusing a stream across unrelated purposes is what makes
     two builds' differences correlate in ways an analyst can exploit.
     """
-    (code_name, exec_name, enter_name, call_name,
-     getfenv_name, table_name) = _fresh_names(rng, 6)
+    fresh = _fresh_names(rng, 9)
+    (code_name, exec_name, enter_name, call_name, getfenv_name, table_name,
+     acc_name, stack_name, sp_name) = fresh
     names = {
         "code": code_name,
         "exec": exec_name,
         "enter": enter_name,
         "call": call_name,
         "getfenv": getfenv_name,
+        # the accumulator/stack locals the non-register families use
+        "acc": acc_name,
+        "stack": stack_name,
+        "sp": sp_name,
         # shared with lower_back -- see the module docstring
         "append": _SHARED[0],
         "iter": _SHARED[1],
@@ -93,7 +102,8 @@ def make_plan(rng: Rng, protos: Iterable[int],
     return VMPlan(opmap=opmap or OpcodeMap.shuffled(rng),
                   names=names,
                   protos=set(protos),
-                  table=table_name)
+                  table=table_name,
+                  family=_family_name(family))
 
 
 #: Node-count floor per level, keyed on :class:`VirtualizationLevel` so the
@@ -135,6 +145,15 @@ def select_protos(module, level: Any = VirtualizationLevel.HEAVY) -> Set[int]:
     return chosen
 
 
+def _family_name(value: Any) -> str:
+    """Normalise a family, which may arrive as a ``VMFamily`` enum."""
+    name = getattr(value, "value", value)
+    key = str(name).strip().lower()
+    if key not in FAMILIES:
+        raise ValueError(f"unknown VM family {value!r}; expected one of {FAMILIES}")
+    return key
+
+
 def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
                    const_expr: Callable[[Any], str],
                    code_expr: Callable[[bytes], str]) -> str:
@@ -146,7 +165,7 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
     path can pass literal emitters and the protected one can pass pool reads --
     the same bytecode, protected or not.
     """
-    parts = [runtime.interpreter_source(plan.opmap, plan.names)]
+    parts = [runtime.interpreter_source(plan.opmap, plan.names, plan.family)]
     rows = []
     for pid in sorted(encoded):
         enc = encoded[pid]

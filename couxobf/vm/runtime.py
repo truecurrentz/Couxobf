@@ -17,20 +17,30 @@ chain differs between builds.  The chain is generated, never transcribed.
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from ..ir import OP
+from .families import Family, family as _family, substitute
 from .isa import OP_GETTABLEK, OP_SETTABLEK, OpcodeMap
 
 
-def _handler(op: str, n: Dict[str, str]) -> List[str]:
+def _handler(op: str, n: Dict[str, str],
+             fam: Optional[Family] = None) -> List[str]:
     """The Luau body of one opcode handler.
 
     The dispatcher has already stepped past the opcode byte, so operand reads
     start at ``pc`` and every handler advances ``pc`` by its own operand width
     before doing its work.  A handler that jumps only has to overwrite ``pc``
     afterwards.
+
+    ``fam`` is the operand discipline -- see :mod:`couxobf.vm.families`.  Every
+    value-producing handler routes its result through the family rather than
+    assigning to the register file directly, which is what makes the four
+    interpreters actually differ instead of being the same code with different
+    local names.
     """
+    if fam is None:
+        fam = _family("register", n)
     code = n["code"]
     b = lambda at: f"_byte({code}, {at})"
     w = lambda at: f"(_byte({code}, {at}) + _byte({code}, {at} + 1) * 256)"
@@ -38,23 +48,20 @@ def _handler(op: str, n: Dict[str, str]) -> List[str]:
 
     if op == OP.MOV:
         return [f"local a, s = {reg('pc')}, {reg('pc + 1')}",
-                "pc = pc + 2",
-                "R[a] = R[s]"]
+                "pc = pc + 2"] + fam.store("R[a]", "R[s]")
     if op == OP.LOADK:
         # the constant index is read before pc moves: these expressions embed
         # the literal text "pc + 1", so advancing first would read past the
         # instruction.  Every handler keeps its reads ahead of its advance.
         return [f"local a = {reg('pc')}",
                 f"local k = {w('pc + 1')}",
-                "pc = pc + 3",
-                "R[a] = K[k + 1]"]
+                "pc = pc + 3"] + fam.store("R[a]", "K[k + 1]")
     if op == OP.GETGLOBAL:
         # E is the calling function's environment, resolved per call -- see
         # interpreter_source for why it cannot be captured once at load.
         return [f"local a = {reg('pc')}",
                 f"local k = {w('pc + 1')}",
-                "pc = pc + 3",
-                "R[a] = E[K[k + 1]]"]
+                "pc = pc + 3"] + fam.store("R[a]", "E[K[k + 1]]")
     if op == OP.SETGLOBAL:
         return [f"local k = {w('pc')}",
                 f"local v = {reg('pc + 2')}",
@@ -63,14 +70,12 @@ def _handler(op: str, n: Dict[str, str]) -> List[str]:
     if op == OP.GETTABLE:
         # computed key: `t[k]`
         return [f"local a, o, k = {reg('pc')}, {reg('pc + 1')}, {reg('pc + 2')}",
-                "pc = pc + 3",
-                "R[a] = R[o][R[k]]"]
+                "pc = pc + 3"] + fam.store("R[a]", "R[o][R[k]]")
     if op == OP_GETTABLEK:
         # literal key: `t.k`, so the key is a pool constant
         return [f"local a, o = {reg('pc')}, {reg('pc + 1')}",
                 f"local k = {w('pc + 2')}",
-                "pc = pc + 4",
-                "R[a] = R[o][K[k + 1]]"]
+                "pc = pc + 4"] + fam.store("R[a]", "R[o][K[k + 1]]")
     if op == OP.SETTABLE:
         # computed key: `t[k] = v`
         return [f"local o, k, v = {reg('pc')}, {reg('pc + 1')}, {reg('pc + 2')}",
@@ -83,28 +88,27 @@ def _handler(op: str, n: Dict[str, str]) -> List[str]:
                 "pc = pc + 4",
                 "R[o][K[k + 1]] = R[v]"]
     if op == OP.NEWTABLE:
-        return [f"local a = {reg('pc')}", "pc = pc + 1", "R[a] = {}"]
+        return [f"local a = {reg('pc')}",
+                "pc = pc + 1"] + fam.store("R[a]", "{}")
     if op in (OP.ADD, OP.SUB, OP.MUL, OP.DIV, OP.IDIV, OP.MOD, OP.POW, OP.CONCAT):
         symbol = {OP.ADD: "+", OP.SUB: "-", OP.MUL: "*", OP.DIV: "/",
                   OP.IDIV: "//", OP.MOD: "%", OP.POW: "^", OP.CONCAT: ".."}[op]
         return [f"local a, x, y = {reg('pc')}, {reg('pc + 1')}, {reg('pc + 2')}",
-                "pc = pc + 3",
-                f"R[a] = R[x] {symbol} R[y]"]
+                "pc = pc + 3"] + fam.binary("R[a]", "R[x]", "R[y]", symbol)
     if op in (OP.EQ, OP.NE, OP.LT, OP.LE, OP.GT, OP.GE):
         symbol = {OP.EQ: "==", OP.NE: "~=", OP.LT: "<", OP.LE: "<=",
                   OP.GT: ">", OP.GE: ">="}[op]
         return [f"local a, x, y = {reg('pc')}, {reg('pc + 1')}, {reg('pc + 2')}",
-                "pc = pc + 3",
-                f"R[a] = R[x] {symbol} R[y]"]
+                "pc = pc + 3"] + fam.binary("R[a]", "R[x]", "R[y]", symbol)
     if op == OP.UNM:
-        return [f"local a, x = {reg('pc')}, {reg('pc + 1')}", "pc = pc + 2",
-                "R[a] = -R[x]"]
+        return [f"local a, x = {reg('pc')}, {reg('pc + 1')}", "pc = pc + 2"] + \
+            substitute(fam.unary("R[a]", lambda e: "-" + e), "R[x]")
     if op == OP.NOT:
-        return [f"local a, x = {reg('pc')}, {reg('pc + 1')}", "pc = pc + 2",
-                "R[a] = not R[x]"]
+        return [f"local a, x = {reg('pc')}, {reg('pc + 1')}", "pc = pc + 2"] + \
+            substitute(fam.unary("R[a]", lambda e: "not " + e), "R[x]")
     if op == OP.LEN:
-        return [f"local a, x = {reg('pc')}, {reg('pc + 1')}", "pc = pc + 2",
-                "R[a] = #R[x]"]
+        return [f"local a, x = {reg('pc')}, {reg('pc + 1')}", "pc = pc + 2"] + \
+            substitute(fam.unary("R[a]", lambda e: "#" + e), "R[x]")
     if op == OP.CALL:
         # nres and tail arrive biased by one so -1 encodes as 0
         return [f"local base = {reg('pc')}",
@@ -116,10 +120,9 @@ def _handler(op: str, n: Dict[str, str]) -> List[str]:
                 "if nres < 0 then",
                 "  R[base] = res",
                 "else",
-                "  for i = 1, nres do",
-                "    R[base + i - 1] = res[i]",
-                "  end",
-                "end"]
+                "  for i = 1, nres do"] + \
+            ["    " + line for line in fam.store("R[base + i - 1]", "res[i]")] + \
+            ["  end", "end"]
     if op == OP.TAILCALL:
         return [f"local base = {reg('pc')}",
                 f"local argc = {w('pc + 1')}",
@@ -258,14 +261,20 @@ def _handler(op: str, n: Dict[str, str]) -> List[str]:
     raise ValueError(f"{op} has no handler")
 
 
-def interpreter_source(opmap: OpcodeMap, names: Dict[str, str]) -> str:
+def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
+                       vm_family: str = "register") -> str:
     """The interpreter, with this build's opcode numbers inlined.
 
     ``names`` supplies the local names so the interpreter is not recognisable
     by shape alone: ``code``, ``exec``, ``enter``, ``call``, ``getfenv``,
-    ``append``, ``iter``, ``iterpack``, ``itercheck``.
+    ``acc``, ``stack``, ``sp``, ``append``, ``iter``, ``iterpack``,
+    ``itercheck``.
+
+    ``vm_family`` selects the operand discipline.  Same bytecode, same
+    semantics, different machinery -- see :mod:`couxobf.vm.families`.
     """
     n = names
+    fam = _family(vm_family, names)
     lines: List[str] = [
         "local _byte = string.byte",
         "local _unpack = table.unpack",
@@ -302,6 +311,7 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str]) -> str:
         f"  local {n['code']} = p.code",
         "  local K = p.consts",
         "  local pc = p.entry",
+    ] + ["  " + decl for decl in fam.state] + [
         "  while true do",
         f"    local op = _byte({n['code']}, pc)",
         "    pc = pc + 1",
@@ -312,7 +322,7 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str]) -> str:
         number = opmap.to_byte[op]
         lines.append(f"    {'if' if first else 'elseif'} op == {number} then")
         first = False
-        for body_line in _handler(op, n):
+        for body_line in _handler(op, n, fam):
             lines.append(f"      {body_line}")
     lines += [
         "    else",

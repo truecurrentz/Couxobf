@@ -653,6 +653,7 @@ def reconstruct_protected(module: IRModule,
                           vm_level: Any = VirtualizationLevel.HEAVY,
                           vm_rng: Any = None,
                           vm_protos: Any = None,
+                          vm_family: Any = "register",
                           string_level: int = 0,
                           string_rng: Any = None,
                           string_cache_policy: str = "none",
@@ -699,7 +700,8 @@ def reconstruct_protected(module: IRModule,
         from .vm import wiring as _wiring
         selected = (set(vm_protos) if vm_protos is not None
                     else _wiring.select_protos(module, vm_level))
-        plan = _wiring.make_plan(vm_rng if vm_rng is not None else rng, selected)
+        plan = _wiring.make_plan(vm_rng if vm_rng is not None else rng,
+                                 selected, family=vm_family)
 
     # Strings get their own bank at level 2 and above: fragmented, scattered
     # across shuffled pages, and addressed by a per-occurrence ticket rather

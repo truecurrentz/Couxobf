@@ -146,6 +146,7 @@ def build(source: str, config: Optional[Config] = None,
         vm_level=config.virtualization_level,
         vm_rng=domains.get("vm"),
         vm_protos=selected,
+        vm_family=config.vm_family,
         string_level=config.string_protection_level,
         # Its own stream: reusing the constant pool's randomness for the string
         # bank would correlate two unrelated layouts, which is exactly what
@@ -238,6 +239,7 @@ def cost_report(result: BuildResult) -> str:
     lines.append(f"virtualized         : {s.virtualized}")
     lines.append(f"virtualization      : "
                  f"{VirtualizationLevel.parse(c.virtualization_level).name.lower()}")
+    lines.append(f"vm family           : {getattr(c.vm_family, 'value', c.vm_family)}")
     lines.append(f"elapsed             : {s.elapsed_ms:.1f} ms")
     lines.append("")
 

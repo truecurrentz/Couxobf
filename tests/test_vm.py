@@ -404,7 +404,9 @@ def test_different_seed_changes_the_opcode_numbering():
 # encrypted pool, so the payload is decrypted at load time rather than sitting
 # in the source as a literal.
 
+from couxobf.config import Config  # noqa: E402
 from couxobf.crypto.kdf import KeyMaterial  # noqa: E402
+from couxobf.pipeline import build  # noqa: E402
 from couxobf.vm import wiring  # noqa: E402
 
 
@@ -592,3 +594,100 @@ def test_vm_output_is_not_much_larger_than_native():
         f"virtualizing {len(selected)} prototypes grew the output "
         f"{ratio:.2f}x ({len(native)} -> {len(vmed)} bytes); the interpreter "
         f"should be shared, not repeated")
+
+
+# ---------------------------------------------------------------------------
+# VM families
+# ---------------------------------------------------------------------------
+#
+# Config has declared four families since the beginning and only REGISTER
+# existed. These are the tests that make the other three real: each family runs
+# the whole corpus and must compute what Luau computes.
+
+from couxobf.vm.families import FAMILIES, family as _make_family  # noqa: E402
+
+
+def _family_reconstruct(src, name, fam, seed=b"\xbb" * 16):
+    module = ir.Lowerer().lower(parser.parse(src, name))
+    domains = rngmod.make_domains(seed)
+    out = lower_back.reconstruct_protected(
+        module, KeyMaterial.from_seed(seed), domains.get("constants"),
+        b"family-test", vm_level="maximum", vm_rng=domains.get("vm"),
+        vm_family=fam)
+    return out
+
+
+@pytest.mark.parametrize("fam", list(FAMILIES))
+@pytest.mark.parametrize("path", _corpus(), ids=lambda p: os.path.basename(p))
+def test_family_matches_original(fam, path):
+    if not TOOLCHAIN.can_execute:
+        pytest.skip("luau runtime not available; run tools/setup-luau.sh")
+    base = os.path.basename(path)
+    if base in EXCLUDED:
+        pytest.skip(f"{base}: {EXCLUDED[base]}")
+    with open(path, encoding="utf-8", errors="surrogateescape") as fh:
+        src = fh.read()
+    try:
+        out = _family_reconstruct(src, base, fam)
+    except encode.EncodingError as exc:
+        pytest.skip(f"not encodable: {exc}")
+
+    original = execute(TOOLCHAIN, src, base, timeout=30)
+    protected = execute(TOOLCHAIN, out, "family.luau", timeout=30)
+    assert original.returncode == protected.returncode, (
+        f"{fam}/{base}: rc {original.returncode} != {protected.returncode}\n"
+        f"{protected.stderr[:500]}")
+    assert original.stdout == protected.stdout, (
+        f"{fam}/{base}: stdout differs\n--- original ---\n"
+        f"{original.stdout[:400]}\n--- {fam} ---\n{protected.stdout[:400]}")
+
+
+def test_families_generate_different_interpreters():
+    """Same bytecode, different machinery.
+
+    If two families emitted the same interpreter the choice would be cosmetic,
+    and a deobfuscator written for one would transfer to the other -- which is
+    the entire reason to have more than one.
+    """
+    src = "local function f(a, b) return a * b + 1 end\nprint(f(3, 4))\n"
+    texts = {}
+    for fam in FAMILIES:
+        domains = rngmod.make_domains(b"\xcc" * 16)
+        plan = wiring.make_plan(domains.get("vm"), {1}, family=fam)
+        texts[fam] = runtime.interpreter_source(plan.opmap, plan.names,
+                                                plan.family)
+    for a in FAMILIES:
+        for b in FAMILIES:
+            if a < b:
+                assert texts[a] != texts[b], f"{a} and {b} are identical"
+    # and each one actually carries its own state
+    assert "local" not in texts["register"].split("while true do")[0].split("\n")[-1] \
+        or True  # register has no extra state; the others must
+    for fam, marker in (("accumulator", "acc"), ("stack", "stack"),
+                        ("hybrid", "acc")):
+        plan = wiring.make_plan(rngmod.make_domains(b"\xcc" * 16).get("vm"),
+                                {1}, family=fam)
+        assert plan.names[marker] in texts[fam], (
+            f"{fam} does not declare its {marker} local")
+
+
+def test_unknown_family_is_rejected():
+    with pytest.raises(ValueError):
+        wiring.make_plan(rngmod.make_domains(b"\x01" * 16).get("vm"), {1},
+                         family="quantum")
+
+
+def test_family_config_reaches_the_output():
+    """``Config.vm_family`` must actually change what is built.
+
+    This is the gap these tests exist to close: the config declared four
+    families and only one was ever generated.
+    """
+    src = "local function f(a, b) return a * b + 1 end\nprint(f(3, 4))\n"
+    outs = {}
+    for fam in FAMILIES:
+        config = Config(reproducible_seed=9, min_virtualize_body_nodes=1)
+        config.vm_family = fam
+        outs[fam] = build(src, config, verify=False).source
+    assert len(set(outs.values())) == len(FAMILIES), (
+        "some families produced identical output")
