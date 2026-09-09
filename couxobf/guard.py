@@ -72,12 +72,48 @@ CAPTURED: Tuple[str, ...] = (
 #: Roblox-only dump functions live.  Either half may be absent on a given
 #: platform, and absence is not a violation -- it is the norm off Roblox.
 SURFACES: Tuple[Tuple[Optional[str], str, bool], ...] = (
+    # Luau itself removes bytecode dumping in the sandbox, but exploit/testing
+    # hosts commonly add these names back.  Snapshot both the official-ish debug
+    # entry points and the executor-style global dump helpers so a mid-run swap
+    # is observable before the VM hands over plaintext payload rows.
     ("string", "dump", False),
+    ("debug", "info", False),
+    ("debug", "getinfo", False),
+    ("debug", "traceback", False),
+    ("debug", "gethook", True),
+    ("debug", "sethook", False),
+    ("debug", "getstack", False),
+    ("debug", "getlocals", False),
+    ("debug", "getlocal", False),
+    ("debug", "getupvalues", False),
+    ("debug", "getupvalue", False),
+    ("debug", "getconstants", False),
+    ("debug", "getconstant", False),
+    ("debug", "getproto", False),
+    ("debug", "getprotos", False),
+    ("debug", "getregistry", False),
+    ("debug", "setconstant", False),
+    ("debug", "setupvalue", False),
+    ("debug", "setstack", False),
+    ("debug", "setproto", False),
     (None, "getbytecode", False),
     (None, "getscriptbytecode", False),
-    ("debug", "getinfo", False),
-    ("debug", "gethook", True),
+    (None, "getgc", False),
+    (None, "getreg", False),
+    (None, "hookfunction", False),
+    (None, "replaceclosure", False),
+    (None, "clonefunction", False),
+    (None, "islclosure", False),
+    (None, "getconnections", False),
+    (None, "saveinstance", False),
 )
+
+#: Metatable fields that matter for logging/proxying.  ``__index`` and
+#: ``__newindex`` are the classic environment logger; ``__namecall`` and
+#: ``__metatable`` catch Roblox/executor proxy tricks without assuming those
+#: fields exist on the reference interpreter.
+_META_KEYS: Tuple[str, ...] = ("__index", "__newindex", "__namecall",
+                              "__metatable", "__mode", "__call")
 
 #: What a detected violation does.
 POLICIES = ("fail", "ignore")
@@ -88,7 +124,17 @@ POLICIES = ("fail", "ignore")
 REFUSAL = "invalid state"
 
 #: The roles the guard needs a name for, beyond the library captures.
-_ROLES = ("env", "meta", "index", "write", "check", "flag")
+_ROLES = ("env", "meta", "index", "write", "namecall", "metaguard",
+          "metamode", "metacall", "rawmeta", "check", "flag")
+
+_META_ROLE = {
+    "__index": "index",
+    "__newindex": "write",
+    "__namecall": "namecall",
+    "__metatable": "metaguard",
+    "__mode": "metamode",
+    "__call": "metacall",
+}
 
 
 def used_globals(node: A.Node, allowed: Iterable[str] = CAPTURED) -> List[str]:
@@ -289,7 +335,7 @@ class Guard:
         is a global read on every call -- exactly the thing the capture exists to
         remove, and a logger would see the guard more often than the program.
         """
-        out = ["_G", "getfenv", "getmetatable", "rawget", "error"]
+        out = ["_G", "getfenv", "getmetatable", "rawget", "rawequal", "error"]
         if self.neutralises:
             out += ["pcall", "rawset"]
         for table, _name, _call in SURFACES:
@@ -336,11 +382,11 @@ class Guard:
             # produces.
             "local %s = (%s) and (%s)(%s) or nil" % (self.n("meta"), getmt,
                                                       getmt, env),
-            "local %s = %s and (%s)(%s, \"__index\")"
-            % (self.n("index"), self.n("meta"), rawget, self.n("meta")),
-            "local %s = %s and (%s)(%s, \"__newindex\")"
-            % (self.n("write"), self.n("meta"), rawget, self.n("meta")),
         ]
+        for key in _META_KEYS:
+            lines.append("local %s = %s and (%s)(%s, \"%s\")"
+                         % (self.n(_META_ROLE[key]), self.n("meta"), rawget,
+                            self.n("meta"), key))
         for index, (table, name, call_it) in enumerate(SURFACES):
             slot = self.n(f"surface:{index}")
             lines.append("local %s = %s" % (slot, self._read_surface(table, name,
@@ -362,17 +408,17 @@ class Guard:
         if not self.active:
             return []
         check, rawget, getmt = self.n("check"), self.cap("rawget"), self.cap("getmetatable")
+        raweq = self.cap("rawequal")
         env = self.n("env")
         body = [
             "local m = (%s) and (%s)(%s) or nil" % (getmt, getmt, env),
-            "if m ~= %s then return false end" % self.n("meta"),
+            "if not (%s)(m, %s) then return false end" % (raweq, self.n("meta")),
             "if m then",
-            "  if (%s)(m, \"__index\") ~= %s then return false end"
-            % (rawget, self.n("index")),
-            "  if (%s)(m, \"__newindex\") ~= %s then return false end"
-            % (rawget, self.n("write")),
-            "end",
         ]
+        for key in _META_KEYS:
+            body.append("  if not (%s)((%s)(m, \"%s\"), %s) then return false end"
+                        % (raweq, rawget, key, self.n(_META_ROLE[key])))
+        body.append("end")
         for index, (table, name, call_it) in enumerate(SURFACES):
             body.append("if %s ~= %s then return false end"
                         % (self._read_surface(table, name, call_it),
@@ -415,6 +461,7 @@ class Guard:
             "      lock(m, false)",
             "      %s(m, \"__index\", nil)" % self.cap("rawset"),
             "      %s(m, \"__newindex\", nil)" % self.cap("rawset"),
+            "      %s(m, \"__namecall\", nil)" % self.cap("rawset"),
             "      lock(m, true)",
             "    end",
             "  end)",
@@ -471,8 +518,8 @@ class Guard:
             "  bound at load   : %d library name%s; after that the runtime "
             "reads" % (bound, plural),
             "                    locals, which no environment hook can see",
-            "  surfaces checked: %d, at load and at each VM entry"
-            % len(SURFACES),
+            "  surfaces checked: %d dump/debug slots and %d metatable slots"
+            " at load and at each VM entry" % (len(SURFACES), len(_META_KEYS)),
             "  neutralise      : "
             + ("yes" if self.neutralises else "no (level 1 observes only)"),
             "  refuse on trip  : " + refusal,
@@ -491,14 +538,14 @@ def make(env_level: int = 0, dump_level: int = 0, policy: str = "fail",
     if policy not in POLICIES:
         raise ValueError(f"guard_policy must be one of {POLICIES}, got {policy!r}")
     names: Dict[str, str] = {
-        "capture:" + name: (f"{prefix}b{index:02x}" if prefix
+        "capture:" + name: (f"{prefix}{_token(prefix, 'cap:' + name, index)}" if prefix
                             else f"_g{index:02x}")
         for index, name in enumerate(CAPTURED)
     }
     names.update({f"capture:{k}": v for k, v in (capture or {}).items()})
     taken = set(names.values())
-    for role in _ROLES + tuple(f"surface:{i}" for i in range(len(SURFACES))):
-        name = (prefix + _ALIAS[role] if prefix
+    for index, role in enumerate(_ROLES + tuple(f"surface:{i}" for i in range(len(SURFACES)))):
+        name = (prefix + _token(prefix, role, index + 97) if prefix
                 else "_" + _ALIAS[role])
         while name in taken:
             name += "_"
@@ -509,12 +556,30 @@ def make(env_level: int = 0, dump_level: int = 0, policy: str = "fail",
                  policy=policy, names=names)
 
 
+def _token(prefix: str, role: str, salt: int) -> str:
+    """Small deterministic name fragment with no role mnemonic in production.
+
+    The prefix is already per-build; mixing the role through an LCG-derived token
+    keeps reproducibility for a seed while removing stable suffixes like ``_k`` or
+    ``_s0`` that made the guard easy to fingerprint across artifacts.
+    """
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    x = (salt * 0x45D9F3B) ^ 0xA5A5A5A5
+    for ch in (prefix + role):
+        x = ((x ^ ord(ch)) * 1103515245 + 12345) & 0x7fffffff
+    chars = []
+    for _ in range(4):
+        x = (x * 1664525 + 1013904223) & 0xffffffff
+        chars.append(alphabet[x % len(alphabet)])
+    return "".join(chars)
+
 #: Defaults for the guard's own locals.  A build that supplies per-build names
 #: overrides them through ``capture``'s collision loop; these exist so the module
 #: is usable on its own, and so a test failure names the role rather than a hash.
 _ALIAS = {
     "env": "e", "meta": "m", "index": "i", "write": "w",
-    "check": "k", "flag": "f",
+    "namecall": "n", "metaguard": "g", "metamode": "o",
+    "metacall": "c", "rawmeta": "r", "check": "k", "flag": "f",
 }
 for _i in range(len(SURFACES)):
     _ALIAS[f"surface:{_i}"] = f"s{_i}"

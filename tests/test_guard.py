@@ -159,6 +159,25 @@ def test_levels_are_clamped_and_a_bad_policy_is_refused():
         guardmod.make(1, 1, policy="shrug")
 
 
+def test_dump_guard_watches_luau_and_executor_dump_surfaces():
+    watched = set(guardmod.SURFACES)
+    for probe in (("debug", "info", False), ("debug", "getconstants", False),
+                  ("debug", "getproto", False), (None, "hookfunction", False),
+                  (None, "getgc", False), (None, "saveinstance", False)):
+        assert probe in watched
+    text = guardmod.guard_block(guardmod.make(2, 2))
+    for literal in ("debug", "getconstants", "hookfunction", "getgc", "__namecall"):
+        assert literal in text
+
+
+def test_guard_role_names_do_not_expose_fixed_suffixes_when_prefixed():
+    one = guardmod.make(2, 2, prefix="_aa")
+    two = guardmod.make(2, 2, prefix="_bb")
+    roles = {"env", "meta", "check", "flag", "surface:0", "surface:1"}
+    assert {one.names[r] for r in roles}.isdisjoint({two.names[r] for r in roles})
+    assert all(not one.names[r].endswith("_" + r.replace(":", "")) for r in roles)
+
+
 def test_the_refusal_is_the_dispatchers_own_error():
     """No banner and no "environment tampered" string to find.
 
