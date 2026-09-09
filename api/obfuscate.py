@@ -79,7 +79,10 @@ def _apply_options(config: Config, options: Dict[str, Any]) -> None:
             allowed = ENUM_OPTIONS[key]
             if value not in allowed:
                 raise ValueError(f"{key}: expected one of {', '.join(allowed)}")
-            setattr(config, key, value)
+            # Store the parsed member, not the raw string.  Otherwise a field
+            # holds an enum when a profile set it and a str when the request
+            # did, and every reader has to cope with both.
+            setattr(config, key, ENUM_PARSERS[key].parse(value))
         elif key in INT_OPTIONS:
             low, high = INT_RANGES[key]
             if not isinstance(value, int) or not low <= value <= high:
@@ -122,9 +125,9 @@ def run(source: str, options: Dict[str, Any]) -> Dict[str, Any]:
         "seed_hex": f"{config.reproducible_seed:032x}",
         "applied": {
             "profile": (options or {}).get("profile", "maximum"),
-            "virtualization_level": _plain(config.virtualization_level),
-            "vm_family": _plain(config.vm_family),
-            "dispatcher_family": _plain(config.dispatcher_family),
+            "virtualization_level": _name(config.virtualization_level, ENUM_PARSERS["virtualization_level"]),
+            "vm_family": _name(config.vm_family, ENUM_PARSERS["vm_family"]),
+            "dispatcher_family": _name(config.dispatcher_family, ENUM_PARSERS["dispatcher_family"]),
             "block_permutation": config.block_permutation,
             "opcode_randomization": config.opcode_randomization,
             "string_protection_level": config.string_protection_level,
@@ -133,7 +136,7 @@ def run(source: str, options: Dict[str, Any]) -> Dict[str, Any]:
             "string_protection_level_note": (
                 "levels 2 and 3 are currently identical"
                 if config.string_protection_level >= 2 else ""),
-            "cache_policy": _plain(config.cache_policy),
+            "cache_policy": _name(config.cache_policy, ENUM_PARSERS["cache_policy"]),
             "minify": config.minify,
         },
         "pending": pending,
@@ -141,8 +144,30 @@ def run(source: str, options: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+ENUM_PARSERS = {
+    "virtualization_level": VirtualizationLevel,
+    "vm_family": VMFamily,
+    "dispatcher_family": DispatcherFamily,
+    "cache_policy": CachePolicy,
+}
+
+
 def _plain(value: Any) -> Any:
     return getattr(value, "value", value)
+
+
+def _name(value: Any, enum_cls: Any) -> str:
+    """The lowercase member name, whether the field holds an enum or a string.
+
+    VirtualizationLevel is an IntEnum, so _plain on it yields 0..4 -- a number
+    a reader cannot map back to a level.  Names round-trip either way.
+    """
+    if isinstance(value, enum_cls):
+        return value.name.lower()
+    try:
+        return enum_cls.parse(value).name.lower()
+    except (ValueError, KeyError, AttributeError, TypeError):
+        return str(value)
 
 
 def handle(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:

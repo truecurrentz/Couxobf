@@ -122,9 +122,19 @@
         </select>
       </label>
 
+      <label class="opt" id="opt-bounded_cache_size" hidden>
+        <span class="opt-name">Cache bound</span>
+        <input type="number" id="bounded_cache_size" min="1" max="4096" value="16">
+      </label>
+
       <label class="opt">
         <span class="opt-name">Min function size to virtualize</span>
         <input type="number" id="min_virtualize_body_nodes" min="0" max="4096" value="1">
+      </label>
+
+      <label class="opt">
+        <span class="opt-name">Max functions to virtualize</span>
+        <input type="number" id="max_vm_functions" min="0" max="4096" value="64">
       </label>
 
       <div class="opt switches">

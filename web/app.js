@@ -9,7 +9,11 @@ const FIELDS = {
   dispatcher_family: { kind: "select" },
   string_protection_level: { kind: "int" },
   cache_policy: { kind: "select" },
+  // Only meaningful alongside the bounded policy; sending it otherwise would be
+  // a knob that silently does nothing, which is the failure mode to avoid.
+  bounded_cache_size: { kind: "int", when: () => $("cache_policy").value === "bounded" },
   min_virtualize_body_nodes: { kind: "int" },
+  max_vm_functions: { kind: "int" },
   block_permutation: { kind: "bool" },
   opcode_randomization: { kind: "bool" },
   minify: { kind: "bool" },
@@ -19,16 +23,25 @@ const FIELDS = {
 
 /* Profiles, mirrored from couxobf.config.Config. Kept here so the buttons do
    something visible instead of only changing a dropdown the user then has to
-   inspect. */
+   inspect.
+
+   virtualization_level and string_protection_level are copied verbatim from
+   Config.from_profile -- a preset that claimed different values would disagree
+   with the profile dropdown sitting right above it. The remaining fields are
+   deliberate UI defaults on top: `minimum` is the point at which a function is
+   considered worth virtualizing, and compact leaves block permutation off.
+
+   Note that the `compact` profile virtualizes nothing. That is what it means,
+   not a bug, but it is easy to mistake for a build that silently failed. */
 const PRESETS = {
   maximum:  { profile: "maximum",  virtualization_level: "maximum", string_protection_level: 3,
               min_virtualize_body_nodes: 1,  vm_family: "stack", minify: true,
               block_permutation: true, opcode_randomization: true, cache_policy: "none" },
-  balanced: { profile: "balanced", virtualization_level: "heavy",  string_protection_level: 2,
+  balanced: { profile: "balanced", virtualization_level: "medium",  string_protection_level: 2,
               min_virtualize_body_nodes: 12, vm_family: "hybrid", minify: false,
               block_permutation: true, opcode_randomization: true, cache_policy: "none" },
-  compact:  { profile: "compact",  virtualization_level: "medium", string_protection_level: 1,
-              min_virtualize_body_nodes: 24, vm_family: "register", minify: true,
+  compact:  { profile: "compact",  virtualization_level: "none",    string_protection_level: 1,
+              min_virtualize_body_nodes: 12, vm_family: "register", minify: true,
               block_permutation: false, opcode_randomization: true, cache_policy: "bounded" },
 };
 
@@ -106,6 +119,7 @@ function readOptions() {
   for (const [name, spec] of Object.entries(FIELDS)) {
     const el = $(name);
     if (!el) continue;
+    if (spec.when && !spec.when()) continue;
     if (spec.kind === "bool") options[name] = el.checked;
     else if (spec.kind === "int") options[name] = parseInt(el.value, 10) || 0;
     else options[name] = el.value;
@@ -119,6 +133,11 @@ function readOptions() {
   return options;
 }
 
+function syncCacheBound() {
+  const wrap = $("opt-bounded_cache_size");
+  if (wrap) wrap.hidden = $("cache_policy").value !== "bounded";
+}
+
 function applyPreset(preset) {
   for (const [name, value] of Object.entries(preset)) {
     const el = $(name);
@@ -126,6 +145,7 @@ function applyPreset(preset) {
     if (el.type === "checkbox") el.checked = value;
     else el.value = String(value);
   }
+  syncCacheBound();
 }
 
 /* ---------- formatting ---------- */
@@ -297,6 +317,9 @@ function init() {
   $("presetMaximum").addEventListener("click", () => applyPreset(PRESETS.maximum));
   $("presetBalanced").addEventListener("click", () => applyPreset(PRESETS.balanced));
   $("presetCompact").addEventListener("click", () => applyPreset(PRESETS.compact));
+
+  $("cache_policy").addEventListener("change", syncCacheBound);
+  syncCacheBound();
 
   $("rollSeed").addEventListener("click", () => {
     const buf = new Uint8Array(8);

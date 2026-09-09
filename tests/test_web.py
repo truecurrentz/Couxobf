@@ -8,6 +8,7 @@ returns 200 with broken Luau is worse than one that returns 500.
 
 import json
 import os
+import re
 import sys
 
 import pytest
@@ -20,6 +21,11 @@ from obfuscate import MAX_INPUT_BYTES, handle  # noqa: E402
 from couxobf.toolchain import execute, find_toolchain  # noqa: E402
 
 TOOLCHAIN = find_toolchain()
+
+INVENTORY = (os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "examples", "inventory.luau"))
+with open(INVENTORY, encoding="utf-8") as _fh:
+    INVENTORY = _fh.read()
 
 SOURCE = '''local function compute(a, b)
   local total = 0
@@ -218,3 +224,153 @@ def test_vercel_entry_point_shape():
     import obfuscate
     assert callable(obfuscate.app)
     assert callable(obfuscate.vercel_handler)
+
+
+# ---------------------------------------------------------------------------
+# UI/endpoint parity
+#
+# The front end and the endpoint are separate files with no shared schema, so
+# the way they drift is a control that the endpoint rejects -- or, worse, an
+# option the endpoint honours that no control can reach, which reads to a user
+# as a feature that quietly does nothing.  Both were real here.
+# ---------------------------------------------------------------------------
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WEB_HTML = os.path.join(REPO, "web", "index.html")
+WEB_JS = os.path.join(REPO, "web", "app.js")
+
+
+def _accepted_options():
+    """Every key the endpoint reads out of `options`, however it validates it.
+
+    `profile` is consumed before the per-option validator and matched against
+    Config.PROFILES, so it is accepted but not a member of any of these tables.
+    Listing only the tables is what made this test fail first time, and the
+    failure was in the test rather than in the endpoint.
+    """
+    from obfuscate import BOOL_OPTIONS, ENUM_OPTIONS, INT_OPTIONS
+    return set(ENUM_OPTIONS) | set(INT_OPTIONS) | set(BOOL_OPTIONS) | {"profile"}
+
+
+def _html_ids():
+    with open(WEB_HTML, encoding="utf-8") as fh:
+        return set(re.findall(r'id="([A-Za-z_0-9]+)"', fh.read()))
+
+
+def _js_field_keys():
+    with open(WEB_JS, encoding="utf-8") as fh:
+        js = fh.read()
+    block = js.split("const FIELDS = {", 1)[1].split("\n};", 1)[0]
+    return set(re.findall(r"^\s{2}([a-z_][a-z_0-9]*):", block, re.M))
+
+
+def test_every_endpoint_option_is_reachable_from_the_ui():
+    missing = sorted(_accepted_options() - _html_ids())
+    assert not missing, f"no UI control for: {missing}"
+
+
+def test_every_ui_option_is_accepted_by_the_endpoint():
+    """A key the UI sends but the endpoint rejects would 400 the whole build."""
+    rejected = sorted(_js_field_keys() - _accepted_options())
+    assert not rejected, f"endpoint would reject: {rejected}"
+
+
+def test_every_declared_field_has_a_matching_element():
+    """readOptions skips absent elements, so a typo here fails silently."""
+    missing = sorted(_js_field_keys() - _html_ids())
+    assert not missing, f"FIELDS declares controls that do not exist: {missing}"
+
+
+def test_the_cache_bound_control_is_gated_on_the_bounded_policy():
+    with open(WEB_HTML, encoding="utf-8") as fh:
+        html = fh.read()
+    with open(WEB_JS, encoding="utf-8") as fh:
+        js = fh.read()
+    # The bound only means something alongside `bounded`; offering it otherwise
+    # would be a knob that silently does nothing.
+    assert 'id="opt-bounded_cache_size" hidden' in html
+    assert 'when: () => $("cache_policy").value === "bounded"' in js
+    assert "syncCacheBound" in js
+    assert '$("cache_policy").addEventListener("change", syncCacheBound)' in js
+
+
+# ---------------------------------------------------------------------------
+# the two knobs added for parity have to do something
+# ---------------------------------------------------------------------------
+
+def test_max_vm_functions_caps_how_much_gets_virtualized():
+    opts = {"virtualization_level": "maximum", "min_virtualize_body_nodes": 1}
+    _, uncapped = handle({"source": INVENTORY, "options": opts})
+    assert uncapped["virtualized"] >= 2, uncapped
+
+    _, capped = handle({"source": INVENTORY,
+                        "options": dict(opts, max_vm_functions=1)})
+    assert capped["virtualized"] == 1, capped
+
+    _, none_at_all = handle({"source": INVENTORY,
+                             "options": dict(opts, max_vm_functions=0)})
+    assert none_at_all["virtualized"] == 0, none_at_all
+
+
+@pytest.mark.parametrize("bound", (1, 16, 512))
+def test_a_bounded_cache_build_executes(bound):
+    status, body = handle({"source": INVENTORY,
+                           "options": {"profile": "maximum", "cache_policy": "bounded",
+                                       "bounded_cache_size": bound,
+                                       "min_virtualize_body_nodes": 1}})
+    assert status == 200, body
+    assert body["applied"]["cache_policy"] == "bounded"
+    if not TOOLCHAIN.can_execute:
+        pytest.skip("luau runtime unavailable")
+    got = execute(TOOLCHAIN, body["output"])
+    want = execute(TOOLCHAIN, INVENTORY)
+    assert got == want, (got, want)
+
+
+@pytest.mark.parametrize("profile", ["nonsense", "", "MAXIMUMX", 123, None])
+def test_an_unknown_profile_is_a_400_naming_the_choices(profile):
+    """Validated on a different path from the per-option table."""
+    status, body = handle({"source": SOURCE, "options": {"profile": profile}})
+    assert status == 400, body
+    assert "profile" in body["error"]
+    for name in ("compact", "balanced", "hardened", "maximum"):
+        assert name in body["error"]
+
+
+@pytest.mark.parametrize("profile", ["compact", "balanced", "hardened", "maximum", "MAXIMUM"])
+def test_profile_names_are_accepted_case_insensitively(profile):
+    status, body = handle({"source": SOURCE, "options": {"profile": profile}})
+    assert status == 200, body
+    assert body["applied"]["profile"] == profile
+
+
+def test_presets_agree_with_the_profiles_they_claim():
+    """A preset button that disagrees with the profile dropdown misleads.
+
+    These live in a JS object with no shared schema against Config, so the
+    values are parsed back out and compared rather than trusted.
+    """
+    from couxobf.config import Config
+
+    with open(WEB_JS, encoding="utf-8") as fh:
+        js = fh.read()
+    block = js.split("const PRESETS = {", 1)[1].split("\n};", 1)[0]
+
+    checked = 0
+    for name in Config.PROFILES:
+        # Only the presets the UI actually offers a button for.
+        entry = re.search(name + r":\s*\{(.*?)\}", block, re.S)
+        if not entry:
+            continue
+        fields = dict(re.findall(r"([a-z_0-9]+):\s*\"?([^,}\"]+)\"?", entry.group(1)))
+        config = Config.from_profile(name)
+        got_level = fields["virtualization_level"].strip()
+        got_strings = int(fields["string_protection_level"])
+        assert got_level == config.virtualization_level.name.lower(), (
+            f"preset {name!r} says virtualization_level={got_level!r}, "
+            f"Config.from_profile says {config.virtualization_level.name.lower()!r}")
+        assert got_strings == config.string_protection_level, (
+            f"preset {name!r} says string_protection_level={got_strings}, "
+            f"Config.from_profile says {config.string_protection_level}")
+        checked += 1
+    assert checked >= 2, f"only {checked} presets were parseable -- the check is vacuous"

@@ -1,5 +1,8 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "buildCommand": "",
+  "installCommand": "",
   "outputDirectory": "web",
   "functions": {
     "api/obfuscate.py": {
@@ -10,7 +13,12 @@
   "headers": [
     {
       "source": "/api/(.*)",
-      "headers": [{ "key": "Cache-Control", "value": "no-store" }]
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-store"
+        }
+      ]
     }
   ]
 }
