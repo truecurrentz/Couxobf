@@ -350,9 +350,13 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
     except Exception as exc:
         raise BuildError(f"{name} failed semantic analysis: {exc}") from None
 
-    # -- IR ---------------------------------------------------------------
-    module = _ir.Lowerer().lower(ast)
     domains = make_domains(seed)
+
+    # -- IR ---------------------------------------------------------------
+    module = _ir.Lowerer(
+        table_key_protection=bool(config.table_key_protection),
+        rng=domains.get("table-keys"),
+    ).lower(ast)
 
     # -- selection --------------------------------------------------------
     # The classifier runs before reconstruction so its decisions can be passed

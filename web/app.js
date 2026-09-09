@@ -109,6 +109,9 @@ const SPEC = [
       ["numeric_protection_level", "Numbers", "select",
        "Masks IEEE-754 double bytes inside the encrypted pool so number materializing " +
        "is generated dynamically while preserving exact Luau float semantics."],
+      ["table_key_protection", "Table keys", "bool",
+       "Assemble syntactic property names from protected fragments so field access " +
+       "does not expose a stable GETTABLEK/SETTABLEK key vocabulary."],
       ["cache_policy", "Decoded-string cache", "select",
        "How much plaintext sits in the heap: `none` re-materialises on every read, " +
        "`full` keeps everything, `bounded` keeps a rolling window."],
@@ -846,6 +849,7 @@ const FALLBACK = {
   string_protection_level: { kind: "int", min: 0, max: 3, default: 2 },
   constant_protection_level: { kind: "int", min: 0, max: 3, default: 2 },
   numeric_protection_level: { kind: "int", min: 0, max: 2, default: 1 },
+  table_key_protection: { kind: "bool", default: true },
   control_flow_level: { kind: "int", min: 0, max: 3, default: 2 },
   env_guard: { kind: "int", min: 0, max: 2, default: 1 },
   dump_guard: { kind: "int", min: 0, max: 2, default: 1 },

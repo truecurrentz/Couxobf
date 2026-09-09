@@ -458,6 +458,7 @@ class Config:
         "string_protection_level",
         "constant_protection_level",
         "numeric_protection_level",
+        "table_key_protection",
         "cache_policy",
         "bounded_cache_size",
         "decoys",

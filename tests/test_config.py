@@ -78,7 +78,7 @@ def test_the_defaults_request_features_that_are_not_built():
     pending = dict(Config().pending_fields())
     for name in ("max_vm_depth", "mixed_execution", "handler_splitting",
                  "call_frame_obfuscation", "encoded_pc", "epoch_masks",
-                 "table_key_protection", "integrity_level", "self_test",
+                 "integrity_level", "self_test",
                  "identifier_polymorphism", "fingerprint_reduction",
                  "branch_inversion", "chunking_level", "lazy_decode",
                  "junk_level", "roblox_mode"):
