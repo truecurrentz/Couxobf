@@ -26,7 +26,7 @@ who identifies the add handler by what it does has it regardless of its number.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..ir import OP, Reg
 from ..rng import Rng
@@ -47,13 +47,20 @@ MAX_WIDE = 0xFFFF
 class OperandSpec:
     """The shape of one instruction's operands.
 
-    ``regs`` is the number of single-byte register operands, in order.
-    ``wides`` is the number of two-byte operands after them.  Anything an
-    instruction needs beyond that does not belong in this ISA.
+    ``regs`` lists the register operands by *IR argument position*, so
+    ``SETTABLEK``'s ``regs=(0, 2)`` says "arguments 0 and 2 are registers" and
+    argument 1 is not.  ``wides`` names the wide operands that follow them, in
+    wire order.  ``wide_first`` records the handful of instructions whose wide
+    operand precedes its register operand -- ``SETGLOBAL`` -- and matters because
+    the format's geometry is derived from this order rather than from a
+    hand-written byte layout.  ``reg_wide`` names wide slots that carry a
+    *register index* instead of an immediate, which is how a multi-value pack
+    register fits in a two-byte field.
     """
 
     regs: Tuple[int, ...] = ()
     wides: Tuple[str, ...] = ()
+    wide_first: bool = False
 
     @property
     def size(self) -> int:
@@ -72,7 +79,10 @@ FORMATS: Dict[str, OperandSpec] = {
     OP.MOV:          OperandSpec(regs=(0, 1)),
     OP.LOADK:        OperandSpec(regs=(0,), wides=("konst",)),
     OP.GETGLOBAL:    OperandSpec(regs=(0,), wides=("name",)),
-    OP.SETGLOBAL:    OperandSpec(wides=("name",), regs=(1,)),
+    # IR order is (konst, register) and the historical wire order follows it, so
+    # the wide comes first -- which is why ``FORMATS`` carries the order instead
+    # of the encoder keeping a per-opcode exception.
+    OP.SETGLOBAL:    OperandSpec(regs=(1,), wides=("name",), wide_first=True),
     OP.GETTABLE:     OperandSpec(regs=(0, 1, 2)),       # key is a register
     OP_GETTABLEK:    OperandSpec(regs=(0, 1), wides=("key",)),  # key is a konst
     # IR SETTABLE has two shapes and the VM gives them two opcodes, because
@@ -109,6 +119,9 @@ FORMATS: Dict[str, OperandSpec] = {
     OP.RETURNMULTI:  OperandSpec(regs=(0,), wides=("count", "pack")),
     OP.EXPAND:       OperandSpec(regs=(0,), wides=("pack", "count")),
     OP.SETLIST:      OperandSpec(regs=(0,), wides=("count", "start")),
+    # ``pack`` is a register index that travels in a wide slot: the IR keeps the
+    # multi-value pack as a plain int, so it needs two bytes but keeps register
+    # semantics (see ``REGISTER_IN_WIDE``).
     OP.SETLISTMULTI: OperandSpec(regs=(0,), wides=("pack",)),
     OP.SELF:         OperandSpec(regs=(0, 1), wides=("name",)),
     OP.JMP:          OperandSpec(wides=("target",)),
@@ -120,6 +133,19 @@ FORMATS: Dict[str, OperandSpec] = {
     OP.FORIN:        OperandSpec(regs=(0,), wides=("target", "nvars")),
     OP.ITERPREP:     OperandSpec(regs=(0,), wides=("packed",)),
 }
+
+#: Wide fields that carry a *register index* rather than an immediate.
+#:
+#: ``pack`` exists because the IR records a multi-value pack as a plain int in a
+#: register slot, where a register field would have to be a ``Reg``: it needs two
+#: bytes for the size of the field but keeps register semantics -- the register
+#: mask, the one-based bias, and ``MAX_REGISTERS`` as its bound.  Reading one is
+#: therefore ``_rp`` and not ``_rk``: same slot, different disguise, because #15
+#: is about which slot a register index may legally hold and not about how many
+#: bytes it travelled in.  ``tail`` and ``nresults`` are deliberately absent: both
+#: are biased *counts* (-1 means "absent"), and the helper that consumes them
+#: does its own one-based arithmetic.
+REGISTER_IN_WIDE = frozenset({"pack"})
 
 #: Opcodes the interpreter implements.  A prototype using anything else is not
 #: virtualized -- see ``couxobf.vm.encode.can_virtualize``.
@@ -145,10 +171,32 @@ class OpcodeMap:
     ``encode`` and ``decode`` both go through this, so a build cannot get out of
     sync with itself.  Numbers start at 1 because ``string.byte`` returns nil
     past the end of the string, and a stray 0 would read as a valid opcode.
+
+    Two optional secondaries make the *count* of opcodes a build-time variable
+    rather than a constant of the tool (points #71 and #14):
+
+    ``aliases``
+        Extra numbers for an opcode that already has one.  They are not decoys
+        in the "dead code" sense -- an encoded instruction may really use one --
+        but a number that appears in the dispatch chain and rarely or never in
+        the stream is exactly the noise the point asks for.
+    ``fused``
+        Numbers assigned to fused super-instructions (see
+        :mod:`couxobf.vm.format`).  Each one is a real handler for a pair of
+        instructions, which is what grows the opcode count without padding the
+        artifact with unreachable code.
     """
 
     to_byte: Dict[str, int]
     to_op: Dict[int, str]
+    aliases: Dict[str, Tuple[int, ...]] = None  # type: ignore[assignment]
+    fused: Dict[int, Tuple[str, str]] = None    # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.aliases is None:
+            self.aliases = {}
+        if self.fused is None:
+            self.fused = {}
 
     @classmethod
     def identity(cls) -> "OpcodeMap":
@@ -157,14 +205,80 @@ class OpcodeMap:
                    to_op={i + 1: op for i, op in enumerate(ops)})
 
     @classmethod
-    def shuffled(cls, rng: Rng) -> "OpcodeMap":
+    def shuffled(cls, rng: Rng, *, alias_ratio: float = 0.0,
+                 fused: Sequence[Tuple[str, str]] = (),
+                 sparse: int = 1) -> "OpcodeMap":
+        """A permutation, optionally with alias numbers and super-ops.
+
+        ``alias_ratio`` is the chance that an opcode gets a second (or third)
+        number; ``sparse`` spaces the numbering out.  Both change *how many
+        opcode bytes the dispatcher has to consider*, which is the quantity the
+        design asks to randomize -- a fixed 47 is a fingerprint even when the
+        numbers themselves move.
+        """
         # sorted, not list(SUPPORTED): iterating a set of strings follows
         # PYTHONHASHSEED, so an unsorted base would make "same seed, same
         # output" false across processes.
         ops = sorted(SUPPORTED)
         order = [ops[j] for j in rng.permutation(len(ops))]
-        return cls(to_byte={op: i + 1 for i, op in enumerate(order)},
-                   to_op={i + 1: op for i, op in enumerate(order)})
+        # A one-byte opcode field holds 1..255, and 0 is reserved because
+        # `string.byte` returns nil past the end of the payload -- so the number
+        # space, not the number of knobs, is the hard budget every group shares.
+        # Spacing the numbering out (``sparse``) and adding aliases are both ways
+        # of spending it, and when it runs out the answer is to stop spending,
+        # not to hand out 256 and let it wrap to zero.
+        cap = 256
+        to_byte: Dict[str, int] = {}
+        to_op: Dict[int, str] = {}
+        state = {"next": 1}
+
+        def claim(step: int) -> Optional[int]:
+            """The next free number, spaced by ``step``, or None when full.
+
+            Spacing is a preference rather than a rule: if the gap would run past
+            the cap, the number below it is still usable, and a build that ran out
+            quietly would encode opcode 0.
+            """
+            at = state["next"]
+            while at < cap and at in to_op:
+                at += 1
+            if at >= cap:
+                if step <= 1:
+                    return None
+                return claim(1)
+            state["next"] = at + step
+            return at
+
+        for op in order:
+            number = claim(max(1, sparse))
+            if number is None:  # pragma: no cover - 47 opcodes cannot fill 255
+                raise ValueError("no opcode numbers left for %s" % op)
+            to_byte[op] = number
+            to_op[number] = op
+        aliases: Dict[str, Tuple[int, ...]] = {}
+        if alias_ratio > 0:
+            for op in order:
+                extra: List[int] = []
+                while rng.chance(alias_ratio) and len(extra) < 3:
+                    number = claim(max(1, sparse))
+                    if number is None:
+                        break
+                    extra.append(number)
+                    to_op[number] = op
+                if extra:
+                    aliases[op] = tuple(extra)
+        fused_map: Dict[int, Tuple[str, str]] = {}
+        for pair in fused:
+            number = claim(max(1, sparse))
+            if number is None:
+                # No room for another arm.  Dropping the rule here is only half
+                # the answer -- the caller has to drop it from the *format* too,
+                # which is what ``allocated_fused`` is for.
+                break
+            to_op[number] = FUSED_PREFIX + "%s,%s" % pair
+            fused_map[number] = pair
+        return cls(to_byte=to_byte, to_op=to_op, aliases=aliases,
+                   fused=fused_map)
 
     def byte(self, op: str) -> int:
         try:
@@ -172,14 +286,39 @@ class OpcodeMap:
         except KeyError:
             raise KeyError(f"{op} is not in this build's opcode map") from None
 
+    def numbers(self, op: str) -> Tuple[int, ...]:
+        """Every number this build will accept for ``op``.
+
+        The encoder uses ``byte(op)`` unless it deliberately draws an alias;
+        the dispatcher generator needs the whole set, because a stream that
+        *may* contain an alias has to be able to execute it.
+        """
+        primary = self.to_byte[op]
+        return (primary,) + tuple(self.aliases.get(op, ()))
+
     def size(self) -> int:
         return len(self.to_byte)
 
+    def opcode_count(self) -> int:
+        """How many numbers the dispatch chain branches on, aliases included."""
+        return len(self.to_op)
 
-def operand_size(op: str) -> int:
-    """Encoded length in bytes of one instruction of this opcode."""
-    spec = FORMATS[op]
-    return 1 + len(spec.regs) + WIDE_BYTES * len(spec.wides)
+
+#: Marks a fused super-instruction inside ``to_op``, which keys on strings.
+FUSED_PREFIX = "@"
+
+
+def operand_size(op: str, fmt: Any = None) -> int:
+    """Encoded length in bytes of one instruction of this opcode.
+
+    With no format this is the historical layout -- one opcode byte, one byte
+    per register operand, two per wide operand -- which is what every call site
+    that has not been given a :class:`~couxobf.vm.format.FormatSpec` expects.
+    """
+    if fmt is None:
+        spec = FORMATS[op]
+        return 1 + len(spec.regs) + WIDE_BYTES * len(spec.wides)
+    return fmt.size(op)
 
 
 def layout() -> List[Tuple[str, int]]:

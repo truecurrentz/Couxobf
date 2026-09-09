@@ -55,10 +55,11 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from ..ir import OP, TERMINATORS
 from ..vm import isa
+from ..vm.format import FusionRule
 from ..vm.isa import OpcodeMap
 
 __all__ = ["IntegrityError", "ProtoReport", "validate_proto", "validate_module"]
@@ -133,9 +134,10 @@ class ProtoReport:
 def _wide_offset(op: str, wide_index: int) -> int:
     """Byte offset of a wide operand inside its own instruction.
 
-    The layout is one opcode byte, then one byte per register operand in
-    ``FORMATS[op].regs`` order, then two little-endian bytes per wide operand
-    in ``FORMATS[op].wides`` order.
+    The legacy layout: one opcode byte, then one byte per register operand in
+    ``FORMATS[op].regs`` order, then two little-endian bytes per wide operand in
+    ``FORMATS[op].wides`` order.  A build with a format hands that job to the
+    format, and this stays for callers that validate the historical layout.
     """
     return 1 + len(isa.FORMATS[op].regs) + 2 * wide_index
 
@@ -144,9 +146,103 @@ def _read_wide(code: bytes, at: int) -> int:
     return code[at] + code[at + 1] * 256
 
 
+def _reader(fmt: Any) -> "_FormatReader":
+    return _FormatReader(fmt)
+
+
+class _FormatReader:
+    """Walks a payload the way this build's interpreter reads it.
+
+    The validator is a second implementation of the decoder, and that is a risk
+    in its own right: two implementations that agree on the *wrong* thing catch
+    nothing.  The mitigation is that this one has no layout logic of its own --
+    offsets, widths, masks, target representation and header field order all
+    come from the same :class:`~couxobf.vm.format.FormatSpec` the encoder and the
+    generator use.  A build that changes its format changes all three at once,
+    which is the property that keeps the check meaningful instead of decorative.
+    """
+
+    def __init__(self, fmt: Any) -> None:
+        from ..vm.format import LEGACY_SPEC
+        from ..vm.isa import FORMATS
+        self._FORMATS = FORMATS
+        self.fmt = fmt if fmt is not None else LEGACY_SPEC
+        self.legacy = fmt is None
+
+    def header(self, code: bytes) -> Dict[str, int]:
+        if self.legacy:
+            nparams, flags, nregs, nconsts, entry = HEADER.unpack_from(code, 0)
+            return {"nparams": nparams, "flags": flags, "nregs": nregs,
+                    "nconsts": nconsts, "entry": entry}
+        return self.fmt.header.parse(code)
+
+    def size(self, op: str) -> int:
+        if self.legacy:
+            return isa.operand_size(op)
+        return self.fmt.size(op)
+
+    def field_at(self, op: str, wide_index: int) -> int:
+        if self.legacy:
+            return _wide_offset(op, wide_index)
+        offs = self.fmt.offsets(op)
+        name = self._FORMATS[op].wides[wide_index]
+        return offs[("w", name)]
+
+    def opcode_at(self, code: bytes, at: int) -> int:
+        if self.fmt.op_bytes == 1:
+            return code[at]
+        return code[at] + code[at + 1] * 256
+
+    def body_at(self, op: str, code: bytes, at: int, key) -> int:
+        """The raw integer in one operand field, before masks are undone."""
+        off = self.fmt.offsets(op)[key]
+        width = self.fmt.width(key)
+        return int.from_bytes(code[at + off:at + off + width], "little")
+
+    def decode_field(self, key, raw: int) -> int:
+        mod = 1 << (8 * self.fmt.width(key))
+        return (raw - self.fmt.mask(key)) % mod
+
+    def resolve_target(self, op: str, code: bytes, at: int, size: int,
+                       opmap: Any, edges: Optional[Sequence[int]]) -> int:
+        """Where a jumping instruction goes, as a 0-based offset.
+
+        Each target representation needs a different question answered --
+        ``rel`` needs this instruction's own position, ``edges`` needs the
+        table -- so the opcode's *meaning* is not enough and the walk has to
+        carry the instruction's start with it.
+        """
+        wide_index = self._FORMATS[op].wides.index("target")
+        raw_at = self.field_at(op, wide_index)
+        if self.legacy:
+            return _read_wide(code, at + raw_at)
+        value = self.decode_field(("w", "target"),
+                                  self.body_at(op, code, at, ("w", "target")))
+        mode = self.fmt.target_mode
+        if mode == "abs":
+            return value
+        if mode == "biased":
+            mod = 1 << (8 * self.fmt.wide_bytes)
+            return (value - self.fmt.target_bias) % mod
+        if mode == "rel":
+            mod = 1 << (8 * self.fmt.wide_bytes)
+            delta = value
+            if delta >= mod // 2:
+                delta -= mod
+            return at + size + delta
+        if mode == "edges":
+            if edges is None or value >= len(edges):
+                raise IntegrityError(
+                    f"edge index {value} is not in this prototype's edge table")
+            return edges[value]
+        raise IntegrityError(f"unknown target mode {mode!r}")
+
+
 def validate_proto(proto_id: int, code: bytes, consts: Iterable[Any],
                    opmap: OpcodeMap,
-                   expected_starts: Optional[Iterable[int]] = None) -> ProtoReport:
+                   expected_starts: Optional[Iterable[int]] = None,
+                   fmt: Any = None,
+                   edges: Optional[Sequence[int]] = None) -> ProtoReport:
     """Check one encoded prototype, and report what the walk covered.
 
     Raises :class:`IntegrityError` on the first inconsistency.  The checks are
@@ -154,13 +250,21 @@ def validate_proto(proto_id: int, code: bytes, consts: Iterable[Any],
     one that carries the weight: everything before it is a sanity bound, while
     the walk is what proves the stream the interpreter is about to execute is
     the stream the encoder meant to produce.
+
+    ``fmt`` and ``edges`` describe the format the payload was encoded with.
+    Without them this checks the historical layout, which is what every call
+    site written before formats existed passes.
     """
-    if len(code) < HEADER_SIZE:
+    reader = _reader(fmt)
+    header_size = reader.fmt.header_size if fmt is not None else HEADER_SIZE
+    if len(code) < header_size:
         raise IntegrityError(
             f"proto {proto_id}: code is {len(code)} bytes, short of the "
-            f"{HEADER_SIZE}-byte header")
+            f"{header_size}-byte header")
 
-    nparams, _flags, nregs, nconsts, entry = HEADER.unpack_from(code, 0)
+    head = reader.header(code)
+    nparams, nregs, nconsts, entry = (head["nparams"], head["nregs"],
+                                      head["nconsts"], head["entry"])
     consts = list(consts)
 
     if nconsts != len(consts):
@@ -172,55 +276,79 @@ def validate_proto(proto_id: int, code: bytes, consts: Iterable[Any],
             f"proto {proto_id}: {nparams} parameters cannot fit in {nregs} "
             f"registers")
     # `entry` is an absolute offset into the blob, header included -- the
-    # encoder starts its program counter at HEADER.size and every block offset
-    # and jump target is measured from the same origin.  Treating it as
-    # relative to the end of the header, which is the intuitive reading and the
-    # wrong one, starts the walk eight bytes late.  On a 25-byte prototype that
-    # silently validated a three-instruction suffix of a five-instruction
+    # encoder starts its program counter at the end of the header and every
+    # block offset and jump target is measured from the same origin.  Treating
+    # it as relative to the end of the header, which is the intuitive reading and
+    # the wrong one, starts the walk eight bytes late.  On a 25-byte prototype
+    # that silently validated a three-instruction suffix of a five-instruction
     # program and reported success.
-    if entry < HEADER_SIZE or entry >= len(code):
+    if entry < header_size or entry >= len(code):
         raise IntegrityError(
             f"proto {proto_id}: entry offset {entry} is outside the "
-            f"{HEADER_SIZE}..{len(code) - 1} code range")
+            f"{header_size}..{len(code) - 1} code range")
 
-    known = set(opmap.to_byte.values())
+    # Which number means what, including aliases and fused super-ops.  A map
+    # that only knew the primary numbers would reject a stream that legitimately
+    # used an alias, and "the validator disagrees with the interpreter" is the
+    # one failure mode a structural check must never have.
+    known: Dict[int, Any] = {}
+    for op, number in _all_numbers(opmap):
+        known[number] = ("op", op)
+    for number, pair in (opmap.fused or {}).items():
+        known[number] = ("fused", pair)
     body = len(code)
     report = ProtoReport(proto_id=proto_id, code_size=len(code), entry=entry,
                          nparams=nparams, nregs=nregs, nconsts=nconsts)
 
     # A worklist rather than a linear sweep: the point is to reach instruction
-    # starts the way control flow does.  A linear sweep would happily decode
-    # the operand bytes of a wide instruction as if they were an opcode, and
-    # then report a bogus instruction boundary as valid.
+    # starts the way control flow does.  A linear sweep would happily decode the
+    # operand bytes of a wide instruction as if they were an opcode, and then
+    # report a bogus instruction boundary as valid.
     work = [entry]
     seen: Set[int] = set()
     while work:
         at = work.pop()
         if at in seen:
             continue
-        if at < HEADER_SIZE or at >= body:
+        if at < header_size or at >= body:
             raise IntegrityError(
                 f"proto {proto_id}: control flow reaches offset {at}, outside "
-                f"the {HEADER_SIZE}..{body} code range")
+                f"the {header_size}..{body} code range")
         seen.add(at)
-        opcode = code[at]
+        opcode = reader.opcode_at(code, at)
         if opcode not in known:
             raise IntegrityError(
                 f"proto {proto_id}: opcode byte {opcode} at offset {at} is not "
                 f"assigned by this build's opcode map")
-        op = opmap.to_op[opcode]
-        size = isa.operand_size(op)
-        if at + size > body:
-            raise IntegrityError(
-                f"proto {proto_id}: {op} at offset {at} needs {size} bytes but "
-                f"only {body - at} remain")
-
-        if op in _JUMP_OPS:
-            wide_at = at + _wide_offset(op, isa.FORMATS[op].wides.index("target"))
-            target = _read_wide(code, wide_at)   # absolute, like entry
-            report.targets.add(target)
-            work.append(target)
-        if op not in _NO_FALLTHROUGH:
+        kind, payload = known[opcode]
+        falls = True
+        if kind == "fused":
+            first, second = payload
+            size = reader.fmt.fused_size(FusionRule(first, second))
+            # Both halves must decode, because both are executed.  Checking only
+            # that the *unit* fits would accept a stream whose second half runs
+            # off the end.
+            for op in (first, second):
+                _check_fits(proto_id, op, at, code, reader, size, body)
+                if op in _JUMP_OPS or op in _NO_FALLTHROUGH:
+                    # Neither half may transfer control: the encoder only fuses
+                    # inside a block, and a jump in the first half would make the
+                    # second half dead code.  Seeing one here means the two
+                    # halves of the tool disagree about what is fusible.
+                    raise IntegrityError(
+                        f"proto {proto_id}: fused unit {op} transfers control, "
+                        f"which the encoder is not allowed to fuse")
+            op = "%s+%s" % (first, second)
+        else:
+            op = payload
+            size = reader.size(op)
+            _check_fits(proto_id, op, at, code, reader, size, body)
+            if op in _JUMP_OPS:
+                target = reader.resolve_target(op, code, at, size, opmap, edges)
+                report.targets.add(target)
+                work.append(target)
+            falls = op not in _NO_FALLTHROUGH
+        if falls:
             work.append(at + size)
 
         report.instructions += 1
@@ -258,14 +386,36 @@ def validate_proto(proto_id: int, code: bytes, consts: Iterable[Any],
     return report
 
 
-def validate_module(encoded: Dict[int, Any],
-                    opmap: OpcodeMap) -> List[ProtoReport]:
+def _all_numbers(opmap: OpcodeMap):
+    """``(op, number)`` for every number the dispatcher accepts for an op."""
+    for op in opmap.to_byte:
+        for number in opmap.numbers(op):
+            yield op, number
+
+
+def _check_fits(proto_id: int, op: str, at: int, code: bytes, reader,
+                size: int, body: int) -> None:
+    if at + size > body:
+        raise IntegrityError(
+            f"proto {proto_id}: {op} at offset {at} needs {size} bytes but "
+            f"only {body - at} remain")
+
+
+def validate_module(encoded: Dict[int, Any], opmap: OpcodeMap,
+                    fmt: Any = None) -> List[ProtoReport]:
     """Validate every encoded prototype in a build.
 
     ``encoded`` maps proto id to the object produced by
-    :func:`~couxobf.vm.encode.encode_proto`, which carries ``.code`` and
-    ``.consts``.
+    :func:`~couxobf.vm.encode.encode_proto`, which carries ``.code``,
+    ``.consts`` and -- when the format represents jumps indirectly -- ``.edges``.
+
+    ``fmt`` is normally taken from each prototype's own encoded record, because
+    one build can hold several formats.  The argument overrides that for callers
+    that validate a hand-written payload.
     """
-    return [validate_proto(pid, encoded[pid].code, encoded[pid].consts, opmap,
-                           expected_starts=encoded[pid].starts)
-            for pid in sorted(encoded)]
+    return [validate_proto(pid, enc.code, enc.consts, opmap,
+                           expected_starts=enc.starts,
+                           fmt=fmt if fmt is not None else getattr(enc, "fmt",
+                                                                    None),
+                           edges=getattr(enc, "edges", ()))
+            for pid, enc in ((p, encoded[p]) for p in sorted(encoded))]

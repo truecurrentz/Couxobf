@@ -46,6 +46,7 @@ from couxobf.emit import printer
 from couxobf.ir import FuncIR
 from couxobf.toolchain import execute, find_toolchain
 from couxobf.vm import encode, isa, runtime, wiring
+from couxobf.vm.format import FormatSpec
 from test_roundtrip import EXCLUDED, MICRO_DIR, _conformance_dir
 
 TOOLCHAIN = find_toolchain()
@@ -69,26 +70,35 @@ NAMES = {
 
 
 class _VMReconstructor(lower_back.Reconstructor):
-    """Reconstructs natively, except for prototypes handed to the VM."""
+    """Reconstructs natively, except for prototypes handed to the VM.
 
-    def __init__(self, opmap, **kw):
+    The closure it emits is the production one -- this build's ``enter`` applied
+    to this build's row of the assembled payload table -- because the descriptor
+    shape is precisely what a lift has to reproduce.  An earlier version of this
+    class hand-wrote its own row and hand-picked the entry name; the tests then
+    passed against a shape that no longer shipped.
+    """
+
+    def __init__(self, plan, **kw):
         super().__init__(**kw)
-        self.opmap = opmap
+        self.plan = plan
         self.encoded = {}
 
     def function_expr(self, proto: FuncIR):
-        ok, _reason = encode.can_virtualize(proto)
+        fmt = self.plan.fmt_for(proto.proto_id)
+        ok, _reason = encode.can_virtualize(proto, fmt)
         if not ok:
             return super().function_expr(proto)
-        enc = encode.encode_proto(proto, self.opmap)
+        enc = encode.encode_proto(
+            proto, self.plan.opmap_for(proto.proto_id), fmt=fmt)
         self.encoded[proto.proto_id] = enc
         # A real Luau closure that enters the interpreter.  To the surrounding
         # native code this is indistinguishable from the function it replaces.
         return A.Func(
             params=[A.Param(name=None)],
             body=A.Block(body=[A.Return(values=[A.Call(
-                fn=A.Name(name=NAMES["enter"]),
-                args=[A.Index(obj=A.Name(name=_DESCRIPTOR_TABLE),
+                fn=A.Name(name=self.plan.enter_for(proto.proto_id)),
+                args=[A.Index(obj=A.Name(name=self.plan.rows_table),
                               key=A.Number(value=proto.proto_id,
                                            is_float=False)),
                       A.Call(fn=A.Name(name=NAMES["getfenv"]),
@@ -101,6 +111,10 @@ class _VMReconstructor(lower_back.Reconstructor):
 #: basic.luau alone virtualizes 256 prototypes, which fails to compile with
 #: "Out of local registers ... exceeded limit 200".
 _DESCRIPTOR_TABLE = "_kVT"
+
+#: The four structures a build splits its VM metadata across (#17): the payload
+#: blob, the constants, the control-flow edges, and the row that assembles them.
+_TABLES = (_DESCRIPTOR_TABLE, "_kKT", "_kET", "_kRT")
 
 
 def _lit(value) -> str:
@@ -115,17 +129,20 @@ def _lit(value) -> str:
     return p.w.value()
 
 
-def _plan(seed: bytes = b"\x07" * 16) -> wiring.VMPlan:
+def _plan(seed: bytes = b"\x07" * 16, protos=(), **kw) -> wiring.VMPlan:
     """A plan over the fixed test names, for driving the real emitter.
 
     These tests used to carry their own copy of the descriptor row.  That copy
     is exactly how a bug like the unauthenticated plaintext ``entry`` survives:
-    the production emitter changed, the test emitter did not, and the tests
-    kept passing against the shape they were asserting instead of the shape
-    that ships.
+    the production emitter changed, the test emitter did not, and the tests kept
+    passing against the shape they were asserting instead of the shape that
+    ships.  So the plan here is built by ``wiring.make_plan`` -- the same call
+    the pipeline makes -- with only the names and the table names pinned, and
+    ``names=`` exists on ``make_plan`` for exactly this purpose.
     """
-    return wiring.VMPlan(opmap=_opmap(seed), names=NAMES, protos=set(),
-                         table=_DESCRIPTOR_TABLE, family="register")
+    kw.setdefault("randomize_opcodes", True)
+    return wiring.make_plan(rngmod.make_domains(seed).get("vm"), set(protos),
+                            tables=_TABLES, names=NAMES, **kw)
 
 
 def _opmap(seed: bytes = b"\x07" * 16) -> isa.OpcodeMap:
@@ -140,7 +157,7 @@ def vm_reconstruct(src: str, name: str = "test.luau", seed: bytes = b"\x07" * 16
     back to native code for everything.
     """
     module = ir.Lowerer().lower(parser.parse(src, name))
-    rec = _VMReconstructor(_opmap(seed))
+    rec = _VMReconstructor(_plan(seed))
     body = printer.emit(rec.reconstruct(module))
     parts = [lower_back.HELPERS_SRC,
              wiring.prelude_source(_plan(seed), dict(rec.encoded), _lit, _lit)]
@@ -741,12 +758,10 @@ def test_every_dispatcher_shape_computes_the_same_thing(dispatcher, vm_family):
     # fixed ones: the reconstructor hardcodes _DESCRIPTOR_TABLE when it emits
     # the call sites, so a plan that invented a different name would produce a
     # body indexing a table that was never declared.
-    plan = dataclasses.replace(
-        wiring.make_plan(domains.get("vm"), {1}, family=vm_family,
-                         dispatcher=dispatcher),
-        names=NAMES, table=_DESCRIPTOR_TABLE)
+    plan = _plan(seed=b"\xd1" * 16, protos={1}, family=vm_family,
+                 dispatcher=dispatcher)
     module = ir.Lowerer().lower(parser.parse(DISPATCH_SOURCE, "d.luau"))
-    rec = _VMReconstructor(plan.opmap)
+    rec = _VMReconstructor(plan)
     body = printer.emit(rec.reconstruct(module))
     parts = [lower_back.HELPERS_SRC,
              wiring.prelude_source(plan, dict(rec.encoded), _lit, _lit),
@@ -818,3 +833,130 @@ def test_opcode_randomization_changes_the_numbering():
     again = wiring.make_plan(rngmod.make_domains(b"\xd3" * 16).get("vm"), {1},
                              randomize_opcodes=True)
     assert again.opmap.to_byte == on.opmap.to_byte
+
+
+# ---------------------------------------------------------------------------
+# handler hygiene: a body may only touch names its own reads declare
+# ---------------------------------------------------------------------------
+#
+# ``GETTABLEK``/``SETGLOBAL`` both had a body that referenced a local the
+# generated reads never declared.  Luau compiles ``K[k + 1]`` with an unbound
+# ``k`` into "index nil", so the artifact parsed, ran, and failed at the first
+# store -- and nothing in the encoder, the validator or the printer objected.
+# A name that only exists in one of the two halves of a handler is the cheapest
+# possible way for a generated interpreter to be wrong, so it is checked
+# statically, for every format, before anything is executed.
+
+_LUAU_GLOBALS = frozenset({
+    "pc", "R", "K", "E", "true", "false", "nil", "and", "or", "not",
+    "_bd", "_r8", "_rr", "_rp", "_rk", "_rt", "_pack", "_unpack", "error",
+    "type", "getmetatable", "bit32", "table", "string", "math", "getfenv",
+    "while", "do", "then", "else", "elseif", "end", "if", "for", "in", "local",
+    "function", "return", "break", "repeat", "until", "goto",
+})
+
+
+def _handler_names(lines):
+    """(declared, used) for a chunk of generated handler source."""
+    declared = set()
+    used = set()
+    for line in lines:
+        text = line.strip()
+        # ``src.n`` and ``t[1]`` are fields and indices, not names: strip the
+        # suffix of a dot access so only the base identifier is considered.
+        text = re.sub(r"\.\s*([A-Za-z_][A-Za-z0-9_]*)", r".\1", text)
+        text = re.sub(r"\.[A-Za-z_][A-Za-z0-9_]*", "", text)
+        for m in re.finditer(r"\blocal\s+([A-Za-z_][A-Za-z0-9_,\s]*?)\s*=",
+                             text):
+            declared.update(p.strip() for p in m.group(1).split(","))
+        for m in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", text):
+            used.add(m.group(1))
+    return declared, used
+
+
+@pytest.mark.parametrize("op", sorted(isa.SUPPORTED))
+def test_every_handler_body_uses_only_declared_names(op):
+    """Every identifier a handler reads is either declared or a real global."""
+    from couxobf.vm.format import LEGACY_SPEC, FormatSpec
+
+    for spec in (LEGACY_SPEC,
+                 FormatSpec(reg_bytes=2, wide_bytes=3, pad=2, wides_first=True,
+                            reg_mask=0x5A, wide_mask=0x1234,
+                            target_mode="rel", target_bias=7),
+                 FormatSpec(target_mode="edges", fused=(), reorder=True)):
+        lines = runtime._handler(op, NAMES, _make_family("register", NAMES),
+                                 spec)
+        declared, used = _handler_names(lines)
+        # multi-value packs arrive as table fields; a `for` loop's control
+        # variable is declared by the loop header itself
+        for line in lines:
+            m = re.match(r"\s*for\s+([A-Za-z_][A-Za-z0-9_]*)", line)
+            if m:
+                declared.add(m.group(1))
+        free = sorted(n for n in used - declared - _LUAU_GLOBALS
+                      # helper locals are named through the NAMES dict
+                      if n not in set(NAMES.values()))
+        assert not free, (
+            f"{op} under {spec.target_mode}/{spec.reg_bytes}B registers uses "
+            f"{free}, which no read in the handler declares: {lines}")
+
+
+#: The layouts whose geometry differs from the historical one, so a handler that
+#: happens to work under ``op_bytes == 1, pad == 0`` cannot pass on its own.
+_GEOMETRY_FORMATS = (
+    FormatSpec(),
+    FormatSpec(pad=1),
+    FormatSpec(pad=2, wides_first=True),
+    FormatSpec(op_bytes=2),
+    FormatSpec(op_bytes=2, reg_bytes=2, wide_bytes=3, pad=1),
+    FormatSpec(reg_bytes=2, wide_bytes=3),
+)
+
+
+def _jumping_ops(fmt):
+    """Opcodes whose instruction carries a jump target."""
+    return sorted(op for op in isa.FORMATS if ("w", "target") in fmt.offsets(op))
+
+
+@pytest.mark.parametrize("fmt", _GEOMETRY_FORMATS)
+def test_a_jump_leaves_pc_where_its_own_mode_measures_from(fmt):
+    """The arm that transfers control must know where ``pc`` is standing.
+
+    A relative delta is measured from the *next* instruction, so an arm that
+    never advances -- ``JMP`` is one, because nothing reads the pc it leaves
+    behind -- has to cover the distance itself.  Getting this wrong is not a
+    crash: it lands one byte into the instruction after the target, and the
+    payload, the encoder and the integrity walk all still agree with each other,
+    so only an executed program can tell.  Absolute modes have the mirror-image
+    obligation: they assign the position, so they must not add to ``pc`` at all.
+    """
+    for op in _jumping_ops(fmt):
+        lines = runtime._handler(op, NAMES, _make_family("register", NAMES), fmt)
+        body = fmt.body_size(op)
+        advanced = 0
+        checked = False
+        for line in lines:
+            moved = re.fullmatch(r"\s*pc = pc \+ (\d+)\s*$", line)
+            if moved:
+                advanced += int(moved.group(1))
+                continue
+            jumped = re.fullmatch(r"\s*pc = pc \+ (?:(\d+) \+ )?tgt\s*$", line)
+            if jumped:
+                checked = True
+                travel = int(jumped.group(1) or 0)
+                if fmt.target_mode == "rel":
+                    assert advanced + travel == body, (
+                        f"{op} under {fmt.target_mode}/{fmt.op_bytes}B opcodes/"
+                        f"{fmt.pad} pad: a taken jump leaves pc at "
+                        f"{advanced + travel} bytes into the unit, but the "
+                        f"encoder measured the delta from {body}; the target is "
+                        f"reached {body - advanced - travel} bytes early")
+                else:
+                    pytest.fail(
+                        f"{op} under {fmt.target_mode}: added a decoded target "
+                        f"to pc, which is only how relative mode works")
+        if fmt.target_mode == "rel":
+            assert checked, f"{op}: no jump at all under relative targets"
+        elif op in runtime._NO_ADVANCE:
+            assert "pc = tgt + 1" in lines, (
+                f"{op} transfers control without setting pc from the target")
