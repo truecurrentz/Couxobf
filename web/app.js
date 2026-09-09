@@ -35,25 +35,18 @@ const SPEC = [
        "frame costs more than it hides."],
       ["max_vm_functions", "Max virtualized functions", "int",
        "A cap, not a target. 0 means no limit."],
+      ["vm_polymorphism", "Polymorphic VM", "bool",
+       "One best-mode switch: blends hybrid/register/stack/accumulator state with " +
+       "nested, bucket, decision-tree, computed-state and threaded dispatch. Turn it " +
+       "off only for debugging a simpler single-family VM."],
       ["vm_variety", "VMs per artifact", "int",
-       "Distinct interpreters in one artifact. Each group gets its own family, " +
-       "dispatcher and instruction format, so 2 means two VMs."],
-      ["vm_family", "VM family", "select",
-       "The register discipline the interpreter uses. Group 0 keeps this; extra " +
-       "groups rotate through the rest when state distribution is on."],
-      ["dispatcher_family", "Dispatcher", "select",
-       "How the interpreter picks the next handler. `mixed` draws one per group, " +
-       "which is what makes the dispatcher part of the per-build shape."],
+       "Distinct interpreters in one artifact. In polymorphic mode this is a floor; " +
+       "the build uses multiple architectures when enough functions are available."],
       ["vm_isa_subset", "Per-VM instruction set", "bool",
        "Each interpreter carries only the opcodes the functions on it need, so the " +
        "handler count follows the code instead of being the whole ISA in every " +
        "build. It also shrinks the artifact; a VM running three numeric helpers " +
        "does not need forty arms."],
-      ["state_distribution", "Spread VM state", "bool",
-       "Rotate the extra groups through the other families instead of repeating one " +
-       "discipline for the whole build."],
-      ["dispatcher_splitting", "Split dispatchers", "bool",
-       "Give each VM its own dispatch shape. Needs more than one group."],
     ],
   },
   {
@@ -653,9 +646,9 @@ function renderMetrics(data) {
   $("metrics").hidden = false;
 }
 
-/* The interpreters, as the build made them.  The preset says "vm_family: stack"
-   and the artifact can hold a stack machine, a register machine and an accumulator
-   in the same file; a panel that repeated the request would be decoration. */
+/* The interpreters, as the build made them.  The site exposes one polymorphism
+   switch, but the artifact can hold stack/register/hybrid/accumulator machines
+   with different dispatchers in the same file; this panel reports the result. */
 function renderVms(groups) {
   const box = $("vmBox");
   if (!groups || !groups.length) { box.hidden = true; return; }
@@ -855,8 +848,7 @@ async function loadSurface() {
    `option_surface()`, so an update to one has to update the other. */
 const FALLBACK = {
   virtualization_level: { kind: "enum", choices: ["none", "light", "medium", "heavy", "maximum"], default: "heavy" },
-  vm_family: { kind: "enum", choices: ["register", "stack", "accumulator", "hybrid"], default: "register" },
-  dispatcher_family: { kind: "enum", choices: ["none", "nested_if", "decision_tree", "bucket", "state_transition", "threaded", "mixed"], default: "mixed" },
+  vm_polymorphism: { kind: "bool", default: true },
   cache_policy: { kind: "enum", choices: ["none", "bounded", "full"], default: "none" },
   guard_policy: { kind: "choice", choices: ["fail", "ignore"], default: "fail" },
   hash_comments: { kind: "choice", choices: ["auto", "strip", "strict"], default: "auto" },

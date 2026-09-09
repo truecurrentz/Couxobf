@@ -176,7 +176,7 @@ def test_writes_through_to_the_prototypes():
     chosen = result.virtualized()
     if chosen:
         proto = next(p for p in mod.walk() if p.proto_id == chosen[0])
-        assert proto.vm_family == VMFamily.REGISTER.value
+        assert proto.vm_family == "polymorphic"
 
 
 def test_vm_family_is_unset_when_not_virtualized():

@@ -314,6 +314,8 @@ def _make_groups(rng: Rng, proto_ids: List[int], names: Dict[str, str], *,
     count = max(1, min(int(variety), 4))
     if len(proto_ids) < 2:
         count = 1
+    else:
+        count = min(count, len(proto_ids))
     family_pool = list(families) if families else [family]
     dispatcher_pool = list(dispatchers) if dispatchers else [dispatcher]
     if len(family_pool) < count:

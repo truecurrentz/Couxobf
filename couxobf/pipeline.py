@@ -42,7 +42,7 @@ from . import ir as _ir
 from . import lower_back as _lower_back
 from . import parser as _parser
 from . import sema as _sema
-from .config import Config, VirtualizationLevel, VMFamily
+from .config import Config, DispatcherFamily, VirtualizationLevel, VMFamily
 from .crypto.kdf import KeyMaterial
 from .rng import make_domains
 from .verify.output import ValidationReport, validate_or_raise, validate_output
@@ -383,12 +383,12 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         vm_level=config.virtualization_level,
         vm_rng=domains.get("vm"),
         vm_protos=selected,
-        vm_family=config.vm_family,
+        vm_family=(VMFamily.HYBRID if config.vm_polymorphism else config.vm_family),
         block_permutation=config.block_permutation,
         opaque_predicates=bool(config.opaque_predicates),
         isa_subset=bool(config.vm_isa_subset),
         layout_rng=domains.get("cfg"),
-        dispatcher_family=config.dispatcher_family,
+        dispatcher_family=(DispatcherFamily.MIXED if config.vm_polymorphism else config.dispatcher_family),
         opcode_randomization=config.opcode_randomization,
         fmt_prefs=_vm_format.FormatPrefs.from_config(config),
         string_level=config.string_protection_level,
@@ -398,21 +398,19 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         string_rng=domains.get("strings"),
         string_cache_policy=str(getattr(config.cache_policy, "value",
                                         config.cache_policy)),
-        # One VM per build is the historical behaviour.  Asking for more groups
-        # is what makes "several VM families per artifact" true, and
-        # `state_distribution` is the config's name for exactly that spread.
-        vm_variety=(max(1, int(config.vm_variety))
-                    if (config.state_distribution or config.vm_variety > 1)
-                    else 1),
-        # Spread, but starting where the user pointed: a build that pinned
-        # ``vm_family`` and turned state distribution on still gets that family
-        # for group 0, with the rest rotated behind it.  Ignoring the pin would
-        # make the config's own field unobservable, which is the one thing a
-        # knob is not allowed to be.
-        families=(_family_rotation(config.vm_family)
-                  if config.state_distribution else None),
-        dispatchers=(_dispatcher_rotation(config.dispatcher_family)
-                     if config.dispatcher_splitting else None),
+        # One VM per build is the historical fallback.  In polymorphic mode the
+        # single public switch enables that spread automatically instead of making
+        # the user juggle separate family and dispatcher choices.
+        vm_variety=((max(2, int(config.vm_variety)))
+                    if config.vm_polymorphism else max(1, int(config.vm_variety))),
+        # The site exposes one "polymorphic VM" switch rather than separate
+        # family/dispatcher menus.  On means use a best-of blend: hybrid first,
+        # then the other state machines, with every dispatcher shape available
+        # to split across groups.  Off keeps the pinned values for debugging.
+        families=(("hybrid", "stack", "accumulator", "register")
+                  if config.vm_polymorphism else (getattr(config.vm_family, "value", config.vm_family),)),
+        dispatchers=(tuple(_vm_runtime.DISPATCHERS)
+                     if config.vm_polymorphism else _dispatcher_rotation(config.dispatcher_family)),
         fusion_level=(1 if config.instruction_fusion
                       and config.super_instructions else 0),
         alias_ratio=_alias_ratio(config),
@@ -549,6 +547,7 @@ def cost_report(result: BuildResult) -> str:
     # The config's answer, labelled as such: with more than one group the artifact
     # carries families the request never named, and the group lines below are the
     # ones that describe the file.
+    lines.append("vm polymorphism     : %s" % ("on" if c.vm_polymorphism else "off"))
     lines.append(f"vm family (config)  : {getattr(c.vm_family, 'value', c.vm_family)}")
     for group in s.vm_groups:
         fmt = group.get("format") or {}

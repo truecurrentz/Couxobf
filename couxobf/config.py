@@ -149,8 +149,15 @@ class Config:
     #: 0 keeps the historical layout, 1 mixes, 2 spends every knob.  A level
     #: rather than a bool because the size cost is real and per-group.
     instruction_formats: int = 1
-    #: How many distinct VMs one build emits.  Each group gets its own family,
-    #: dispatcher and format, so 2 means two interpreters in the artifact.
+    #: One switch for the "best mixed VM" mode.  On means the build chooses and
+    #: combines the strongest pieces of every VM architecture and dispatch shape:
+    #: hybrid/register/stack/accumulator state, computed/state/threaded/nested
+    #: dispatch, per-group formats and per-build opcode maps.  Off keeps a single
+    #: pinned VM for debugging/reproducibility.
+    vm_polymorphism: bool = True
+    #: How many distinct VMs one build emits.  In polymorphic mode this is treated
+    #: as a floor and the build may raise it enough to exercise more than one
+    #: architecture when the program has enough functions.
     vm_variety: int = 1
     #: Register fields are widened and masked.  A full register permutation is
     #: not on the table: FORLOOP, CALL and SETLIST all address base+1, base+2,
@@ -329,6 +336,7 @@ class Config:
         return cls(
             virtualization_level=VirtualizationLevel.NONE,
             instruction_formats=0,
+            vm_polymorphism=False,
             vm_variety=1,
             opcode_aliases=0,
             edge_indirection=False,
@@ -377,7 +385,8 @@ class Config:
             # Two VMs, every format knob, fused super-ops, indirect edges.  The
             # price is stated in the report rather than hidden: roughly one
             # extra interpreter.
-            vm_variety=2,
+            vm_polymorphism=True,
+            vm_variety=3,
             instruction_formats=2,
             opcode_aliases=2,
             edge_indirection=True,
@@ -428,9 +437,9 @@ class Config:
     #: Fields that are read by the compiler and change the output.
     IMPLEMENTED: ClassVar[FrozenSet[str]] = frozenset({
         "virtualization_level",
+        "vm_polymorphism",
         "vm_family",
         "block_permutation",
-        "dispatcher_family",
         "opcode_randomization",
         "opcode_aliases",
         "operand_randomization",
@@ -443,8 +452,7 @@ class Config:
         "opcode_cipher",
         "vm_isa_subset",
         "edge_indirection",
-        "state_distribution",
-        "dispatcher_splitting",
+        "dispatcher_family",
         "metadata_fragmentation",
         "string_protection_level",
         "constant_protection_level",

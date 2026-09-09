@@ -707,7 +707,8 @@ def test_family_config_reaches_the_output():
     src = "local function f(a, b) return a * b + 1 end\nprint(f(3, 4))\n"
     outs = {}
     for fam in FAMILIES:
-        config = Config(reproducible_seed=9, min_virtualize_body_nodes=1)
+        config = Config(reproducible_seed=9, min_virtualize_body_nodes=1,
+                        vm_polymorphism=False)
         config.vm_family = fam
         outs[fam] = build(src, config, verify=False).source
     assert len(set(outs.values())) == len(FAMILIES), (

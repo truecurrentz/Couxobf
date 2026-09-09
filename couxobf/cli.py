@@ -55,8 +55,10 @@ def _config_from_args(args) -> Config:
         # numeric-looking default hid it.
         config.virtualization_level = VirtualizationLevel.parse(args.vm_level)
     if getattr(args, "vm_family", None) is not None:
+        config.vm_polymorphism = False
         config.vm_family = args.vm_family
     if getattr(args, "dispatcher", None) is not None:
+        config.vm_polymorphism = False
         config.dispatcher_family = args.dispatcher
     if getattr(args, "string_level", None) is not None:
         config.string_protection_level = args.string_level

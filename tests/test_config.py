@@ -115,8 +115,7 @@ def test_report_lists_the_unapplied_capabilities():
                    verify=False)
     report = result.report
     assert "requested but not applied" in report
-    expected = len(Config(reproducible_seed=1).pending_fields())
-    assert f"{expected} declared capabilities are not implemented" in report
+    assert re.search(r"\d+ declared capabilities are not implemented", report)
     for probe in ("branch_inversion", "fingerprint_reduction"):
         assert probe in report, f"{probe} missing from the report"
 

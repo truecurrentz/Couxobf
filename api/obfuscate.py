@@ -104,8 +104,7 @@ FIELD_REQUIRES: Dict[str, Dict[str, Any]] = {
     "decoy_constants": {"field": "decoys", "op": "==", "value": True},
     "super_instructions": {"field": "instruction_fusion", "op": "==", "value": True},
     "opcode_aliases": {"field": "opcode_randomization", "op": "==", "value": True},
-    "dispatcher_splitting": {"field": "vm_variety", "op": ">=", "value": 2},
-    "state_distribution": {"field": "vm_variety", "op": ">=", "value": 2},
+    "vm_variety": {"field": "vm_polymorphism", "op": "==", "value": True},
     "instruction_formats": {"field": "operand_randomization", "op": "==", "value": True},
     "operand_randomization": {"field": "virtualization_level", "op": "!=", "value": "none"},
     "register_randomization": {"field": "virtualization_level", "op": "!=", "value": "none"},
@@ -125,6 +124,11 @@ _ENUM_FIELDS: Dict[str, Any] = {
     "dispatcher_family": DispatcherFamily,
     "cache_policy": CachePolicy,
 }
+
+#: Implemented compatibility fields that remain available to config files/CLI but
+#: are deliberately not exposed by the web/API surface; `vm_polymorphism` is the
+#: single public best-mode switch now.
+_HIDDEN_SURFACE_FIELDS = {"vm_family", "dispatcher_family"}
 
 
 def _plain(value: Any) -> Any:
@@ -175,7 +179,7 @@ def describe() -> Dict[str, Any]:
         # app.js was apologising for.
         "profile_values": {
             name: {key: _applied_value(Config.from_profile(name), key)
-                   for key in sorted(Config.IMPLEMENTED)}
+                   for key in sorted(Config.IMPLEMENTED - _HIDDEN_SURFACE_FIELDS)}
             for name in Config.PROFILES
         },
     }
@@ -238,7 +242,7 @@ def option_surface() -> Dict[str, Dict[str, Any]]:
 
     surface: Dict[str, Dict[str, Any]] = {}
     defaults = {f.name: f.default for f in dataclasses.fields(Config)}
-    for name in sorted(Config.IMPLEMENTED):
+    for name in sorted(Config.IMPLEMENTED - _HIDDEN_SURFACE_FIELDS):
         if name == "reproducible_seed":
             surface[name] = {"kind": "int", "min": 0, "max": (1 << 128) - 1,
                              "default": None}
