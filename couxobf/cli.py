@@ -78,6 +78,14 @@ def cmd_protect(args, out=sys.stdout, err=sys.stderr) -> int:
     if not args.no_verify:
         toolchain = find_toolchain(args.toolchain)
 
+    pending = config.pending_fields()
+    if pending and not args.quiet:
+        # Terse on purpose: the full list is in `couxobf report`.  Saying
+        # nothing here would let a user believe a flag they set was applied.
+        print(f"couxobf: {len(pending)} requested capabilities are not "
+              f"implemented and were not applied (see `couxobf report`)",
+              file=err)
+
     try:
         result = build(_read(args.input), config, name=os.path.basename(args.input),
                        toolchain=toolchain, verify=not args.no_verify)

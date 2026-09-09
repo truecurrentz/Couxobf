@@ -27,6 +27,7 @@ so anything a determined analyst wants badly enough they can eventually get.
 from __future__ import annotations
 
 import secrets
+import textwrap
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
@@ -264,6 +265,20 @@ def cost_report(result: BuildResult) -> str:
         lines.append("   and no dispatcher -- only renamed identifiers and an")
         lines.append("   encrypted constant pool.")
     lines.append("")
+
+    pending = c.pending_fields()
+    if pending:
+        # Named explicitly, because a config field that silently does nothing
+        # is the same defect as a report that overstates what it did.  The
+        # defaults request all of these, so a default build lists all of them.
+        lines.append("requested but not applied")
+        lines.append("----------------------------------------------")
+        lines.append(f"{len(pending)} declared capabilities are not implemented")
+        lines.append("yet. Setting them changes nothing:")
+        names = ", ".join(n for n, _ in pending)
+        lines.extend(textwrap.wrap(names, width=46,
+                                   initial_indent="  ", subsequent_indent="  "))
+        lines.append("")
 
     lines.append("what this does not do")
     lines.append("-" * 46)

@@ -23,7 +23,8 @@ from __future__ import annotations
 import dataclasses
 import enum
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import (Any, ClassVar, Dict, FrozenSet, List, Optional,
+                    Tuple)
 
 VERSION = "0.1.0"
 
@@ -71,6 +72,11 @@ class VMFamily(enum.Enum):
 class DispatcherFamily(enum.Enum):
     """How the VM decides which handler runs next."""
 
+    #: Leave the dispatcher alone.  Without this member the enum could not
+    #: express "no dispatcher transform", so a config that wanted one had no
+    #: way to decline it -- and Config.pending_fields, which treats an enum
+    #: with a NONE member as turn-off-able, had to special-case it.
+    NONE = "none"
     NESTED_IF = "nested_if"
     TABLE = "table"
     BUCKET = "bucket"
@@ -275,6 +281,58 @@ class Config:
 
     def overrides(self, **kwargs: Any) -> "Config":
         return Config.from_dict({**self.to_dict(), **kwargs})
+
+    # -- what this config actually delivers -----------------------------
+    #
+    # A config field that nothing reads is worse than a missing field: setting
+    # it looks like a decision, and the build silently does something else.
+    # Thirty-five of the fields below were in that state.  They stay declared
+    # because they encode intent for work that is not done yet, but the build
+    # now reports them instead of implying they were applied.
+    #
+    #: Fields that are read by the compiler and change the output.
+    IMPLEMENTED: ClassVar[FrozenSet[str]] = frozenset({
+        "virtualization_level",
+        "vm_family",
+        "string_protection_level",
+        "cache_policy",
+        "bounded_cache_size",
+        "minify",
+        "strip_types",
+        "reproducible_seed",
+        "max_vm_functions",
+        "min_virtualize_body_nodes",
+    })
+
+    #: The value at which a field asks for nothing.
+    @classmethod
+    def _off_value(cls, field: "dataclasses.Field") -> Any:
+        if field.type in (bool, "bool"):
+            return False
+        if field.type in (int, "int", float, "float"):
+            return 0
+        default = field.default
+        if isinstance(default, enum.Enum):
+            # an enum with a NONE member can be turned off; one without cannot
+            return type(default).NONE if hasattr(type(default), "NONE") else None
+        return None
+
+    def pending_fields(self) -> List[Tuple[str, Any]]:
+        """Declared capabilities this build will not deliver.
+
+        Only fields whose current value asks for something are reported: a
+        feature left off was never requested, so listing it would be noise.
+        """
+        out: List[Tuple[str, Any]] = []
+        for f in dataclasses.fields(self):
+            if f.name in self.IMPLEMENTED:
+                continue
+            value = getattr(self, f.name)
+            off = self._off_value(f)
+            if off is not None and value == off:
+                continue
+            out.append((f.name, value))
+        return out
 
     def validate(self) -> List[str]:
         """Return human-readable problems (empty list means the config is fine)."""
