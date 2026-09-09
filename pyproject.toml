@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "couxobf"
+version = "0.1.0"
+description = "Source-to-source Luau obfuscation compiler"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+
+# No runtime dependencies. The build tool is pure Python and the output is
+# self-contained Luau -- depending on anything else would put a package manager
+# between the user and their own build.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+couxobf = "couxobf.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["couxobf*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

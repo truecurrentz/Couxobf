@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="description" content="couxobf — source-to-source Luau obfuscation compiler. Paste or upload .luau, get self-contained protected Luau back.">
+<title>couxobf — Luau obfuscator</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🔐</text></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="mark">🔐</span>
+    <div>
+      <h1>couxobf</h1>
+      <p>source-to-source Luau obfuscation compiler</p>
+    </div>
+  </div>
+  <button id="optionsToggle" class="ghost options-toggle" aria-expanded="false" aria-controls="options">
+    <span>Options</span><span class="chev">▾</span>
+  </button>
+</header>
+
+<main class="wrap">
+
+  <section class="pane" id="inputPane" aria-labelledby="inputHeading">
+    <div class="pane-head">
+      <h2 id="inputHeading">Input</h2>
+      <div class="pane-actions">
+        <label class="ghost file-btn" tabindex="0">
+          <input type="file" id="fileInput" accept=".luau,.lua,.txt,text/plain" hidden>
+          Upload .luau / .txt
+        </label>
+        <button class="ghost" id="loadExample">Load example</button>
+        <button class="ghost" id="clearInput">Clear</button>
+      </div>
+    </div>
+
+    <div class="drop" id="drop">
+      <textarea id="source" spellcheck="false" autocomplete="off" autocapitalize="off"
+        placeholder='-- paste Luau here, or drop a .luau / .txt file&#10;local function greet(name)&#10;  return "hello, " .. name&#10;end&#10;print(greet("world"))'></textarea>
+      <div class="drop-hint" id="dropHint" hidden>Drop the file to load it</div>
+    </div>
+
+    <div class="pane-foot">
+      <span id="inputStats" class="muted">0 bytes</span>
+      <span class="muted">nothing is uploaded anywhere else — the build runs on this request and is not stored</span>
+    </div>
+  </section>
+
+  <section class="pane options" id="options" aria-labelledby="optionsHeading">
+    <div class="pane-head">
+      <h2 id="optionsHeading">Techniques</h2>
+      <div class="pane-actions">
+        <button class="ghost" id="presetMaximum">Maximum</button>
+        <button class="ghost" id="presetBalanced">Balanced</button>
+        <button class="ghost" id="presetCompact">Compact</button>
+      </div>
+    </div>
+
+    <div class="opt-grid">
+      <label class="opt">
+        <span class="opt-name">Profile</span>
+        <select id="profile">
+          <option value="maximum">maximum</option>
+          <option value="hardened">hardened</option>
+          <option value="balanced">balanced</option>
+          <option value="compact">compact</option>
+        </select>
+      </label>
+
+      <label class="opt">
+        <span class="opt-name">Virtualization level</span>
+        <select id="virtualization_level">
+          <option value="maximum">maximum</option>
+          <option value="heavy">heavy</option>
+          <option value="medium">medium</option>
+          <option value="light">light</option>
+          <option value="none">none</option>
+        </select>
+      </label>
+
+      <label class="opt">
+        <span class="opt-name">VM family</span>
+        <select id="vm_family">
+          <option value="stack">stack</option>
+          <option value="hybrid">hybrid</option>
+          <option value="accumulator">accumulator</option>
+          <option value="register">register</option>
+        </select>
+      </label>
+
+      <label class="opt">
+        <span class="opt-name">Dispatcher</span>
+        <select id="dispatcher_family">
+          <option value="mixed">mixed (random per build)</option>
+          <option value="nested_if">nested_if</option>
+          <option value="bucket">bucket</option>
+          <option value="decision_tree">decision_tree</option>
+        </select>
+      </label>
+
+      <label class="opt">
+        <span class="opt-name">String protection</span>
+        <select id="string_protection_level">
+          <option value="3">3 — bank (same as 2)</option>
+          <option value="2">2 — fragmented + encrypted + ticketed</option>
+          <option value="1">1 — pooled</option>
+          <option value="0">0 — none</option>
+        </select>
+      </label>
+
+      <label class="opt">
+        <span class="opt-name">Decoded-string cache</span>
+        <select id="cache_policy">
+          <option value="none">none (safest)</option>
+          <option value="bounded">bounded</option>
+          <option value="full">full</option>
+        </select>
+      </label>
+
+      <label class="opt" id="opt-bounded_cache_size" hidden>
+        <span class="opt-name">Cache bound</span>
+        <input type="number" id="bounded_cache_size" min="1" max="4096" value="16">
+      </label>
+
+      <label class="opt">
+        <span class="opt-name">Min function size to virtualize</span>
+        <input type="number" id="min_virtualize_body_nodes" min="0" max="4096" value="1">
+      </label>
+
+      <label class="opt">
+        <span class="opt-name">Max functions to virtualize</span>
+        <input type="number" id="max_vm_functions" min="0" max="4096" value="64">
+      </label>
+
+      <div class="opt switches">
+        <label class="switch"><input type="checkbox" id="block_permutation" checked><span>Permute block layout</span></label>
+        <label class="switch"><input type="checkbox" id="opcode_randomization" checked><span>Randomize opcodes</span></label>
+        <label class="switch"><input type="checkbox" id="minify" checked><span>Minify output</span></label>
+        <label class="switch"><input type="checkbox" id="strip_types" checked><span>Strip type annotations</span></label>
+      </div>
+    </div>
+
+    <details class="seed-box">
+      <summary>Reproducible seed <span class="muted">(off = fresh seed every build)</span></summary>
+      <div class="seed-row">
+        <input type="text" id="seed" placeholder="leave empty for a random seed per build" spellcheck="false">
+        <button class="ghost" id="rollSeed">Roll</button>
+      </div>
+      <p class="muted small">A pinned seed reproduces one exact artifact. Leaving it empty is what makes two builds structurally different, which is most of the point.</p>
+    </details>
+
+    <button id="run" class="primary">Obfuscate</button>
+    <p id="status" class="status" role="status" aria-live="polite"></p>
+  </section>
+
+  <section class="pane" id="outputPane" aria-labelledby="outputHeading">
+    <div class="pane-head">
+      <h2 id="outputHeading">Output</h2>
+      <div class="pane-actions">
+        <button class="ghost" id="copy" disabled>Copy</button>
+        <button class="ghost" id="download" disabled>Download</button>
+      </div>
+    </div>
+    <div class="metrics" id="metrics" hidden></div>
+    <pre id="output" class="output" tabindex="0">The protected Luau will appear here.</pre>
+    <details class="pending" id="pendingBox" hidden>
+      <summary id="pendingSummary">What was <em>not</em> applied</summary>
+      <p class="muted small">couxobf declares more capabilities than it implements. These are configured but change nothing — listed so the result is never overstated.</p>
+      <div id="pendingList" class="chips"></div>
+    </details>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <p><strong>This raises the cost of reversing your code. It does not make it irreversible.</strong>
+     Everything needed to run the program is in the output, including the key material.
+     Anything shipped to a client should be treated as readable — secrets belong on a server.</p>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
