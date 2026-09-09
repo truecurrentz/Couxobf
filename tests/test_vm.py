@@ -55,6 +55,7 @@ NAMES = {
     "exec": "_kX",
     "enter": "_kGo",
     "call": "_kAp",
+    "getfenv": "_kGe",
     "append": "_kapp",
     "iter": "_kiter",
     "iterpack": "_kiterpack",
@@ -85,6 +86,8 @@ class _VMReconstructor(lower_back.Reconstructor):
                 args=[A.Index(obj=A.Name(name=_DESCRIPTOR_TABLE),
                               key=A.Number(value=proto.proto_id,
                                            is_float=False)),
+                      A.Call(fn=A.Name(name=NAMES["getfenv"]),
+                             args=[A.Number(value=1, is_float=False)]),
                       A.Vararg()])])]))
 
 
@@ -389,3 +392,203 @@ def test_different_seed_changes_the_opcode_numbering():
     m1 = _opmap(b"\x01" * 16)
     m2 = _opmap(b"\x02" * 16)
     assert m1.to_byte != m2.to_byte, "opcode map did not change with the seed"
+
+
+# ---------------------------------------------------------------------------
+# Differential through the real protected path
+# ---------------------------------------------------------------------------
+#
+# The tests above substitute virtualized prototypes through a Reconstructor
+# subclass.  These go through ``reconstruct_protected``, which is what a build
+# actually calls: the bytecode and the constants are interned into the
+# encrypted pool, so the payload is decrypted at load time rather than sitting
+# in the source as a literal.
+
+from couxobf.crypto.kdf import KeyMaterial  # noqa: E402
+from couxobf.vm import wiring  # noqa: E402
+
+
+def protected_vm_reconstruct(src: str, name: str, seed: bytes = b"\x21" * 16,
+                             vm_level: str = "maximum"):
+    """source -> IR -> protected Luau with the VM enabled.
+
+    Returns the source and how many prototypes the VM took, so the caller can
+    tell an exercised VM from a build that quietly virtualized nothing.
+    """
+    module = ir.Lowerer().lower(parser.parse(src, name))
+    lower_back.optimize_module(module) if hasattr(lower_back, "optimize_module") else None
+    domains = rngmod.make_domains(seed)
+    selected = wiring.select_protos(module, vm_level)
+    out = lower_back.reconstruct_protected(
+        module, KeyMaterial.from_seed(seed), domains.get("emission"),
+        b"couxobf-test", vm_level=vm_level, vm_rng=domains.get("vm"))
+    return out, selected
+
+
+@pytest.mark.parametrize("path", _corpus(),
+                         ids=lambda p: os.path.basename(p))
+def test_protected_vm_matches_original(path):
+    if not TOOLCHAIN.can_execute:
+        pytest.skip("luau runtime not available; run tools/setup-luau.sh")
+    base = os.path.basename(path)
+    if base in EXCLUDED:
+        pytest.skip(f"{base}: {EXCLUDED[base]}")
+    with open(path, encoding="utf-8", errors="surrogateescape") as fh:
+        src = fh.read()
+
+    try:
+        out, selected = protected_vm_reconstruct(src, base)
+    except encode.EncodingError as exc:
+        pytest.skip(f"not encodable: {exc}")
+
+    original = execute(TOOLCHAIN, src, base, timeout=30)
+    protected = execute(TOOLCHAIN, out, "protected.luau", timeout=30)
+
+    assert original.returncode == protected.returncode, (
+        f"{base}: rc {original.returncode} != {protected.returncode}\n"
+        f"virtualized={len(selected)}\n{protected.stderr[:600]}")
+    assert original.stdout == protected.stdout, (
+        f"{base}: stdout differs\nvirtualized={len(selected)}\n"
+        f"--- original ---\n{original.stdout[:400]}\n"
+        f"--- protected ---\n{protected.stdout[:400]}")
+
+
+def test_protected_path_hides_the_bytecode():
+    """The payload must be in the encrypted blob, not in the source.
+
+    A VM whose bytecode sits in the output as a string literal is an encoding,
+    not a protection: an analyst reads the dispatcher once and disassembles
+    every build with it.  Routing it through the pool means the bytes are
+    encrypted alongside every other constant.
+    """
+    src = ("local function accumulate(t)\n  local total = 0\n"
+           "  for i = 1, #t do total = total + t[i] end\n  return total\nend\n"
+           "print(accumulate({4, 5, 6, 7}))\n")
+    out, selected = protected_vm_reconstruct(src, "hide.luau")
+    assert selected, "nothing was virtualized; this test proves nothing"
+    module = ir.Lowerer().lower(parser.parse(src, "hide.luau"))
+    opmap = _opmap()
+    for proto in _all_protos(module):
+        if proto.proto_id not in selected:
+            continue
+        enc = encode.encode_proto(proto, opmap)
+        # the exact bytes must not appear, in any escaping the printer uses
+        assert _lit(enc.code) not in out, "bytecode literal leaked into output"
+    # and the program still has to run
+    if TOOLCHAIN.can_execute:
+        original = execute(TOOLCHAIN, src, "hide.luau", timeout=20)
+        protected = execute(TOOLCHAIN, out, "protected.luau", timeout=20)
+        assert original.stdout == protected.stdout == "22\n"
+
+
+def test_interning_after_seal_is_refused():
+    """A slot handed out after sealing points at nothing in the blob.
+
+    That is what the VM wiring did at first: the bytecode was interned after
+    ``pool.seal()``, so ``p.code`` was nil at runtime and the interpreter died
+    on its first ``string.byte``.  The failure surfaced far from the cause, so
+    the pool now refuses it.
+    """
+    from couxobf.constpool import ConstantPool, ConstantPoolError
+    seed = b"\x05" * 16
+    pool = ConstantPool(KeyMaterial.from_seed(seed),
+                        rngmod.make_domains(seed).get("constants"), b"ctx")
+    # bytes, not str: the pool stores string constants as byte strings, since
+    # that is what the IR's string constants are.
+    assert pool.slot(b"first") == 1
+    pool.seal()
+    with pytest.raises(ConstantPoolError):
+        pool.slot(b"second")
+
+
+def test_setfenv_reaches_a_virtualized_function():
+    """`setfenv` on a VM-backed function must change what its globals mean.
+
+    The VM reads and writes globals through an environment table, so it has to
+    be the *caller's* environment, resolved per call.  Two ways to get this
+    wrong, both measured:
+
+    * capturing the environment once at load ignores setfenv entirely, and the
+      build writes the real globals instead of the swapped table;
+    * looking `getfenv` up as a global fails outright once the environment has
+      been swapped, because the swapped table does not contain getfenv.
+    """
+    if not TOOLCHAIN.can_execute:
+        pytest.skip("luau runtime not available; run tools/setup-luau.sh")
+    src = (
+        "A = 10\n"
+        "local f = function() A = A + 1; return A end\n"
+        "print(f())\n"
+        "setfenv(f, {A = 100})\n"
+        "print(f())\n"
+        "print(f())\n"
+        "print(A)\n"
+    )
+    out, selected = protected_vm_reconstruct(src, "setfenv.luau",
+                                             vm_level="maximum")
+    assert selected, "the function was not virtualized; this test proves nothing"
+    original = execute(TOOLCHAIN, src, "setfenv.luau", timeout=20)
+    protected = execute(TOOLCHAIN, out, "protected.luau", timeout=20)
+    assert original.returncode == protected.returncode == 0, protected.stderr[:300]
+    assert original.stdout == protected.stdout, (
+        f"setfenv did not reach the virtualized function\n"
+        f"  want {original.stdout!r}\n  got  {protected.stdout!r}")
+    # 11 from the pre-setfenv call, then 101 and 102 inside the swapped table,
+    # and the real global left where the first call put it
+    assert original.stdout == "11\n101\n102\n11\n"
+
+
+def test_default_protected_build_virtualizes():
+    """The production default must virtualize, or the feature is dead code.
+
+    ``reconstruct_protected`` defaults to ``VirtualizationLevel.HEAVY``, the
+    same level ``Config`` defaults to.  If that default ever stops selecting
+    anything, every protected-path test above still passes while testing only
+    the native reconstructor.
+    """
+    src = (
+        "local function classify(n)\n"
+        "  if n < 2 then return false end\n"
+        "  for d = 2, math.floor(math.sqrt(n)) do\n"
+        "    if n % d == 0 then return false end\n"
+        "  end\n"
+        "  return true\n"
+        "end\n"
+        "local found = 0\n"
+        "for i = 1, 40 do if classify(i) then found += 1 end end\n"
+        "print(found)\n"
+    )
+    # no vm_level argument: whatever the default is
+    out, _ = protected_vm_reconstruct(src, "default.luau")
+    domains = rngmod.make_domains(b"\x21" * 16)
+    module = ir.Lowerer().lower(parser.parse(src, "default.luau"))
+    lower_back.optimize_module(module) if hasattr(lower_back, "optimize_module") else None
+    selected = wiring.select_protos(module, "heavy")
+    assert selected, "the default level selected nothing"
+    assert out != protected_vm_reconstruct(src, "default.luau",
+                                           vm_level="none")[0], (
+        "the default build is identical to virtualization_level=none")
+
+
+def test_vm_output_is_not_much_larger_than_native():
+    """Virtualizing must not be paid for in output size.
+
+    The design's own warning: bigger output is not stronger security.  One
+    interpreter serves every virtualized prototype, so the per-prototype cost
+    is a descriptor plus a one-line closure -- and the interpreter is amortized
+    away.  What this pins is that the amortization actually happens, rather than
+    the prelude being emitted per prototype.
+    """
+    src = "\n".join(
+        "local function f%d(a, b) return a * %d + b end" % (i, i)
+        for i in range(1, 21)) + "\n" + \
+        "\n".join("print(f%d(%d, 1))" % (i, i) for i in range(1, 21)) + "\n"
+    native, _ = protected_vm_reconstruct(src, "size.luau", vm_level="none")
+    vmed, selected = protected_vm_reconstruct(src, "size.luau",
+                                              vm_level="maximum")
+    assert len(selected) >= 10, f"only {len(selected)} prototypes virtualized"
+    ratio = len(vmed) / len(native)
+    assert ratio < 1.6, (
+        f"virtualizing {len(selected)} prototypes grew the output "
+        f"{ratio:.2f}x ({len(native)} -> {len(vmed)} bytes); the interpreter "
+        f"should be shared, not repeated")

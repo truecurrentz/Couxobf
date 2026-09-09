@@ -49,9 +49,8 @@ def _handler(op: str, n: Dict[str, str]) -> List[str]:
                 "pc = pc + 3",
                 "R[a] = K[k + 1]"]
     if op == OP.GETGLOBAL:
-        # _G is readonly in this runtime (measured: "attempt to modify a
-        # readonly table"), but getfenv(0) returns the same table bidirectionally
-        # and is writable, so both directions go through the captured env.
+        # E is the calling function's environment, resolved per call -- see
+        # interpreter_source for why it cannot be captured once at load.
         return [f"local a = {reg('pc')}",
                 f"local k = {w('pc + 1')}",
                 "pc = pc + 3",
@@ -263,18 +262,19 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str]) -> str:
     """The interpreter, with this build's opcode numbers inlined.
 
     ``names`` supplies the local names so the interpreter is not recognisable
-    by shape alone: ``code``, ``exec``, ``enter``, ``call``, ``append``,
-    ``iter``, ``iterpack``, ``itercheck``.
+    by shape alone: ``code``, ``exec``, ``enter``, ``call``, ``getfenv``,
+    ``append``, ``iter``, ``iterpack``, ``itercheck``.
     """
     n = names
     lines: List[str] = [
         "local _byte = string.byte",
         "local _unpack = table.unpack",
         "local _pack = table.pack",
-        # captured once: getfenv(0) is the writable global table (_G is
-        # readonly here).  A setfenv applied to a virtualised function will not
-        # be seen by it -- a documented limitation of the VM path.
-        "local E = getfenv(0)",
+        # getfenv is held in a local rather than looked up as a global, because
+        # a virtualised function that has had setfenv applied to it no longer
+        # sees the real globals -- including getfenv itself.  Measured: calling
+        # it through the swapped env fails with "attempt to call a nil value".
+        f"local {n['getfenv']} = getfenv",
         f"local {n['call']} = function(R, base, argc, tail)",
         "  local f = R[base]",
         "  if tail >= 0 then",
@@ -295,7 +295,10 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str]) -> str:
         "  end",
         "  return f(_unpack(R, base + 1, base + argc))",
         "end",
-        f"local function {n['exec']}(p, R)",
+        # E arrives as an argument.  Resolving it here instead would give this
+        # function's environment, not the virtualised function's, and a
+        # setfenv'd build would silently read and write the real globals.
+        f"local function {n['exec']}(p, R, E)",
         f"  local {n['code']} = p.code",
         "  local K = p.consts",
         "  local pc = p.entry",
@@ -317,13 +320,13 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str]) -> str:
         "    end",
         "  end",
         "end",
-        f"local function {n['enter']}(p, ...)",
+        f"local function {n['enter']}(p, E, ...)",
         "  local R = {}",
         "  local args = _pack(...)",
         "  for i = 1, p.nparams do",
         "    R[i] = args[i]",
         "  end",
-        f"  return {n['exec']}(p, R)",
+        f"  return {n['exec']}(p, R, E)",
         "end",
     ]
     return "\n".join(lines) + "\n"

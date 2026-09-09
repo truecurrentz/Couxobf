@@ -59,6 +59,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import ast_nodes as A
+from .config import VirtualizationLevel
 from .ir import (MULTIRET, TERMINATORS, FuncIR, IRModule, Instr, Kon, OP, Reg,
                  Up)
 
@@ -184,13 +185,18 @@ def _const_expr(value: Any) -> A.Expr:
 
 
 class Reconstructor:
-    def __init__(self, pool: Any = None, accessor: Optional[str] = None) -> None:
+    def __init__(self, pool: Any = None, accessor: Optional[str] = None,
+                 vm: Any = None) -> None:
         """``pool`` is a :class:`~couxobf.constpool.ConstantPool`.
 
         When one is supplied, no literal reaches the output: every constant is
         interned into the pool and read back through ``accessor`` at runtime.
         Without a pool the reconstructor emits literals inline, which keeps the
         plain path simple and diffable.
+
+        ``vm`` is an optional :class:`~couxobf.vm.wiring.VMPlan`.  Prototypes it
+        selects are encoded to bytecode and replaced by a closure that enters
+        the interpreter; everything else is reconstructed natively as usual.
         """
         self.parents: Dict[int, Optional[FuncIR]] = {}
         self.by_id: Dict[int, FuncIR] = {}
@@ -199,6 +205,9 @@ class Reconstructor:
         self.snapshots: Dict[Tuple[int, int], str] = {}
         self.pool = pool
         self.accessor = accessor
+        self.vm = vm
+        #: proto_id -> EncodedProto, filled in as function_expr runs
+        self.vm_encoded: Dict[int, Any] = {}
         if (pool is None) != (accessor is None):
             raise ReconstructionError("pool and accessor must be given together")
 
@@ -208,11 +217,52 @@ class Reconstructor:
         return A.Block(body=self._proto_body(module.main))
 
     def function_expr(self, proto: FuncIR) -> A.Func:
+        if self.vm is not None and self.vm.selects(proto):
+            wrapper = self._vm_closure(proto)
+            if wrapper is not None:
+                return wrapper
         params = [A.Param(name=param_name(proto.proto_id, i))
                   for i in range(proto.num_params)]
         if proto.is_vararg:
             params.append(A.Param(name=None))
         return A.Func(params=params, body=A.Block(body=self._proto_body(proto)))
+
+    def _vm_closure(self, proto: FuncIR) -> Optional[A.Func]:
+        """Encode ``proto`` and return the Luau closure that runs it.
+
+        Returns ``None`` if the prototype turns out not to be encodable after
+        all, so the caller falls back to native reconstruction rather than
+        failing the whole build.  Eligibility was already checked when the plan
+        was made; this second check is cheap insurance against the plan and the
+        encoder disagreeing.
+        """
+        from .vm import encode as _encode
+
+        ok, _reason = _encode.can_virtualize(proto)
+        if not ok:
+            return None
+        self.vm_encoded[proto.proto_id] = _encode.encode_proto(
+            proto, self.vm.opmap)
+        # A vararg parameter list, not the prototype's declared parameters:
+        # the descriptor carries the real count and the interpreter distributes
+        # the arguments itself.  From the caller's side this is an ordinary
+        # Luau function with the same signature.
+        #
+        # The environment is resolved here, in the closure the caller actually
+        # holds, at level 1 -- this function.  Resolving it deeper would return
+        # the interpreter's environment instead, and `setfenv` applied to a
+        # virtualised function would be ignored.  `_gf` is an upvalue rather
+        # than a global lookup, because a swapped environment does not contain
+        # getfenv either.
+        return A.Func(
+            params=[A.Param(name=None)],
+            body=A.Block(body=[A.Return(values=[A.Call(
+                fn=A.Name(name=self.vm.names["enter"]),
+                args=[A.Index(obj=A.Name(name=self.vm.table),
+                              key=_num(proto.proto_id)),
+                      A.Call(fn=A.Name(name=self.vm.names["getfenv"]),
+                             args=[_num(1)]),
+                      A.Vararg()])])]))
 
     def _build_parent_map(self, module: IRModule) -> None:
         def walk(p: FuncIR, par: Optional[FuncIR]) -> None:
@@ -576,7 +626,9 @@ def reconstruct_protected(module: IRModule,
                           cache_bound: int = 64,
                           names: Optional[Dict[str, str]] = None,
                           minify: bool = False,
-                          optimize_first: bool = True) -> str:
+                          optimize_first: bool = True,
+                          vm_level: Any = VirtualizationLevel.HEAVY,
+                          vm_rng: Any = None) -> str:
     """Lower an IR module to protected, self-contained Luau source.
 
     Assembles three pieces in the order they must appear: the constant pool
@@ -605,8 +657,32 @@ def reconstruct_protected(module: IRModule,
         _optimize.optimize_module(module)
     pool = ConstantPool(keys, rng, context,
                         cache_policy=cache_policy, cache_bound=cache_bound)
-    rec = Reconstructor(pool=pool, accessor=names["get"])
+
+    # Selected after optimization, so prototypes the optimizer shrank below the
+    # size floor are not virtualized on the strength of code that no longer
+    # exists.
+    # Virtualization is on by default at the same level ``Config`` defaults to.
+    # Pass ``VirtualizationLevel.NONE`` (or the "compact" profile) to get a
+    # purely native reconstruction.
+    plan = None
+    if VirtualizationLevel.parse(vm_level) is not VirtualizationLevel.NONE:
+        from .vm import wiring as _wiring
+        plan = _wiring.make_plan(
+            vm_rng if vm_rng is not None else rng,
+            _wiring.select_protos(module, vm_level))
+
+    rec = Reconstructor(pool=pool, accessor=names["get"], vm=plan)
     body = rec.reconstruct(module)
+
+    # The VM's bytecode and constants are interned here, before the pool is
+    # sealed below.  Doing it after would hand out slot numbers the encrypted
+    # blob does not contain; the pool now refuses that outright, but the order
+    # still has to be right.
+    vm_src = ""
+    if plan is not None and rec.vm_encoded:
+        from .vm import wiring as _wiring
+        pooled = lambda value: "%s(%d)" % (names["get"], pool.slot(value))
+        vm_src = _wiring.prelude_source(plan, rec.vm_encoded, pooled, pooled)
 
     # A program with no constants at all needs no pool: emitting the runtime
     # for an empty blob would just be a decoder that never runs.
@@ -623,6 +699,14 @@ def reconstruct_protected(module: IRModule,
     # call anywhere in the body refers to them.
     helpers = _parser.parse(HELPERS_SRC, "<helpers>")
 
+    # The VM prelude goes after both: the interpreter calls the helpers, and
+    # the descriptor table reads the bytecode and the constants back out of the
+    # pool at load time, so the accessor has to exist first.  Routing the
+    # bytecode through the pool is what makes the payload protected rather than
+    # merely encoded -- it is encrypted in the blob like every other constant.
+    vm_block = _parser.parse(vm_src, "<vm>") if vm_src else None
+
     prefix = list(pool_block.body) if pool_block is not None else []
-    out = A.Block(body=prefix + list(helpers.body) + list(body.body))
+    vm_stmts = list(vm_block.body) if vm_block is not None else []
+    out = A.Block(body=prefix + list(helpers.body) + vm_stmts + list(body.body))
     return _printer.emit(out, minify=minify)

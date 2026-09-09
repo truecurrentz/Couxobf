@@ -124,6 +124,13 @@ class ConstantPool:
         because Luau cannot distinguish them either.  ``True`` and ``1`` do not,
         because the bool check runs first.
         """
+        if self._sealed is not None:
+            # The blob is already encrypted, so this value would get a slot
+            # number the ciphertext does not contain and the runtime would read
+            # nil.  That failure shows up at the use site, far from here, so it
+            # is refused at the cause instead.
+            raise ConstantPoolError(
+                "cannot intern a constant after the pool was sealed")
         key = self._key_for(value)
         hit = self._index.get(key)
         if hit is not None:
