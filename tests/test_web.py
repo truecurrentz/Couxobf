@@ -9,6 +9,8 @@ returns 200 with broken Luau is worse than one that returns 500.
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 
 import pytest
@@ -157,12 +159,23 @@ def test_string_level_three_is_accepted_because_maximum_sets_it():
 # ---------------------------------------------------------------------------
 
 def test_the_response_lists_what_was_not_applied():
-    """The UI shows this; omitting it would overstate the result."""
-    status, body = handle({"source": SOURCE, "options": {}})
+    """The UI shows this; omitting it would overstate the result.
+
+    Compared against the config's own answer rather than a number, because the
+    list is supposed to shrink as features get built -- a hardcoded count here is a
+    test that fails for the right reason and gets "fixed" by bumping the bound.
+    """
+    from couxobf.config import Config
+
+    status, body = handle({"source": SOURCE, "options": {"profile": "maximum"}})
     assert status == 200
-    assert len(body["pending"]) >= 30
     names = {p["name"] for p in body["pending"]}
-    for probe in ("opaque_predicates", "branch_inversion", "fingerprint_reduction"):
+    config = Config.from_profile("maximum")
+    assert names == {n for n, _ in config.pending_fields()}, (
+        "the pending list the endpoint reports is not the config's")
+    # Declared, asked for by every profile, and read by nothing: these two are the
+    # reason the box exists.
+    for probe in ("identifier_polymorphism", "fingerprint_reduction"):
         assert probe in names, probe
 
 
@@ -241,15 +254,17 @@ WEB_JS = os.path.join(REPO, "web", "app.js")
 
 
 def _accepted_options():
-    """Every key the endpoint reads out of `options`, however it validates it.
+    """Every key the endpoint reads out of `options`, however it validates it."""
+    from obfuscate import OPTIONS
+    return set(OPTIONS) | {"profile"}
 
-    `profile` is consumed before the per-option validator and matched against
-    Config.PROFILES, so it is accepted but not a member of any of these tables.
-    Listing only the tables is what made this test fail first time, and the
-    failure was in the test rather than in the endpoint.
-    """
-    from obfuscate import BOOL_OPTIONS, ENUM_OPTIONS, INT_OPTIONS
-    return set(ENUM_OPTIONS) | set(INT_OPTIONS) | set(BOOL_OPTIONS) | {"profile"}
+
+#: The ids app.js reaches for with `$(...)`.  A typo here means the page throws
+#: on load rather than failing the build, which is the worst time to find out.
+def _js_static_ids():
+    with open(WEB_JS, encoding="utf-8") as fh:
+        js = fh.read()
+    return set(re.findall(r'$\("([A-Za-z_][A-Za-z_0-9]*)"\)', js))
 
 
 def _html_ids():
@@ -257,62 +272,350 @@ def _html_ids():
         return set(re.findall(r'id="([A-Za-z_0-9]+)"', fh.read()))
 
 
-def _js_field_keys():
+def _form_fields():
+    """The option names the page lists in its form spec, in order."""
     with open(WEB_JS, encoding="utf-8") as fh:
         js = fh.read()
-    block = js.split("const FIELDS = {", 1)[1].split("\n};", 1)[0]
-    return set(re.findall(r"^\s{2}([a-z_][a-z_0-9]*):", block, re.M))
+    block = js.split("const SPEC = [", 1)[1].split("const GROUPS", 1)[0]
+    return [m.group(1) for m in re.finditer(
+        r'\["([a-z_][a-z_0-9]+)",\s*"[^"]*",\s*"(bool|select|int|float|seed|text)"', block)]
 
 
-def test_no_ui_control_is_inert():
-    """Every control must map to a capability the build actually delivers.
+def _form_kinds():
+    with open(WEB_JS, encoding="utf-8") as fh:
+        js = fh.read()
+    block = js.split("const SPEC = [", 1)[1].split("const GROUPS", 1)[0]
+    return {m.group(1): m.group(2) for m in re.finditer(
+        r'\["([a-z_][a-z_0-9]+)",\s*"[^"]*",\s*"(bool|select|int|float|seed|text)"', block)}
 
-    `identifier_polymorphism` was a checkbox here that produced byte-identical
-    output whichever way it was set: the endpoint accepted it, stored it on the
-    config, and nothing read it.  Tying the controls to Config.IMPLEMENTED is
-    what stops the next one.
+
+def test_no_control_exists_for_an_option_the_build_ignores():
+    """Every widget has to map to a field the pipeline actually reads.
+
+    `identifier_polymorphism` was a checkbox that produced byte-identical output
+    whichever way it was set: the endpoint stored it and nothing read it.  Tying
+    the form to `Config.IMPLEMENTED` is what stops the next one, and it cuts both
+    ways -- a field becomes offerable exactly when it starts doing something,
+    which is why the page has no `integrity_level` control today.
     """
     from couxobf.config import Config
 
-    # `profile` selects a bundle of implemented fields rather than being one
-    # itself, and the seed box is a separate affordance with its own id.
-    exempt = {"profile", "seed"}
-    inert = sorted(_js_field_keys() - set(Config.IMPLEMENTED) - exempt)
+    live = set(Config.IMPLEMENTED)
+    inert = sorted(set(_form_fields()) - live - SYNTH_FIELDS)
     assert not inert, f"controls with no effect: {inert}"
 
 
-def test_every_implemented_option_is_reachable_from_the_ui():
+def test_every_live_option_is_reachable_from_the_ui():
+    """No option that only the CLI can set.
+
+    The endpoint derives its accepted keys from the same list, so this fails when
+    a field is implemented and left out of the form -- which is how `edge_indirection`
+    and the guard levels ended up reachable only by editing a config file.
+    """
     from couxobf.config import Config
 
-    # The seed is exposed through the seed box rather than an `opt-` control.
-    ids = _html_ids() | {"reproducible_seed"} if "seed" in _html_ids() else _html_ids()
-    missing = sorted(set(Config.IMPLEMENTED) - ids)
-    assert not missing, f"implemented but not exposed: {missing}"
+    missing = sorted(set(Config.IMPLEMENTED) - set(_form_fields()) - {"reproducible_seed"})
+    assert not missing, f"implemented but not on the site: {missing}"
+
+
+def test_the_form_is_grouped_rather_than_flat():
+    """42 options in one list is not a form; six labelled sections are.
+
+    Checked structurally, because the grouping is the part a future edit would
+    quietly flatten: every field has to sit under a titled group that says why the
+    fields belong together.
+    """
+    with open(WEB_JS, encoding="utf-8") as fh:
+        js = fh.read()
+    block = js.split("const SPEC = [", 1)[1].split("const GROUPS", 1)[0]
+    titles = re.findall(r'title:\s*"([^"]+)",\s*\n\s*help:\s*"([^"]+)', block)
+    assert len(titles) >= 4, titles
+    assert len(re.findall(r'\bid: "[a-z_]+",', block)) == len(titles)
+
+
+#: Widgets on the page that are not Config fields: the preset chooser and the
+#: seed box, whose value is sent as `reproducible_seed`.
+SYNTH_FIELDS = {"profile", "seed"}
 
 
 def test_every_ui_option_is_accepted_by_the_endpoint():
     """A key the UI sends but the endpoint rejects would 400 the whole build."""
-    rejected = sorted(_js_field_keys() - _accepted_options())
+    rejected = sorted(set(_form_fields()) - _accepted_options() - SYNTH_FIELDS)
     assert not rejected, f"endpoint would reject: {rejected}"
 
 
-def test_every_declared_field_has_a_matching_element():
-    """readOptions skips absent elements, so a typo here fails silently."""
-    missing = sorted(_js_field_keys() - _html_ids())
-    assert not missing, f"FIELDS declares controls that do not exist: {missing}"
+def test_widget_kinds_match_the_field_types_the_endpoint_declares():
+    """A checkbox for an integer and a menu with no values are both invisible bugs.
+
+    The page renders from `kind`, the endpoint validates from its own derived
+    surface; this is the seam where the two are compared.
+    """
+    from obfuscate import OPTIONS
+
+    for name, kind in _form_kinds().items():
+        spec = OPTIONS.get(name)
+        if spec is None:
+            assert kind in ("select", "seed"), f"{name}: {kind} with no endpoint spec"
+            continue
+        declared = spec["kind"]
+        if kind == "bool":
+            assert declared == "bool", f"{name}: checkbox for a {declared} field"
+        elif kind == "select":
+            assert declared in ("enum", "choice") or (
+                declared == "int" and spec["max"] - spec["min"] <= 8
+            ), f"{name}: menu for a {declared} {spec.get('min')}..{spec.get('max')}"
+        else:
+            assert declared in ("int", "float"), f"{name}: {kind} for a {declared} field"
 
 
-def test_the_cache_bound_control_is_gated_on_the_bounded_policy():
-    with open(WEB_HTML, encoding="utf-8") as fh:
-        html = fh.read()
+def test_the_pages_own_copy_of_the_surface_matches_the_endpoint():
+    """The fallback table is only used without a backend, so it can rot quietly.
+
+    Compared field by field -- kind, choices, bounds -- because that is exactly
+    what the form draws from it, and a stale default here would be a preset that
+    the endpoint then refuses.
+    """
+    from obfuscate import OPTIONS
+    import re as _re
+
     with open(WEB_JS, encoding="utf-8") as fh:
         js = fh.read()
-    # The bound only means something alongside `bounded`; offering it otherwise
-    # would be a knob that silently does nothing.
-    assert 'id="opt-bounded_cache_size" hidden' in html
-    assert 'when: () => $("cache_policy").value === "bounded"' in js
-    assert "syncCacheBound" in js
-    assert '$("cache_policy").addEventListener("change", syncCacheBound)' in js
+    block = js.split("const FALLBACK = {", 1)[1].split("\n};", 1)[0]
+    copied = {}
+    for m in _re.finditer(r"(\w+):\s*\{([^}]*)\}", block):
+        body = m.group(2)
+        entry = {"kind": _re.search(r'kind: "([a-z]+)"', body).group(1)}
+        choices = _re.search(r'choices: \[([^\]]*)\]', body)
+        if choices:
+            entry["choices"] = [c.strip().strip('"') for c in choices.group(1).split(",")]
+        for bound in ("min", "max", "default"):
+            found = _re.search(r"%s: (-?[\d.]+|null)" % bound, body)
+            if found:
+                raw = found.group(1)
+                entry[bound] = None if raw == "null" else (
+                    float(raw) if "." in raw else int(raw))
+        copied[m.group(1)] = entry
+
+    assert copied, "the fallback table could not be parsed -- the check is vacuous"
+    for name, spec in copied.items():
+        live = OPTIONS[name]
+        assert live["kind"] == ("int" if spec["kind"] == "wide" else spec["kind"]), name
+        if "choices" in spec and live.get("choices"):
+            assert list(spec["choices"]) == list(live["choices"]), name
+        if live["kind"] in ("int", "float"):
+            assert spec.get("min") == live["min"], name
+            assert spec.get("max") == live["max"], name
+
+
+def test_the_page_only_reaches_ids_that_exist():
+    missing = sorted(_js_static_ids() - _html_ids())
+    assert not missing, f"app.js looks up ids that are not in index.html: {missing}"
+
+
+def test_every_option_group_is_rendered_from_the_endpoint_description():
+    """The form is generated; the HTML has no per-field markup to forget.
+
+    Asserting the *absence* is the point: hand-written controls in index.html were
+    where the page and the config drifted apart, because a new field could be added
+    to one file and missed in the other.
+    """
+    html = open(WEB_HTML, encoding="utf-8").read()
+    for name in _form_fields():
+        if name == "profile":
+            continue
+        assert f'id="opt-{name}"' not in html, (
+            f"index.html hardcodes a control for {name}; the form is generated from "
+            f"SPEC, so this is a second source of truth")
+    assert 'id="options"' in html, "the container the generator fills is gone"
+
+
+def test_the_gating_rules_are_declared_where_they_are_used():
+    """A knob that only matters next to another one says so on the page.
+
+    `bounded_cache_size` without `cache_policy = "bounded"` used to be a field the
+    request carried and the build ignored, which reads as a feature that does
+    nothing.  Each gated field needs an entry in both the endpoint (the rule) and
+    the page (the widget that hides it), and the rule's field has to be a real
+    option.
+    """
+    from obfuscate import FIELD_REQUIRES, OPTIONS
+
+    gated = re.findall(r'specFor\(name\)\.requires', open(WEB_JS, encoding="utf-8").read())
+    assert gated, "the page stopped consulting the gating rules"
+    for name, gate in FIELD_REQUIRES.items():
+        assert name in OPTIONS, f"{name} is gated but not offered"
+        fields = gate["any_of"] if "any_of" in gate else [gate["field"]]
+        for field in fields:
+            assert field in OPTIONS, f"{name} gated on {field}, which is not an option"
+
+
+def test_the_describe_route_matches_the_config_it_claims_to_mirror():
+    """The page draws its presets from this route; a stale copy is a lie."""
+    from obfuscate import _applied_value
+    from couxobf.config import Config
+
+    status, body = handle({"mode": "options"})
+    assert status == 200
+    assert set(body["options"]) == set(Config.IMPLEMENTED)
+    assert set(body["profiles"]) == set(Config.PROFILES)
+    assert set(body["profile_values"]) == set(Config.PROFILES)
+    for name in Config.PROFILES:
+        config = Config.from_profile(name)
+        for field, value in body["profile_values"][name].items():
+            # Compared through the endpoint's own formatting, so a level rendered
+            # as a name matches the enum it came from rather than its int value.
+            assert value == _applied_value(config, field), f"{name}.{field}"
+
+
+def test_the_applied_table_reports_the_request_not_the_defaults():
+    """The table is what a user reads to find out what a preset did."""
+    from couxobf.config import Config
+
+    status, body = handle({"source": SOURCE, "options": {
+        "profile": "hardened", "vm_variety": 3, "env_guard": 2,
+        "hash_comments": "strict", "minify": False}})
+    assert status == 200, body
+    applied = body["applied"]
+    assert applied["profile"] == "hardened"
+    assert applied["vm_variety"] == 3
+    assert applied["env_guard"] == 2
+    assert applied["hash_comments"] == "strict"
+    assert applied["minify"] is False
+    assert len(applied) == len(Config.IMPLEMENTED) + 1
+
+
+def test_the_response_names_what_a_build_gave_up():
+    """Notes are the pipeline's own words about the run, not a fixed string.
+
+    A size-budget trim and a guard summary both belong here: they describe what
+    happened to *this* input, so a page that hardcoded them would be describing
+    somebody else's build.
+    """
+    status, body = handle({"source": INVENTORY, "options": {
+        "profile": "maximum", "min_virtualize_body_nodes": 1, "env_guard": 2,
+        "dump_guard": 2, "max_output_growth": 0}})
+    assert status == 200, body
+    assert any("guard" in n for n in body["notes"]), body["notes"]
+    assert not any("size budget" in n for n in body["notes"]), (
+        "the budget was disabled and still reported a trim")
+
+    status, tight = handle({"source": INVENTORY, "options": {
+        "profile": "maximum", "min_virtualize_body_nodes": 1, "max_output_growth": 2}})
+    assert status == 200, tight
+    assert any("size budget" in n for n in tight["notes"]), tight["notes"]
+
+
+# ---------------------------------------------------------------------------
+# the page itself
+#
+# The form is generated from the endpoint's description of its own options, so
+# markup-level checks cannot see it. These run app.js against a small DOM stub and
+# assert on what the page says it would send -- the only way to catch a control that
+# renders, is filled with strings, and is then refused by the endpoint.
+# ---------------------------------------------------------------------------
+
+NODE = shutil.which("node")
+RENDER_STUB = os.path.join(REPO, "tests", "support", "web-render.js")
+WEB_APP = os.path.join(REPO, "web", "app.js")
+
+
+def _render(tmp_path, describe_payload=None):
+    """Build the page and return the report the stub prints."""
+    if describe_payload is not None:
+        payload = tmp_path / "describe.json"
+        payload.write_text(json.dumps(describe_payload), encoding="utf-8")
+        target = str(payload)
+    else:
+        target = str(tmp_path / "absent.json")
+    html = open(WEB_HTML, encoding="utf-8").read()
+    ids = ",".join(sorted(set(re.findall(r'id="([A-Za-z_0-9]+)"', html))))
+    proc = subprocess.run([NODE, RENDER_STUB, WEB_APP, ids, target],
+                          capture_output=True, text=True, timeout=180, cwd=REPO)
+    assert proc.stdout.strip(), proc.stderr[-800:]
+    report = json.loads(proc.stdout)
+    assert "error" not in report, report["error"]
+    return report
+
+
+@pytest.mark.skipif(not NODE, reason="node is not installed")
+def test_the_generated_form_offers_every_live_option(tmp_path):
+    from couxobf.config import Config
+
+    report = _render(tmp_path, describe())
+    fields = report["fields"]
+    assert len(fields) == len(set(fields)), "an option is on the page twice"
+    missing = sorted(set(Config.IMPLEMENTED) - set(fields) - {"reproducible_seed"})
+    assert not missing, f"implemented but not on the page: {missing}"
+    assert report["missing"] == "", report["missing"]
+    assert len(report["groups"]) >= 4, report["groups"]
+
+
+@pytest.mark.skipif(not NODE, reason="node is not installed")
+def test_the_page_sends_only_what_the_endpoint_accepts(tmp_path):
+    """The whole point of generating the form: what it sends, the build takes.
+
+    Every value goes back through `_apply_options`, which is the same function a
+    request runs through, so a widget that produces a string for an integer field or
+    an out-of-range number fails here instead of 400ing in a browser.
+    """
+    from couxobf.config import Config
+    from obfuscate import OPTIONS, _apply_options
+
+    sent = _render(tmp_path, describe())["readOptions"]
+    assert set(sent) - {"profile"} <= set(OPTIONS), sorted(set(sent) - set(OPTIONS))
+    config = Config.from_profile("maximum")
+    _apply_options(config, {k: v for k, v in sent.items() if k != "profile"})
+    for name, value in sent.items():
+        if name == "profile":
+            continue
+        kind = OPTIONS[name]["kind"]
+        if kind in ("int", "float", "wide"):
+            assert isinstance(value, (int, float)) and not isinstance(value, bool), (
+                f"{name} arrived as {type(value).__name__}: a menu of levels has "
+                f"to send numbers, not the strings a <select> holds")
+        elif kind in ("enum", "choice"):
+            assert isinstance(value, str), name
+
+
+@pytest.mark.skipif(not NODE, reason="node is not installed")
+def test_a_gated_option_is_left_out_of_the_request(tmp_path):
+    """`bounded_cache_size` without the bounded policy must not be sent.
+
+    The alternative is a build that records the field and ignores it, which is the
+    same dead-control problem wearing a different hat.
+    """
+    from obfuscate import OPTIONS
+
+    sent = _render(tmp_path, describe())["readOptions"]
+    assert OPTIONS["cache_policy"]["default"] != "bounded" or "bounded_cache_size" in sent
+    assert "bounded_cache_size" not in sent, (
+        "the cache window was sent with the default policy, which does not use it")
+
+
+@pytest.mark.skipif(not NODE, reason="node is not installed")
+def test_the_page_still_builds_a_form_without_the_endpoint(tmp_path):
+    """Opening web/index.html with no backend has to give a usable page.
+
+    The fallback table is the copy of the surface that ships inside app.js, so this
+    is also the check that the copy is complete enough to render every option.
+    """
+    from couxobf.config import Config
+
+    report = _render(tmp_path, None)
+    assert "page's own copy" in report["surfaceState"], report["surfaceState"]
+    assert report["missing"] == "", report["missing"]
+    uncontrolled = sorted(set(Config.IMPLEMENTED) - set(report["fields"])
+                         - {"reproducible_seed"})
+    assert not uncontrolled, uncontrolled
+    assert all(v != "none" for v in report["controls"].values()), (
+        {k: v for k, v in report["controls"].items() if v == "none"})
+
+
+def describe():
+    from obfuscate import handle
+    status, body = handle({"mode": "options"})
+    assert status == 200
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -365,36 +668,16 @@ def test_profile_names_are_accepted_case_insensitively(profile):
     assert body["applied"]["profile"] == profile
 
 
-def test_presets_agree_with_the_profiles_they_claim():
-    """A preset button that disagrees with the profile dropdown misleads.
-
-    These live in a JS object with no shared schema against Config, so the
-    values are parsed back out and compared rather than trusted.
-    """
+def test_the_response_names_the_profile_that_was_applied():
+    """A preset that only sets the dropdown would be decoration."""
     from couxobf.config import Config
 
-    with open(WEB_JS, encoding="utf-8") as fh:
-        js = fh.read()
-    block = js.split("const PRESETS = {", 1)[1].split("\n};", 1)[0]
-
-    checked = 0
     for name in Config.PROFILES:
-        # Only the presets the UI actually offers a button for.
-        entry = re.search(name + r":\s*\{(.*?)\}", block, re.S)
-        if not entry:
-            continue
-        fields = dict(re.findall(r"([a-z_0-9]+):\s*\"?([^,}\"]+)\"?", entry.group(1)))
-        config = Config.from_profile(name)
-        got_level = fields["virtualization_level"].strip()
-        got_strings = int(fields["string_protection_level"])
-        assert got_level == config.virtualization_level.name.lower(), (
-            f"preset {name!r} says virtualization_level={got_level!r}, "
-            f"Config.from_profile says {config.virtualization_level.name.lower()!r}")
-        assert got_strings == config.string_protection_level, (
-            f"preset {name!r} says string_protection_level={got_strings}, "
-            f"Config.from_profile says {config.string_protection_level}")
-        checked += 1
-    assert checked >= 2, f"only {checked} presets were parseable -- the check is vacuous"
+        status, body = handle({"source": SOURCE, "options": {"profile": name}})
+        assert status == 200, body
+        assert body["applied"]["profile"] == name
+        assert body["applied"]["virtualization_level"] == \
+            Config.from_profile(name).virtualization_level.name.lower()
 
 
 # ---------------------------------------------------------------------------

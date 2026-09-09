@@ -1,52 +1,242 @@
-/* couxobf web UI. No framework, no build step, no dependencies. */
+/* couxobf web UI. No framework, no build step, no dependencies.
+ *
+ * The option form is built from two tables that have to agree:
+ *
+ *   SPEC   -- the curated structure: which groups exist, which field goes in
+ *             each, what a control is called and what it does.
+ *   surface -- kinds, choices, ranges and defaults, fetched from the endpoint.
+ *
+ * Only the second one decides what a build accepts, so the form is not allowed to
+ * contain a field the endpoint has never heard of; `tests/test_web.py` asserts the
+ * two cover the same set.  Fetching `surface` is an enhancement, not a dependency:
+ * opening this file straight from the filesystem still gives a working form, built
+ * from the fallback copy at the bottom of the file, which the same test keeps from
+ * drifting.
+ */
 
 const $ = (id) => document.getElementById(id);
 
-const FIELDS = {
-  profile: { kind: "select" },
-  virtualization_level: { kind: "select" },
-  vm_family: { kind: "select" },
-  dispatcher_family: { kind: "select" },
-  string_protection_level: { kind: "int" },
-  cache_policy: { kind: "select" },
-  // Only meaningful alongside the bounded policy; sending it otherwise would be
-  // a knob that silently does nothing, which is the failure mode to avoid.
-  bounded_cache_size: { kind: "int", when: () => $("cache_policy").value === "bounded" },
-  min_virtualize_body_nodes: { kind: "int" },
-  max_vm_functions: { kind: "int" },
-  block_permutation: { kind: "bool" },
-  opcode_randomization: { kind: "bool" },
-  minify: { kind: "bool" },
-  strip_types: { kind: "bool" },
+/* The curated part: order, grouping, labels, help. */
+const SPEC = [
+  {
+    id: "core",
+    title: "What gets hidden",
+    help: "Everything below decides how much of the program is turned into bytecode " +
+          "for a private interpreter, and how that interpreter is shaped.",
+    fields: [
+      ["profile", "Preset", "select",
+       "Sets every option below. Change it any time; a control you have moved by " +
+       "hand keeps its value until you press the preset again."],
+      ["virtualization_level", "Virtualization", "select",
+       "How many functions go into the VM. `none` leaves a native build with " +
+       "renaming, string protection and integrity only."],
+      ["min_virtualize_body_nodes", "Body size floor", "int",
+       "Functions smaller than this stay native: below about eight AST nodes a VM " +
+       "frame costs more than it hides."],
+      ["max_vm_functions", "Max virtualized functions", "int",
+       "A cap, not a target. 0 means no limit."],
+      ["vm_variety", "VMs per artifact", "int",
+       "Distinct interpreters in one artifact. Each group gets its own family, " +
+       "dispatcher and instruction format, so 2 means two VMs."],
+      ["vm_family", "VM family", "select",
+       "The register discipline the interpreter uses. Group 0 keeps this; extra " +
+       "groups rotate through the rest when state distribution is on."],
+      ["dispatcher_family", "Dispatcher", "select",
+       "How the interpreter picks the next handler. `mixed` draws one per group, " +
+       "which is what makes the dispatcher part of the per-build shape."],
+      ["state_distribution", "Spread VM state", "bool",
+       "Rotate the extra groups through the other families instead of repeating one " +
+       "discipline for the whole build."],
+      ["dispatcher_splitting", "Split dispatchers", "bool",
+       "Give each VM its own dispatch shape. Needs more than one group."],
+    ],
+  },
+  {
+    id: "format",
+    title: "Instruction format",
+    help: "What one instruction looks like on the wire: which fields, how wide, in " +
+          "what order, and what the numbers in them mean. A devirtualizer written " +
+          "against one artifact stops transferring here.",
+    fields: [
+      ["operand_randomization", "Operand layout", "bool",
+       "Field widths, order, padding and masks are drawn per build."],
+      ["instruction_formats", "Format variety", "select",
+       "0 keeps the historical layout, 1 mixes, 2 spends every knob. A level " +
+       "because the size cost is real and per-group."],
+      ["pc_protection", "Encoded targets", "bool",
+       "Jump targets are biased or relative rather than raw positions, so the " +
+       "numbers in the stream mean nothing without the format."],
+      ["edge_indirection", "Edge table", "bool",
+       "Control-flow edges leave the instruction stream: a payload carries an " +
+       "ordinal and the destinations live in their own blob."],
+      ["opcode_randomization", "Opcode randomization", "bool",
+       "Number opcodes per build rather than following Luau's order."],
+      ["opcode_aliases", "Opcode aliases", "select",
+       "How many numbers can reach one instruction: 0 one number per opcode, 1 " +
+       "some opcodes get a second alias, 2 widens both the alias set and the " +
+       "numbering space."],
+      ["instruction_fusion", "Fuse pairs", "bool",
+       "Fuse independent instruction pairs into super-instructions."],
+      ["super_instructions", "Super-instructions", "bool",
+       "Offer fused pairs as distinct opcodes, growing the handler set."],
+      ["register_randomization", "Register numbering", "bool",
+       "Register fields are widened and masked. A full permutation is not " +
+       "implemented: FORLOOP, CALL and SETLIST address base+1..+3."],
+      ["control_flow_level", "Control flow", "select",
+       "How far blocks are rearranged, from reordering up to flattening."],
+      ["block_permutation", "Permute blocks", "bool",
+       "Emit basic blocks in an order that is not the source order."],
+    ],
+  },
+  {
+    id: "data",
+    title: "Data protection",
+    help: "Literals are not stored as literals. Numbers keep their exact IEEE-754 " +
+          "value -- precision, signed zero and NaN included -- but not their shape.",
+    fields: [
+      ["string_protection_level", "Strings", "select",
+       "0 off, 1 encoded, 2 fragmented and ticketed through the string bank. 3 is " +
+       "currently the same as 2; there is no third tier yet."],
+      ["cache_policy", "Decoded-string cache", "select",
+       "How much plaintext sits in the heap: `none` re-materialises on every read, " +
+       "`full` keeps everything, `bounded` keeps a rolling window."],
+      ["bounded_cache_size", "Cache window", "int",
+       "How many entries the bounded cache holds before it drops them."],
+      ["numeric_protection_level", "Numbers", "select",
+       "0 stores the double; 1 stores a disguised form; 2 also splits large " +
+       "integers in half. Values that no arithmetic encoding can keep exact stay on " +
+       "the direct path."],
+      ["chunking_level", "Pool chunking", "select",
+       "Split the encrypted constant pool into separately keyed, separately " +
+       "authenticated chunks. 0 is one blob."],
+      ["chunk_size", "Chunk size", "int",
+       "Target bytes per pool chunk."],
+      ["lazy_decode", "Open chunks on demand", "bool",
+       "Decrypt a chunk when a constant in it is first read, instead of the whole " +
+       "pool at load."],
+      ["decoys", "Decoy entries", "bool",
+       "Real pool entries and dispatch numbers the program never uses, with no " +
+       "recognisable pattern in which ones they are."],
+      ["decoy_constants", "Decoy count", "int",
+       "Per build. Scales with the real pool so a small file does not gain a " +
+       "conspicuous block of noise."],
+      ["metadata_fragmentation", "Split descriptor tables", "bool",
+       "Per-VM descriptor tables arrive as several pieces instead of one table."],
+    ],
+  },
+  {
+    id: "guards",
+    title: "Environment and dump guards",
+    help: "These do not prevent a dump; nothing in a Lua VM can. They remove the " +
+          "free look at which globals the artifact touches, and they notice a " +
+          "replaced dump surface. Both are drawn from the runtime's own snapshot of " +
+          "the environment before any hook is in place.",
+    fields: [
+      ["env_guard", "Anti environment logging", "select",
+       "0 off, 1 snapshot, 2 snapshot plus refusing to run when the environment has " +
+       "been given a logging __index/__newindex pair. At 1 and above the runtime's " +
+       "own library lookups become chunk locals, so an __index logger does not see " +
+       "them at all."],
+      ["dump_guard", "Anti dump", "select",
+       "Checks the surfaces a dumper replaces -- string.dump, getbytecode, " +
+       "getscriptbytecode, debug.getinfo -- and, at 2, the hook state."],
+      ["guard_policy", "When a guard fires", "select",
+       "`fail` refuses the same way a corrupt payload does, so the trip is not a " +
+       "message that names the check. `ignore` keeps running, which is how you " +
+       "measure the checks on a machine that legitimately has a hooked " +
+       "environment."],
+    ],
+  },
+  {
+    id: "noise",
+    title: "Padding and integrity",
+    help: "Dead-but-valid code, bounded on purpose: padding that dominates the " +
+          "artifact is a fingerprint of its own. Integrity checking always runs -- " +
+          "each payload authenticates its own header, opcode map and instruction " +
+          "count -- but the fields that would let you choose how far to take it " +
+          "(integrity_level, self_test, encoded_pc) are declared and not applied, " +
+          "and this page lists them as such after a build.",
+    fields: [
+      ["junk_level", "Junk states", "select",
+       "Unreachable states in the dispatcher: 0 none, 1 a few, 2 more."],
+      ["opaque_predicates", "Opaque predicates", "bool",
+       "Always-true tests that gate reachable code, so a static reader has to prove " +
+       "each branch."],
+      ["branch_inversion", "Invert branches", "bool",
+       "Flip a conditional and negate its test where the meaning is unchanged."],
+    ],
+  },
+  {
+    id: "output",
+    title: "Output",
+    help: "How the artifact is written and how much it is allowed to grow.",
+    fields: [
+      ["minify", "Minify", "bool",
+       "No newlines or indentation. Harder to read; also harder for you to diff " +
+       "against a previous build."],
+      ["strip_types", "Strip type annotations", "bool",
+       "Luau type syntax is erased either way; this drops it before lowering rather " +
+       "than carrying it."],
+      ["hash_comments", "# comments", "select",
+       "`auto` strips a leading # (the `#!` shebang and the convention some " +
+       "tooling uses), `strip` always, `strict` refuses the input. A # inside a " +
+       "string or an operator like #t is never touched, and the stripped source is " +
+       "re-parsed to prove nothing was cut through."],
+      ["max_output_growth", "Size budget", "float",
+       "Above this ratio the pipeline gives up the most expensive optional passes " +
+       "and rebuilds, then reports what it dropped. 0 disables the check. A maximum " +
+       "build of a small file runs 12-16x, so the default is 24."],
+      ["roblox_mode", "Roblox API surface", "bool",
+       "Use only globals Roblox provides. It does not run Roblox code -- there is " +
+       "no runtime here, and pretending otherwise would be a check that never " +
+       "happened."],
+      ["fingerprint", "Format fingerprint", "bool",
+       "Record a structural digest of what this build decided in the report, and " +
+       "bind the constant pool to it. No marker string ends up in the artifact."],
+      ["seed", "Seed", "seed",
+       "Empty draws a fresh 128-bit seed per build, which is the point: a fixed seed " +
+       "means a fixed artifact."],
+    ],
+  },
+];
+
+/* Fields the endpoint accepts that this page does not have a control for. The
+   form generator refuses to build one, and the banner below says so, because a
+   knob can only be offered once the pipeline reads it. */
+const EXTRA_WIDGET = {
+  kind: "text",
 };
 
-/* Profiles, mirrored from couxobf.config.Config. Kept here so the buttons do
-   something visible instead of only changing a dropdown the user then has to
-   inspect.
-
-   virtualization_level and string_protection_level are copied verbatim from
-   Config.from_profile -- a preset that claimed different values would disagree
-   with the profile dropdown sitting right above it. The remaining fields are
-   deliberate UI defaults on top: `minimum` is the point at which a function is
-   considered worth virtualizing, and compact leaves block permutation off.
-
-   Note that the `compact` profile virtualizes nothing. That is what it means,
-   not a bug, but it is easy to mistake for a build that silently failed. */
-const PRESETS = {
-  maximum:  { profile: "maximum",  virtualization_level: "maximum", string_protection_level: 3,
-              min_virtualize_body_nodes: 1,  vm_family: "stack", minify: true,
-              block_permutation: true, opcode_randomization: true, cache_policy: "none" },
-  balanced: { profile: "balanced", virtualization_level: "medium",  string_protection_level: 2,
-              min_virtualize_body_nodes: 12, vm_family: "hybrid", minify: false,
-              block_permutation: true, opcode_randomization: true, cache_policy: "none" },
-  compact:  { profile: "compact",  virtualization_level: "none",    string_protection_level: 1,
-              min_virtualize_body_nodes: 12, vm_family: "register", minify: true,
-              block_permutation: false, opcode_randomization: true, cache_policy: "bounded" },
+const PRESET_BLURB = {
+  compact: "Renaming and string protection, no VM. Smallest output.",
+  balanced: "One VM, common settings, moderate growth.",
+  hardened: "Several formats, integrity checks, bigger.",
+  maximum: "Every pass, including the ones that cost 12-16× in size.",
 };
 
-const EXAMPLE = `-- inventory.lua
--- A small shop: tiered discounts, a counter closure, and a summary line.
+const GROUPS = SPEC.map((g) => g.fields.map((f) => f[0]));
+const FIELD_NAMES = GROUPS.flat();
 
+/* Widgets that are not Config fields. */
+const SYNTH = {
+  profile: { kind: "enum", choices: ["compact", "balanced", "hardened", "maximum"],
+             default: "maximum" },
+  seed: { kind: "text" },
+};
+
+const PRESET_LABELS = {
+  compact: "Compact",
+  balanced: "Balanced",
+  hardened: "Hardened",
+  maximum: "Maximum",
+};
+
+/* ---------- option state ---------- */
+
+/* A program worth obfuscating: a metatable, a closure, loops, numeric formatting.
+   Small enough that a build finishes in about a second, and it prints something,
+   so a user can compare the original output with the protected one. */
+const EXAMPLE = `-- inventory.luau
 local Catalog = {}
 Catalog.__index = Catalog
 
@@ -111,43 +301,313 @@ end
 print(string.format("%s: %d lines, total %.2f", shop.name, #receipts, grand))
 `;
 
-/* ---------- options ---------- */
+const HONESTY = `What this does, and what it does not.
+
+It raises the cost of reading the program. It does not make the program unreadable.
+
+- The output is Luau source. Anyone who can run it can run it, and anything that
+  can run can be observed while it runs. A dumper attached to a real VM can read
+  the constant pool after the runtime decrypts it, because decrypting it is the
+  runtime's job.
+- The key material is inside the artifact. So is the interpreter, so is the format
+  description. Each of those is findable by someone determined enough; what they
+  cannot do cheaply is find them in a build whose instruction format, opcode
+  numbering, pool layout and helper names differ from the last build's.
+- The environment and dump guards remove a free look and notice a replaced
+  surface. A runner that never touches string.dump, keeps its own VM, and does not
+  install a logging metatable trips nothing at all -- that is a dump no guard could
+  see, and pretending otherwise is how tools get trusted to do more than they do.
+- Roblox's own protections are not part of this. Output is checked against the API
+  surface, not run inside an executor.
+
+The useful model is cost, not secrecy. docs/SECURITY.md in the repository has the
+whole version of this.`;
+
+let surface = {};       // from the endpoint: {name: {kind, choices, min, max, ...}}
+let profileValues = {}; // from the endpoint: {profile: {name: value}}
+
+function specFor(name) {
+  return surface[name] || SYNTH[name] || { kind: name };
+}
+
+function widgetFor(name) {
+  const el = $(`opt-${name}`);
+  return el ? el.querySelector("input, select") : null;
+}
+
+function currentValue(name) {
+  const el = widgetFor(name);
+  if (!el) return undefined;
+  if (el.type === "checkbox") return el.checked;
+  if (el.type === "range" || el.dataset.kind === "int") {
+    const n = parseInt(el.value, 10);
+    return Number.isNaN(n) ? undefined : n;
+  }
+  if (el.dataset.kind === "float") {
+    const n = parseFloat(el.value);
+    return Number.isNaN(n) ? undefined : n;
+  }
+  if (el.dataset.number) {
+    const n = parseInt(el.value, 10);
+    return Number.isNaN(n) ? undefined : n;
+  }
+  return el.value;
+}
+
+/* A control whose field only has an effect alongside another setting is shown,
+   marked, and left out of the request: sending it would make the response claim
+   an option was applied when the build ignored it. */
+function gateState(name) {
+  const gate = specFor(name).requires;
+  if (!gate) return { live: true, note: "" };
+  if (gate.any_of) {
+    const on = gate.any_of.some((f) => {
+      const v = currentValue(f);
+      return typeof v === "number" ? v > 0 : !!v;
+    });
+    return { live: on, note: specFor(name).gate || "needs one of those on" };
+  }
+  const value = currentValue(gate.field);
+  let ok = false;
+  if (gate.op === "==") ok = value === gate.value;
+  else if (gate.op === "!=") ok = value !== gate.value;
+  else if (gate.op === ">=") ok = Number(value) >= gate.value;
+  else if (gate.op === "<=") ok = Number(value) <= gate.value;
+  return { live: ok, note: specFor(name).gate || `${gate.field} ${gate.op} ${gate.value}` };
+}
 
 function readOptions() {
   const options = {};
-  for (const [name, spec] of Object.entries(FIELDS)) {
-    const el = $(name);
+  for (const name of FIELD_NAMES) {
+    const el = widgetFor(name);
     if (!el) continue;
-    if (spec.when && !spec.when()) continue;
-    if (spec.kind === "bool") options[name] = el.checked;
-    else if (spec.kind === "int") options[name] = parseInt(el.value, 10) || 0;
-    else options[name] = el.value;
-  }
-  const seed = $("seed").value.trim();
-  if (seed) {
-    const n = seed.toLowerCase().startsWith("0x")
-      ? parseInt(seed.slice(2), 16) : parseInt(seed, 10);
-    if (!Number.isNaN(n)) options.reproducible_seed = n;
+    if (name !== "profile" && !gateState(name).live) continue;
+    const value = currentValue(name);
+    if (value === undefined || value === "") continue;
+    if (name === "profile") {
+      options.profile = value;
+    } else if (name === "seed") {
+      const text = String(value).trim();
+      if (!text) continue;
+      if (/^0x[0-9a-fA-F_]+$/.test(text) || /^\d[\d_]*$/.test(text)) {
+        options.reproducible_seed = text.replace(/_/g, "");
+      }
+    } else {
+      // A dropdown or a text box hands back a string even for a numeric field, and
+      // the endpoint refuses a string where it declared an integer -- which is the
+      // right thing for it to do, so the conversion happens here instead.
+      const kind = specFor(name).kind;
+      if (kind === "int" || kind === "float" || kind === "wide") {
+        const n = Number(value);
+        if (Number.isNaN(n)) continue;
+        options[name] = n;
+      } else {
+        options[name] = value;
+      }
+    }
   }
   return options;
 }
 
-function syncCacheBound() {
-  const wrap = $("opt-bounded_cache_size");
-  if (wrap) wrap.hidden = $("cache_policy").value !== "bounded";
-}
+/* ---------- form building ---------- */
 
-function applyPreset(preset) {
-  for (const [name, value] of Object.entries(preset)) {
-    const el = $(name);
-    if (!el) continue;
-    if (el.type === "checkbox") el.checked = value;
-    else el.value = String(value);
+function buildForm() {
+  const root = $("options");
+  root.innerHTML = "";
+  for (const group of SPEC) {
+    const section = document.createElement("section");
+    section.className = "group";
+    section.id = `group-${group.id}`;
+    section.innerHTML =
+      `<h3>${group.title}</h3><p class="group-help">${group.help}</p>` +
+      `<div class="rows"></div>`;
+    const rows = section.querySelector(".rows");
+    for (const [name, label, kind, help] of group.fields) {
+      rows.appendChild(buildRow(name, label, kind, help));
+    }
+    root.appendChild(section);
   }
-  syncCacheBound();
+  const unknown = unknownFields();
+  $("missing").hidden = !unknown.length;
+  $("missing").textContent = unknown.length
+    ? `The endpoint accepts options this page has no control for: ${unknown.join(", ")}.`
+    : "";
+  syncGates();
 }
 
-/* ---------- formatting ---------- */
+function unknownFields() {
+  const accepted = new Set([...Object.keys(surface), ...Object.keys(SYNTH)]);
+  return Object.keys(surface)
+    .filter((n) => n !== "reproducible_seed" && !accepted.has(n));
+}
+
+function buildRow(name, label, kind, help) {
+  const spec = specFor(name);
+  const row = document.createElement("div");
+  row.className = "row";
+  row.dataset.field = name;
+
+  const head = document.createElement("div");
+  head.className = "row-label";
+  head.innerHTML =
+    `<label for="opt-${name}"><code>${name}</code><span>${label}</span></label>` +
+    `<p class="help">${help}</p>`;
+  row.appendChild(head);
+
+  const box = document.createElement("div");
+  box.className = "row-control";
+  box.id = `opt-${name}`;
+  box.appendChild(buildControl(name, kind, spec));
+  row.appendChild(box);
+  return row;
+}
+
+/* A dropdown of small integers, for the level-shaped fields the config types as
+   int.  The values come from the endpoint's own min/max, so this page cannot
+   offer a level the config would refuse; when the range is too wide to be a menu
+   the caller gets a slider instead (`selectChoices` returns null). */
+function selectChoices(name, spec) {
+  if (spec.choices && spec.choices.length) return spec.choices;
+  if (spec.min == null || spec.max == null) return null;
+  const low = Math.floor(spec.min), high = Math.floor(spec.max);
+  if (high - low > 8) return null;
+  const out = [];
+  for (let v = low; v <= high; v += 1) out.push(String(v));
+  return out;
+}
+
+function buildControl(name, kind, spec) {
+  if (kind === "bool") {
+    const label = document.createElement("label");
+    label.className = "switch";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = spec.default !== false;
+    input.dataset.kind = "bool";
+    input.id = `control-${name}`;
+    label.appendChild(input);
+    label.appendChild(document.createTextNode("on"));
+    input.addEventListener("change", () => {
+      label.classList.toggle("off", !input.checked);
+      syncGates();
+    });
+    label.classList.toggle("off", !input.checked);
+    return label;
+  }
+  if (kind === "select" && selectChoices(name, spec)) {
+    const select = document.createElement("select");
+    select.id = `control-${name}`;
+    for (const choice of selectChoices(name, spec)) {
+      const option = document.createElement("option");
+      option.value = choice;
+      option.textContent = choice;
+      select.appendChild(option);
+    }
+    if (spec.default != null) select.value = String(spec.default);
+    select.addEventListener("change", syncGates);
+    return select;
+  }
+  if (kind === "int" && (spec.kind === "wide" || WIDE_INTS.has(name))) kind = "number";
+  if (kind === "int" || kind === "float") {
+    const wrap = document.createElement("div");
+    wrap.className = "slider";
+    const low = kind === "int" ? (spec.min ?? 0) : (spec.min ?? 1);
+    const high = kind === "int" ? (spec.max ?? 64) : (spec.max ?? 40);
+    const input = document.createElement("input");
+    input.type = "range";
+    input.min = String(low);
+    input.max = String(high);
+    input.step = kind === "int" ? "1" : "0.5";
+    input.value = String(spec.default ?? low);
+    input.id = `control-${name}`;
+    input.dataset.kind = kind;
+    const out = document.createElement("output");
+    out.textContent = input.value;
+    input.addEventListener("input", () => {
+      out.textContent = input.value;
+      syncGates();
+    });
+    wrap.appendChild(input);
+    wrap.appendChild(out);
+    return wrap;
+  }
+  if (kind === "number") {
+    const input = document.createElement("input");
+    input.type = "number";
+    input.id = `control-${name}`;
+    input.dataset.kind = "text";
+    input.dataset.number = "1";
+    if (spec.min != null) input.min = String(spec.min);
+    if (spec.max != null) input.max = String(spec.max);
+    if (spec.default != null) input.value = String(spec.default);
+    input.addEventListener("input", syncGates);
+    return input;
+  }
+  const text = document.createElement("input");
+  text.type = "text";
+  text.id = `control-${name}`;
+  text.dataset.kind = "text";
+  text.placeholder = "fresh per build";
+  text.spellcheck = false;
+  return text;
+}
+
+/* Grey out controls that are gated off, and say why. */
+function syncGates() {
+  for (const name of FIELD_NAMES) {
+    const row = document.querySelector(`.row[data-field="${name}"]`);
+    if (!row) continue;
+    const { live, note } = gateState(name);
+    row.classList.toggle("gated", !live);
+    let flag = row.querySelector(".gate");
+    if (!live) {
+      if (!flag) {
+        flag = document.createElement("p");
+        flag.className = "gate";
+        row.querySelector(".row-label").appendChild(flag);
+      }
+      flag.textContent = `unused unless ${note}`;
+    } else if (flag) {
+      flag.remove();
+    }
+  }
+}
+
+function applyProfile(name) {
+  const values = profileValues[name];
+  if (!values) return;
+  for (const [field, value] of Object.entries(values)) {
+    const el = widgetFor(field);
+    if (!el) continue;
+    if (el.type === "checkbox") {
+      el.checked = !!value;
+      el.closest(".switch")?.classList.toggle("off", !value);
+    } else if (el.tagName === "SELECT") {
+      el.value = String(value);
+    } else if (el.dataset.kind === "int" || el.dataset.kind === "float") {
+      el.value = String(value);
+      const out = el.parentNode.querySelector("output");
+      if (out) out.textContent = String(value);
+    }
+  }
+  syncGates();
+}
+
+/* After a build: mark any control the response reported as not applied. It is a
+   real option of the config, and this page says so rather than implying it did
+   something. */
+function markPending(list) {
+  for (const name of FIELD_NAMES) {
+    document.querySelector(`.row[data-field="${name}"]`)
+      ?.classList.remove("inert");
+  }
+  for (const item of list || []) {
+    document.querySelector(`.row[data-field="${item.name}"]`)
+      ?.classList.add("inert");
+  }
+}
+
+/* ---------- results ---------- */
 
 function bytes(n) {
   if (n < 1024) return `${n} B`;
@@ -166,7 +626,7 @@ function renderMetrics(data) {
   const cards = [
     ["in", bytes(data.input_bytes)],
     ["out", bytes(data.output_bytes)],
-    ["growth", growth + "×"],
+    ["growth", `${growth}×`],
     ["prototypes", String(data.prototypes)],
     ["virtualized", String(data.virtualized)],
   ];
@@ -176,11 +636,33 @@ function renderMetrics(data) {
   $("metrics").hidden = false;
 }
 
+function renderApplied(applied) {
+  const rows = Object.entries(applied || {}).map(([name, value]) =>
+    `<tr><td><code>${name}</code></td><td>${fmtValue(value)}</td></tr>`).join("");
+  $("appliedBody").innerHTML = rows;
+  $("appliedBox").hidden = false;
+}
+
+function fmtValue(value) {
+  if (value === true) return '<span class="yes">on</span>';
+  if (value === false) return '<span class="no">off</span>';
+  if (value === null || value === undefined) return '<span class="no">—</span>';
+  return String(value);
+}
+
+function renderNotes(list) {
+  const box = $("notesBox");
+  if (!list || !list.length) { box.hidden = true; return; }
+  $("notesList").innerHTML = list.map((n) => `<li>${n}</li>`).join("");
+  box.hidden = false;
+}
+
 function renderPending(list) {
   const box = $("pendingBox");
   if (!list || !list.length) { box.hidden = true; return; }
   $("pendingSummary").innerHTML =
-    `${list.length} configured techniques were <em>not</em> applied`;
+    `${list.length} configured ${list.length === 1 ? "option was" : "options were"} ` +
+    `<em>not</em> applied by this build`;
   $("pendingList").innerHTML = list
     .map((p) => `<span class="chip" title="set to ${String(p.value)}">${p.name}</span>`)
     .join("");
@@ -201,9 +683,11 @@ async function run() {
   $("output").textContent = "";
   $("metrics").hidden = true;
   $("pendingBox").hidden = true;
+  $("notesBox").hidden = true;
+  $("appliedBox").hidden = true;
 
   try {
-    const res = await fetch("api/obfuscate", {
+    const res = await fetch(API, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ source, options: readOptions() }),
@@ -212,14 +696,19 @@ async function run() {
 
     if (!res.ok || data.error) {
       $("output").textContent = data.error || `HTTP ${res.status}`;
-      setStatus("The build failed.", "err");
+      setStatus(data.error ? "The build was refused." : "The build failed.", "err");
+      renderPending(data.pending);
       return;
     }
 
     lastOutput = data.output;
     $("output").textContent = data.output;
     renderMetrics(data);
+    renderApplied(data.applied);
+    renderNotes(data.notes);
     renderPending(data.pending);
+    markPending(data.pending);
+    $("report").textContent = data.report || "";
     $("copy").disabled = false;
     $("download").disabled = false;
 
@@ -274,8 +763,10 @@ function download() {
 function updateInputStats() {
   const text = $("source").value;
   const size = new Blob([text]).size;
+  const lines = text.split("\n").length;
+  const comments = (text.match(/^\s*#/gm) || []).length;
   $("inputStats").textContent =
-    `${bytes(size)} · ${text.split("\n").length} lines`;
+    `${bytes(size)} · ${lines} lines` + (comments ? ` · ${comments} # line(s)` : "");
 }
 
 function loadFile(file) {
@@ -293,6 +784,80 @@ function loadFile(file) {
   };
   reader.onerror = () => setStatus("Could not read that file.", "err");
   reader.readAsText(file);
+}
+
+/* ---------- options surface ---------- */
+
+const API = "api/obfuscate";
+
+async function loadSurface() {
+  try {
+    const res = await fetch(API, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "options" }),
+    });
+    if (!res.ok) return false;
+    const data = await res.json();
+    // An empty surface is not a surface: `OPTIONS` with no keys would build a form
+    // of empty menus that all validate, which is worse than the fallback copy.
+    if (!data || !data.options || !Object.keys(data.options).length) return false;
+    surface = data.options;
+    profileValues = data.profile_values || {};
+    return true;
+  } catch {
+    return false;           // opened without a backend: use the fallback copy
+  }
+}
+
+/* Fallback surface, mirroring the endpoint for the handful of fields whose
+   choices or ranges the form needs. `tests/test_web.py` compares this against
+   `option_surface()`, so an update to one has to update the other. */
+const FALLBACK = {
+  virtualization_level: { kind: "enum", choices: ["none", "light", "medium", "heavy", "maximum"], default: "heavy" },
+  vm_family: { kind: "enum", choices: ["register", "stack", "accumulator", "hybrid"], default: "register" },
+  dispatcher_family: { kind: "enum", choices: ["none", "nested_if", "decision_tree", "bucket", "mixed"], default: "mixed" },
+  cache_policy: { kind: "enum", choices: ["none", "bounded", "full"], default: "none" },
+  guard_policy: { kind: "choice", choices: ["fail", "ignore"], default: "fail" },
+  hash_comments: { kind: "choice", choices: ["auto", "strip", "strict"], default: "auto" },
+  instruction_formats: { kind: "int", min: 0, max: 2, default: 1 },
+  opcode_aliases: { kind: "int", min: 0, max: 4, default: 1 },
+  numeric_protection_level: { kind: "int", min: 0, max: 2, default: 1 },
+  string_protection_level: { kind: "int", min: 0, max: 3, default: 2 },
+  control_flow_level: { kind: "int", min: 0, max: 3, default: 2 },
+  chunking_level: { kind: "int", min: 0, max: 3, default: 2 },
+  junk_level: { kind: "int", min: 0, max: 3, default: 1 },
+  env_guard: { kind: "int", min: 0, max: 2, default: 1 },
+  dump_guard: { kind: "int", min: 0, max: 2, default: 1 },
+  decoy_constants: { kind: "int", min: 0, max: 256, default: 12 },
+  bounded_cache_size: { kind: "int", min: 1, max: 4096, default: 16 },
+  chunk_size: { kind: "int", min: 256, max: 1048576, default: 4096 },
+  max_vm_functions: { kind: "int", min: 0, max: 4096, default: 64 },
+  min_virtualize_body_nodes: { kind: "int", min: 0, max: 4096, default: 12 },
+  vm_variety: { kind: "int", min: 1, max: 4, default: 1 },
+  max_output_growth: { kind: "float", min: 0, max: 1000, default: 24 },
+};
+
+/* The int fields a slider can represent: the endpoint allows up to 4096, which a
+   range input would turn into a lottery.  Those get a number box instead. */
+const WIDE_INTS = new Set(["bounded_cache_size", "chunk_size", "max_vm_functions",
+                           "min_virtualize_body_nodes", "decoy_constants"]);
+
+function useFallback() {
+  for (const group of SPEC) {
+    for (const entry of group.fields) {
+      const name = entry[0];
+      if (surface[name] || SYNTH[name]) continue;
+      let fallback = FALLBACK[name];
+      if (fallback && WIDE_INTS.has(name)) fallback = { ...fallback, kind: "wide" };
+      if (fallback) surface[name] = fallback;
+      else if (entry[2] === "int") {
+        surface[name] = WIDE_INTS.has(name)
+          ? { kind: "wide", default: 0 }
+          : { kind: "int", min: 0, max: 8, default: 0 };
+      }
+    }
+  }
 }
 
 /* ---------- wiring ---------- */
@@ -313,17 +878,37 @@ function init() {
     setStatus("Loaded the example.");
   });
 
-  $("presetMaximum").addEventListener("click", () => applyPreset(PRESETS.maximum));
-  $("presetBalanced").addEventListener("click", () => applyPreset(PRESETS.balanced));
-  $("presetCompact").addEventListener("click", () => applyPreset(PRESETS.compact));
+  $("presetBar").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-profile]");
+    if (!btn) return;
+    const select = widgetFor("profile");
+    if (select) select.value = btn.dataset.profile;
+    applyProfile(btn.dataset.profile);
+    setStatus(`Applied the ${btn.dataset.profile} preset.`);
+  });
 
-  $("cache_policy").addEventListener("change", syncCacheBound);
-  syncCacheBound();
+  const profileSelect = widgetFor("profile");
+  if (profileSelect) profileSelect.addEventListener("change", () => {
+    applyProfile(profileSelect.value);
+    setStatus(`Applied the ${profileSelect.value} preset.`);
+  });
 
-  $("rollSeed").addEventListener("click", () => {
-    const buf = new Uint8Array(8);
-    crypto.getRandomValues(buf);
-    $("seed").value = "0x" + [...buf].map((b) => b.toString(16).padStart(2, "0")).join("");
+  $("honestyLink").addEventListener("click", (e) => {
+    e.preventDefault();
+    $("output").textContent = HONESTY;
+    setStatus("The limits of what this does, in its own words.");
+  });
+
+  $("filter").addEventListener("input", () => {
+    const needle = $("filter").value.trim().toLowerCase();
+    document.querySelectorAll(".row").forEach((row) => {
+      const text = row.textContent.toLowerCase();
+      row.hidden = !!needle && !text.includes(needle);
+    });
+    document.querySelectorAll(".group").forEach((group) => {
+      const any = [...group.querySelectorAll(".row")].some((r) => !r.hidden);
+      group.hidden = !!needle && !any;
+    });
   });
 
   $("fileInput").addEventListener("change", (e) => loadFile(e.target.files[0]));
@@ -357,11 +942,35 @@ function init() {
   });
   // On desktop the panel is always visible; make sure resizing back up does not
   // leave it hidden behind the mobile toggle state.
-  const mq = window.matchMedia("(min-width: 761px)");
+  const mq = window.matchMedia("(min-width: 900px)");
   const sync = (e) => { if (e.matches) $("options").classList.remove("open"); };
   mq.addEventListener ? mq.addEventListener("change", sync) : mq.addListener(sync);
 
   updateInputStats();
 }
 
-document.addEventListener("DOMContentLoaded", init);
+function renderPresets() {
+  const bar = $("presetBar");
+  const names = Object.keys(profileValues).length
+    ? Object.keys(profileValues)
+    : ["compact", "balanced", "hardened", "maximum"];
+  bar.innerHTML = names
+    .map((n) => `<button type="button" data-profile="${n}" title="${PRESET_BLURB[n] || ""}">${PRESET_LABELS[n] || n}</button>`)
+    .join("");
+}
+
+async function boot() {
+  const fresh = await loadSurface();
+  if (!fresh) $("surfaceState").textContent =
+    "ranges and vocabularies from the page's own copy";
+  else $("surfaceState").textContent = "ranges and vocabularies from the endpoint";
+  useFallback();
+  buildForm();
+  renderPresets();
+  if (profileValues.maximum) applyProfile("maximum");
+  init();
+}
+
+if (typeof document !== "undefined") {
+  document.addEventListener("DOMContentLoaded", boot);
+}
