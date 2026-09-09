@@ -80,7 +80,7 @@ def test_the_defaults_request_features_that_are_not_built():
                  "call_frame_obfuscation", "encoded_pc", "epoch_masks",
                  "integrity_level", "self_test",
                  "identifier_polymorphism", "fingerprint_reduction",
-                 "branch_inversion", "chunking_level", "lazy_decode",
+                 "chunking_level", "lazy_decode",
                  "junk_level", "roblox_mode"):
         assert name in pending, name
     assert len(pending) <= 20, sorted(pending)
@@ -116,7 +116,7 @@ def test_report_lists_the_unapplied_capabilities():
     report = result.report
     assert "requested but not applied" in report
     assert re.search(r"\d+ declared capabilities are not implemented", report)
-    for probe in ("branch_inversion", "fingerprint_reduction"):
+    for probe in ("fingerprint_reduction",):
         assert probe in report, f"{probe} missing from the report"
 
 

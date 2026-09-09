@@ -90,6 +90,9 @@ const SPEC = [
       ["opaque_predicates", "Opaque predicates", "bool",
        "Add short validity predicates whose truth depends on the current decoded " +
        "VM state, not repeated arithmetic identities a simplifier can delete."],
+      ["branch_inversion", "Invert branches", "bool",
+       "Randomly flip eligible if/else branches and their conditions before lowering, " +
+       "without adding dummy blocks or changing evaluation order."],
       ["block_permutation", "Permute blocks", "bool",
        "Emit basic blocks in an order that is not the source order."],
     ],
@@ -851,6 +854,7 @@ const FALLBACK = {
   numeric_protection_level: { kind: "int", min: 0, max: 2, default: 1 },
   table_key_protection: { kind: "bool", default: true },
   control_flow_level: { kind: "int", min: 0, max: 3, default: 2 },
+  branch_inversion: { kind: "bool", default: true },
   env_guard: { kind: "int", min: 0, max: 2, default: 1 },
   dump_guard: { kind: "int", min: 0, max: 2, default: 1 },
   decoy_constants: { kind: "int", min: 0, max: 256, default: 12 },

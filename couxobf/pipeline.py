@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from . import classify as _classify
 from . import comments as _comments
+from . import controlflow as _controlflow
 from .vm import format as _vm_format
 from .vm import runtime as _vm_runtime
 from . import ir as _ir
@@ -342,6 +343,10 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         raise BuildError(f"{name} does not parse: {_parse_hint(source, exc)}"
                          ) from None
 
+    domains = make_domains(seed)
+    if config.branch_inversion and int(config.control_flow_level) > 0:
+        _controlflow.invert_branches(ast, domains.get("cfg"), enabled=True)
+
     # Semantic analysis runs for its own sake: it is what the identifier
     # renamer and the classifier read, and running it here means a source file
     # that breaks it fails now, at the front, with the file name attached.
@@ -349,8 +354,6 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         _sema.ScopeAnalyzer().analyze(ast)
     except Exception as exc:
         raise BuildError(f"{name} failed semantic analysis: {exc}") from None
-
-    domains = make_domains(seed)
 
     # -- IR ---------------------------------------------------------------
     module = _ir.Lowerer(

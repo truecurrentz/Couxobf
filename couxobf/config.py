@@ -465,6 +465,7 @@ class Config:
         "decoy_constants",
         "control_flow_level",
         "opaque_predicates",
+        "branch_inversion",
         "env_guard",
         "dump_guard",
         "guard_policy",
