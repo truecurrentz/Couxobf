@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 dist/
 build/
+*.egg-info/
 
 # Toolchain (built by tools/setup-luau.sh, ~200MB, never vendored)
 /.luau-toolchain/

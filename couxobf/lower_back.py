@@ -628,7 +628,8 @@ def reconstruct_protected(module: IRModule,
                           minify: bool = False,
                           optimize_first: bool = True,
                           vm_level: Any = VirtualizationLevel.HEAVY,
-                          vm_rng: Any = None) -> str:
+                          vm_rng: Any = None,
+                          vm_protos: Any = None) -> str:
     """Lower an IR module to protected, self-contained Luau source.
 
     Assembles three pieces in the order they must appear: the constant pool
@@ -664,12 +665,14 @@ def reconstruct_protected(module: IRModule,
     # Virtualization is on by default at the same level ``Config`` defaults to.
     # Pass ``VirtualizationLevel.NONE`` (or the "compact" profile) to get a
     # purely native reconstruction.
+    # ``vm_protos`` lets a caller supply an explicit selection -- the pipeline
+    # passes the classifier's decision rather than the size-floor heuristic.
     plan = None
     if VirtualizationLevel.parse(vm_level) is not VirtualizationLevel.NONE:
         from .vm import wiring as _wiring
-        plan = _wiring.make_plan(
-            vm_rng if vm_rng is not None else rng,
-            _wiring.select_protos(module, vm_level))
+        selected = (set(vm_protos) if vm_protos is not None
+                    else _wiring.select_protos(module, vm_level))
+        plan = _wiring.make_plan(vm_rng if vm_rng is not None else rng, selected)
 
     rec = Reconstructor(pool=pool, accessor=names["get"], vm=plan)
     body = rec.reconstruct(module)
