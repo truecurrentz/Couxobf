@@ -30,6 +30,12 @@ only randomized), #68 from ⬜ to ⭐ (there is an extractor whose findings beco
 tests), and #65 and #66 from ⬜ to 🔶 (a real cross-build measurement exists; a
 recovery-time study and a CFG-reconstruction number do not).
 
+This document scores the tool against the 80 techniques. The 29 points of the
+architecture review that prompted this round -- per-build VM diversity, partition
+diversity, and reducing single points of extraction -- are answered point by point
+in [`reviewer-analysis.md`](reviewer-analysis.md), which also records what the
+review asked for that this project will not build, and why.
+
 Two standing caveats that apply to the whole document. Client-side
 obfuscation raises the cost of reversing; it does not make reversing
 impossible, and nothing here should be read as claiming otherwise. And
@@ -126,7 +132,7 @@ is unbreakable.
 
 | # | Technique | Status | Evidence | Test count |
 | --- | --- | --- | --- | --- |
-| 21 | Preserve native Luau semantics | ✅ | Full lexer → parser → sema → IR pipeline; 1963 passing tests, 99 skipped with the toolchain on `PATH`. The skips are the upstream conformance files this tree documents as excluded -- each needs the vector type, native-code support or the debug library, or asserts on source line numbers a source-to-source compiler cannot preserve -- not a missing runtime: without `.luau-toolchain/bin` on `PATH` the execution-backed tests skip on top of those. | — |
+| 21 | Preserve native Luau semantics | ✅ | Full lexer → parser → sema → IR pipeline; 1964 passing tests, 99 skipped with the toolchain on `PATH`. The skips are the upstream conformance files this tree documents as excluded -- each needs the vector type, native-code support or the debug library, or asserts on source line numbers a source-to-source compiler cannot preserve -- not a missing runtime: without `.luau-toolchain/bin` on `PATH` the execution-backed tests skip on top of those. | — |
 | 51 | Test closures heavily | 🔶 | Present, not heavy. | 8 |
 | 52 | Test upvalues heavily | 🔶 | Same 8. | (shared) |
 | 53 | Test multiple returns | 🔶 | `RETURNMULTI` semantics are covered, including the splice. | 7 |
@@ -356,7 +362,7 @@ Ten passes, one partial. What is left, in the order it should be done:
 # the whole checklist's testable half; the PATH prefix is what un-skips every
 # test that has to run Luau rather than only emit it
 PATH="$PWD/.luau-toolchain/bin:$PATH" python3 -m pytest tests/ -q
-                                     # 1963 passed, 99 skipped
+                                     # 1964 passed, 99 skipped
 
 # a single build, scored
 python3 -m couxobf protect examples/maze.luau --profile maximum \
