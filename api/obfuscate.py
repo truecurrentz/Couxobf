@@ -100,8 +100,6 @@ FIELD_CHOICES: Dict[str, Tuple[str, ...]] = {
 #: is on", which is how a policy field that both guards share is described.
 FIELD_REQUIRES: Dict[str, Dict[str, Any]] = {
     "bounded_cache_size": {"field": "cache_policy", "op": "==", "value": "bounded"},
-    "chunk_size": {"field": "chunking_level", "op": ">=", "value": 1},
-    "lazy_decode": {"field": "chunking_level", "op": ">=", "value": 1},
     "decoy_constants": {"field": "decoys", "op": "==", "value": True},
     "super_instructions": {"field": "instruction_fusion", "op": "==", "value": True},
     "opcode_aliases": {"field": "opcode_randomization", "op": "==", "value": True},
@@ -155,8 +153,16 @@ def describe() -> Dict[str, Any]:
     from the same table copied into ``app.js``, and the parity test in
     ``tests/test_web.py`` is what keeps the copy honest.
     """
+    # The fields a config can name but the compiler does not read.  Listed rather
+    # than offered: a control for one of these would be the dead knob this project
+    # keeps having to remove, and leaving the name out entirely would be the other
+    # failure -- a user setting `junk_level = 2` and never learning it did nothing.
+    declared = {f.name for f in _fields(Config)}
+    pending = sorted(declared - set(Config.IMPLEMENTED) - {"reproducible_seed"})
+
     return {
         "options": OPTIONS,
+        "pending": pending,
         "profiles": list(Config.PROFILES),
         "implemented": sorted(Config.IMPLEMENTED),
         # The preset values come from the config rather than being copied into

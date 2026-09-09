@@ -102,18 +102,6 @@ const SPEC = [
        "`full` keeps everything, `bounded` keeps a rolling window."],
       ["bounded_cache_size", "Cache window", "int",
        "How many entries the bounded cache holds before it drops them."],
-      ["numeric_protection_level", "Numbers", "select",
-       "0 stores the double; 1 stores a disguised form; 2 also splits large " +
-       "integers in half. Values that no arithmetic encoding can keep exact stay on " +
-       "the direct path."],
-      ["chunking_level", "Pool chunking", "select",
-       "Split the encrypted constant pool into separately keyed, separately " +
-       "authenticated chunks. 0 is one blob."],
-      ["chunk_size", "Chunk size", "int",
-       "Target bytes per pool chunk."],
-      ["lazy_decode", "Open chunks on demand", "bool",
-       "Decrypt a chunk when a constant in it is first read, instead of the whole " +
-       "pool at load."],
       ["decoys", "Decoy entries", "bool",
        "Real pool entries and dispatch numbers the program never uses, with no " +
        "recognisable pattern in which ones they are."],
@@ -121,7 +109,8 @@ const SPEC = [
        "Per build. Scales with the real pool so a small file does not gain a " +
        "conspicuous block of noise."],
       ["metadata_fragmentation", "Split descriptor tables", "bool",
-       "Per-VM descriptor tables arrive as several pieces instead of one table."],
+       "Keep the payload, the constants and the edge table in three locals instead " +
+       "of one record per prototype, so there is no single object to dump."],
     ],
   },
   {
@@ -157,13 +146,6 @@ const SPEC = [
           "(integrity_level, self_test, encoded_pc) are declared and not applied, " +
           "and this page lists them as such after a build.",
     fields: [
-      ["junk_level", "Junk states", "select",
-       "Unreachable states in the dispatcher: 0 none, 1 a few, 2 more."],
-      ["opaque_predicates", "Opaque predicates", "bool",
-       "Always-true tests that gate reachable code, so a static reader has to prove " +
-       "each branch."],
-      ["branch_inversion", "Invert branches", "bool",
-       "Flip a conditional and negate its test where the meaning is unchanged."],
     ],
   },
   {
@@ -186,10 +168,6 @@ const SPEC = [
        "Above this ratio the pipeline gives up the most expensive optional passes " +
        "and rebuilds, then reports what it dropped. 0 disables the check. A maximum " +
        "build of a small file runs 12-16x, so the default is 24."],
-      ["roblox_mode", "Roblox API surface", "bool",
-       "Use only globals Roblox provides. It does not run Roblox code -- there is " +
-       "no runtime here, and pretending otherwise would be a check that never " +
-       "happened."],
       ["fingerprint", "Format fingerprint", "bool",
        "Record a structural digest of what this build decided in the report, and " +
        "bind the constant pool to it. No marker string ends up in the artifact."],
@@ -325,6 +303,7 @@ whole version of this.`;
 
 let surface = {};       // from the endpoint: {name: {kind, choices, min, max, ...}}
 let profileValues = {}; // from the endpoint: {profile: {name: value}}
+let pendingFields = []; // from the endpoint: config fields nothing reads yet
 
 function specFor(name) {
   return surface[name] || SYNTH[name] || { kind: name };
@@ -411,6 +390,20 @@ function readOptions() {
 
 /* ---------- form building ---------- */
 
+/* The config's own declared-but-unread fields, as chips the page cannot do more
+   with than name. Rendered from the endpoint's answer so the list is the config's
+   and not a copy that has to be remembered. */
+function renderPendingFields(list) {
+  const box = $("declaredBox");
+  if (!list || !list.length) { box.hidden = true; return; }
+  $("declaredSummary").textContent =
+    `${list.length} field${list.length === 1 ? "" : "s"} in the config that this build will not read`;
+  $("declaredList").innerHTML = list
+    .map((n) => `<span class="chip dim" title="accepted by Config, ignored by the pipeline">${n}</span>`)
+    .join("");
+  box.hidden = false;
+}
+
 function buildForm() {
   const root = $("options");
   root.innerHTML = "";
@@ -429,6 +422,7 @@ function buildForm() {
   }
   const unknown = unknownFields();
   $("missing").hidden = !unknown.length;
+  renderPendingFields(pendingFields);
   $("missing").textContent = unknown.length
     ? `The endpoint accepts options this page has no control for: ${unknown.join(", ")}.`
     : "";
@@ -804,6 +798,7 @@ async function loadSurface() {
     if (!data || !data.options || !Object.keys(data.options).length) return false;
     surface = data.options;
     profileValues = data.profile_values || {};
+    pendingFields = data.pending || [];
     return true;
   } catch {
     return false;           // opened without a backend: use the fallback copy
@@ -822,16 +817,12 @@ const FALLBACK = {
   hash_comments: { kind: "choice", choices: ["auto", "strip", "strict"], default: "auto" },
   instruction_formats: { kind: "int", min: 0, max: 2, default: 1 },
   opcode_aliases: { kind: "int", min: 0, max: 4, default: 1 },
-  numeric_protection_level: { kind: "int", min: 0, max: 2, default: 1 },
   string_protection_level: { kind: "int", min: 0, max: 3, default: 2 },
   control_flow_level: { kind: "int", min: 0, max: 3, default: 2 },
-  chunking_level: { kind: "int", min: 0, max: 3, default: 2 },
-  junk_level: { kind: "int", min: 0, max: 3, default: 1 },
   env_guard: { kind: "int", min: 0, max: 2, default: 1 },
   dump_guard: { kind: "int", min: 0, max: 2, default: 1 },
   decoy_constants: { kind: "int", min: 0, max: 256, default: 12 },
   bounded_cache_size: { kind: "int", min: 1, max: 4096, default: 16 },
-  chunk_size: { kind: "int", min: 256, max: 1048576, default: 4096 },
   max_vm_functions: { kind: "int", min: 0, max: 4096, default: 64 },
   min_virtualize_body_nodes: { kind: "int", min: 0, max: 4096, default: 12 },
   vm_variety: { kind: "int", min: 1, max: 4, default: 1 },

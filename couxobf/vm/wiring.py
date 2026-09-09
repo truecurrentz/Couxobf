@@ -95,6 +95,9 @@ class VMPlan:
     edges_table: str = ""
     #: The assembled per-prototype record every ``enter`` is handed.
     rows_table: str = ""
+    #: Whether the three descriptor tables above are actually kept apart.  See
+    #: :func:`prelude_source`; this is :attr:`Config.metadata_fragmentation`.
+    fragmented: bool = True
     #: Operand discipline of group 0 -- kept because callers and tests reach for
     #: it, and it is the honest answer whenever the build has one group.
     family: str = "register"
@@ -211,7 +214,8 @@ def make_plan(rng: Rng, protos: Iterable[int],
               tables: Optional[Sequence[str]] = None,
               names: Optional[Dict[str, str]] = None,
               families: Optional[Sequence[str]] = None,
-              dispatchers: Optional[Sequence[str]] = None) -> VMPlan:
+              dispatchers: Optional[Sequence[str]] = None,
+              fragmented: bool = True) -> VMPlan:
     """Build a :class:`VMPlan` from the build's ``vm`` randomness stream.
 
     ``rng`` should be the domain-separated stream for VM generation, not the
@@ -285,7 +289,8 @@ def make_plan(rng: Rng, protos: Iterable[int],
                   layout_rng=layout_rng,
                   dispatcher=primary.dispatcher,
                   groups=groups,
-                  alias_chance=alias_chance)
+                  alias_chance=alias_chance,
+                  fragmented=bool(fragmented))
 
 
 def _make_groups(rng: Rng, proto_ids: List[int], names: Dict[str, str], *,
@@ -423,11 +428,19 @@ def _family_name(value: Any) -> str:
     return key
 
 
+def _pack_edges(edges: Sequence[int]) -> bytes:
+    """The edge table as bytes: one little-endian u32 per destination."""
+    import struct
+
+    return struct.pack("<%dI" % len(edges), *edges)
+
+
 def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
                    const_expr: Callable[[Any], str],
                    code_expr: Callable[[bytes], str],
                    edges_expr: Optional[Callable[[bytes], str]] = None,
-                   entry_guard: Sequence[str] = ()) -> str:
+                   entry_guard: Sequence[str] = (),
+                   fragmented: Optional[bool] = None) -> str:
     """The interpreters plus the descriptor tables, as Luau source.
 
     One interpreter per VM group, then three tables keyed by prototype id: the
@@ -464,14 +477,33 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
         if enc.edges and edges_expr is not None:
             # Four bytes per edge, so the stream itself carries only ordinals
             # and the positions they mean live somewhere else entirely (#18).
-            import struct as _struct
-            blob = _struct.pack("<%dI" % len(enc.edges), *enc.edges)
+            blob = _pack_edges(enc.edges)
             edge_rows.append("  [%d] = %s," % (pid, edges_expr(blob)))
     if not payload_rows:
         # No prototype made it in, so there is nothing to dispatch.  Emitting
         # the interpreter anyway would be dead weight an analyst could study
         # for free.
         return ""
+    if fragmented is None:
+        fragmented = plan.fragmented
+    if not fragmented:
+        # One table holding everything about every prototype, which is what a
+        # tool that wants to dump the metadata would like: `for pid, row in
+        # pairs(T)` yields code, constants and edges together, no assembly step.
+        # `plan.table` still has to exist because the interpreter's row reads are
+        # written against it, so the single-table build points it at the joined
+        # table and skips the split ones.
+        joined = []
+        for pid in sorted(encoded):
+            enc = encoded[pid]
+            consts = ", ".join(const_expr(v) for v in enc.consts)
+            edges = (" edges = " + edges_expr(_pack_edges(enc.edges)) + ",") if (
+                enc.edges and edges_expr is not None) else ""
+            joined.append("  [%d] = { code = %s, consts = { %s },%s },"
+                          % (pid, code_expr(enc.code), consts, edges))
+        parts.append("local %s = {\n%s\n}"
+                     % (plan.rows_table, "\n".join(joined)))
+        return "\n".join(parts) + "\n"
     parts.append("local %s = {\n%s\n}" % (plan.table, "\n".join(payload_rows)))
     parts.append("local %s = {\n%s\n}"
                  % (plan.consts_table, "\n".join(const_rows)))

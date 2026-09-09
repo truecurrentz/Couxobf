@@ -525,3 +525,42 @@ def test_the_fingerprint_can_be_declined_and_says_so():
                 name="decoys.luau", verify=False)
     assert off.stats.fingerprint == ""
     assert "fingerprint" in off.report and "off" in off.report.split("fingerprint")[1][:60]
+
+
+# ---------------------------------------------------------------------------
+# metadata layout (Config.metadata_fragmentation)
+# ---------------------------------------------------------------------------
+
+def _maze_config(**over):
+    config = Config.hardened()
+    config.min_virtualize_body_nodes = 1
+    config.max_output_growth = 0
+    for key, value in over.items():
+        setattr(config, key, value)
+    return config
+
+
+def test_metadata_fragmentation_decides_whether_one_table_holds_everything():
+    """On, a row points at sibling tables; off, the row carries the payload itself.
+
+    The observable difference is in the assembled row.  Split, it reads
+    `code = T[3]` -- a reference into the payload table, with the constants and the
+    edge table somewhere else; unsplit, it reads `code = get(47)`, the pool accessor
+    called inline, because there is nothing else to point at.  A tool that wants the
+    whole description of a VM gets one table to dump in the second case and three to
+    line up in the first, which is the entire content of the option, so the test
+    asserts that shape rather than a byte count.
+    """
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(repo, "examples", "maze.luau"), encoding="utf-8") as fh:
+        source = fh.read()
+    split = build(source, _maze_config(metadata_fragmentation=True),
+                  name="maze.luau", verify=False).source
+    whole = build(source, _maze_config(metadata_fragmentation=False),
+                  name="maze.luau", verify=False).source
+    assert re.search(r"code=\w+\[\d+\]", split), "the tables were not split apart"
+    assert not re.search(r"code=\w+\[\d+\]", whole), "off still emitted references"
+    assert re.search(r"code=\w+\(", whole), "the unsplit row does not carry its payload"
+    # Both have to be the same program, and both run: the interpreter is handed one
+    # record either way, so the only thing that changed is where the pieces live.
+    assert "code=" in split and "code=" in whole

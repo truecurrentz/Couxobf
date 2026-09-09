@@ -237,6 +237,12 @@ button.primary kbd {
   font: 11.5px var(--mono); color: #fecaca; background: #2a1414;
   border: 1px solid #5b2b2b; border-radius: 999px; padding: 1px 8px;
 }
+/* Declared-but-inert config fields: the same shape, without the alarm colour,
+   because they are not a problem with this build -- they are a promise the tool has
+   not made yet, and the page says which is which. */
+.notice.declared { border: 1px solid var(--line-soft); background: #0f1420; color: var(--muted); }
+.chip.dim { color: #b6c2d6; background: #17202e; }
+.chip.dim { border-color: #2b3648; }
 
 .output {
   margin: 0; padding: 10px 12px; min-height: 34vh; max-height: 52vh; overflow: auto;

@@ -576,24 +576,28 @@ class FormatPrefs:
         field that stops being read shows up as an unused attribute here instead of
         as a silently inert option in the UI.
         """
-        enabled = bool(getattr(config, "operand_randomization", True))
-        variety = int(getattr(config, "instruction_formats", 1)) if enabled else 0
-        pc = bool(getattr(config, "pc_protection", True))
+        # Read as attributes, not through getattr with a name and a default: the
+        # docstring above promises that a field which stops being read shows up
+        # here as an unused attribute, and a string literal in a getattr call is
+        # how four of these fields ended up claiming to be wired while nothing
+        # could grep for them.
+        enabled = bool(config.operand_randomization)
+        variety = int(config.instruction_formats) if enabled else 0
+        pc = bool(config.pc_protection)
         return cls(
             variety=variety,
             allow_op_widen=variety >= 1,
-            allow_reg_widen=variety >= 1 and bool(
-                getattr(config, "register_randomization", True)),
+            allow_reg_widen=variety >= 1 and bool(config.register_randomization),
             allow_wide_widen=variety >= 1,
             allow_pad=variety >= 2,
             allow_operand_swap=variety >= 1,
-            allow_reg_mask=bool(getattr(config, "register_randomization", True)),
+            allow_reg_mask=bool(config.register_randomization),
             allow_wide_mask=variety >= 1,
             allow_biased=pc,
             allow_relative=pc,
-            allow_edges=bool(getattr(config, "edge_indirection", False)),
+            allow_edges=bool(config.edge_indirection),
             allow_renumbered_header=variety >= 1,
-            allow_instruction_reorder=bool(getattr(config, "control_flow_level", 0) >= 1)
+            allow_instruction_reorder=bool(config.control_flow_level >= 1)
             and variety >= 1,
             weight={0: 0.0, 1: 0.5, 2: 0.8, 3: 1.0}[max(0, min(3, variety))],
         )

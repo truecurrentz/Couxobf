@@ -6,6 +6,7 @@ refuses and about whether what it returns actually executes.  A handler that
 returns 200 with broken Luau is worse than one that returns 500.
 """
 
+import dataclasses
 import json
 import os
 import re
@@ -609,6 +610,28 @@ def test_the_page_still_builds_a_form_without_the_endpoint(tmp_path):
     assert not uncontrolled, uncontrolled
     assert all(v != "none" for v in report["controls"].values()), (
         {k: v for k, v in report["controls"].items() if v == "none"})
+
+
+def test_the_endpoint_names_the_fields_nothing_reads():
+    """So the page can list them without keeping its own copy of the list.
+
+    `Config.pending_fields()` is the honest answer to "did my option do anything",
+    and it is derived from the same IMPLEMENTED set the accepted options come from --
+    which is why both halves can be checked against one source of truth.
+    """
+    from couxobf.config import Config
+
+    status, body = handle({"mode": "options"})
+    assert status == 200
+    declared = {f.name for f in dataclasses.fields(Config)} - {"reproducible_seed"}
+    assert set(body["pending"]) == declared - set(Config.IMPLEMENTED)
+    # Refused on the way in, listed on the way out: a field the pipeline does not
+    # read cannot be asked for, and cannot be quietly forgotten either.
+    for name in ("junk_level", "chunking_level", "roblox_mode"):
+        code, refused = handle({"source": "print(1)", "options": {name: 2}})
+        assert code == 400, name
+        assert "does not read it yet" in refused["error"], name
+        assert name in body["pending"], name
 
 
 def describe():

@@ -789,6 +789,7 @@ def reconstruct_protected(module: IRModule,
                           cache_bound: int = 64,
                           pool_decoys: int = 0,
                           fingerprint: bool = True,
+                          metadata_fragmentation: bool = True,
                           names: Optional[Dict[str, str]] = None,
                           minify: bool = False,
                           optimize_first: bool = True,
@@ -887,6 +888,11 @@ def reconstruct_protected(module: IRModule,
                                  fmt_prefs=fmt_prefs,
                                  families=families,
                                  dispatchers=dispatchers,
+                                 # One metadata object or three: see
+                                 # prelude_source.  Off is the easier read, and
+                                 # the config's name for choosing that is
+                                 # `metadata_fragmentation`.
+                                 fragmented=bool(metadata_fragmentation),
                                  # wiring indexes this positionally as
                                  # (append, iter, iterpack, itercheck); passing
                                  # the dict would hand it the role *keys*.

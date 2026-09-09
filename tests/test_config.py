@@ -67,16 +67,24 @@ def test_pending_fields_are_actually_unread(name):
         f"unimplemented; add it to Config.IMPLEMENTED")
 
 
-def test_defaults_request_thirty_five_unimplemented_features():
-    """Pinned so the number can only go down.
+def test_the_defaults_request_features_that_are_not_built():
+    """The default config asks for things the compiler does not do, and says so.
 
-    The defaults are left as they are -- they encode intent for work that is
-    not done -- which means a default build asks for all of them.  Asserting
-    the count makes the remaining surface visible and makes implementing one a
-    measurable event rather than a quiet edit.
+    A count is asserted as a ceiling rather than an equality: the number is allowed
+    to fall as features land (that is the point of the ratchet) but not to rise, and
+    the names are checked one by one because a pending list that quietly dropped a
+    field would read as a list of fields that got built.
     """
-    pending = Config().pending_fields()
-    assert len(pending) == 32, [n for n, _ in pending]
+    pending = dict(Config().pending_fields())
+    for name in ("max_vm_depth", "mixed_execution", "handler_splitting",
+                 "call_frame_obfuscation", "encoded_pc", "epoch_masks",
+                 "constant_protection_level", "table_key_protection",
+                 "integrity_level", "self_test", "identifier_polymorphism",
+                 "fingerprint_reduction", "opaque_predicates", "branch_inversion",
+                 "chunking_level", "lazy_decode", "numeric_protection_level",
+                 "junk_level", "roblox_mode"):
+        assert name in pending, name
+    assert len(pending) <= 20, sorted(pending)
 
 
 def test_turning_a_feature_off_removes_it_from_the_pending_list():
@@ -85,9 +93,10 @@ def test_turning_a_feature_off_removes_it_from_the_pending_list():
     turned_off = {n for n, _ in Config(
         opaque_predicates=False, decoys=False, numeric_protection_level=0,
         integrity_level=IntegrityLevel.NONE).pending_fields()}
+    # `decoys` is deliberately not in here any more: it became a real option, so
+    # turning it off changes the build rather than changing the pending list.
     assert baseline - turned_off == {
-        "opaque_predicates", "decoys", "numeric_protection_level",
-        "integrity_level"}
+        "opaque_predicates", "numeric_protection_level", "integrity_level"}
 
 
 def test_debug_build_is_not_reported_when_off():
@@ -107,7 +116,8 @@ def test_report_lists_the_unapplied_capabilities():
                    verify=False)
     report = result.report
     assert "requested but not applied" in report
-    assert "32 declared capabilities are not implemented" in report
+    expected = len(Config(reproducible_seed=1).pending_fields())
+    assert f"{expected} declared capabilities are not implemented" in report
     for probe in ("opaque_predicates", "branch_inversion",
                   "fingerprint_reduction"):
         assert probe in report, f"{probe} missing from the report"
@@ -146,7 +156,8 @@ def test_cli_warns_about_unapplied_capabilities():
                               "-o", "/dev/null", "--no-verify"])
     assert args.func(args, out=io.StringIO(), err=err) == cli.EXIT_OK
     text = err.getvalue()
-    assert "32 requested capabilities are not implemented" in text
+    expected = len(Config().pending_fields())
+    assert f"{expected} requested capabilities are not implemented" in text
 
 
 def test_cli_warning_is_suppressed_by_quiet():

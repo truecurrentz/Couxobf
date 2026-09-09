@@ -424,22 +424,14 @@ class Config:
         "dispatcher_splitting",
         "metadata_fragmentation",
         "string_protection_level",
-        "numeric_protection_level",
         "cache_policy",
         "bounded_cache_size",
-        "chunking_level",
-        "lazy_decode",
-        "chunk_size",
         "decoys",
         "decoy_constants",
-        "junk_level",
         "control_flow_level",
-        "opaque_predicates",
-        "branch_inversion",
         "env_guard",
         "dump_guard",
         "guard_policy",
-        "roblox_mode",
         "hash_comments",
         "fingerprint",
         "minify",
@@ -472,6 +464,12 @@ class Config:
         out: List[Tuple[str, Any]] = []
         for f in dataclasses.fields(self):
             if f.name in self.IMPLEMENTED:
+                continue
+            # A field that only the pass it belongs to would read is not a request
+            # for that pass: `chunk_size = 4096` next to `chunking_level = 0` names
+            # no unmet capability, and because the size has a legal minimum equal to
+            # its default there is no value of it that could ever mean "off".
+            if f.name == "chunk_size" and self.chunking_level <= 0:
                 continue
             value = getattr(self, f.name)
             off = self._off_value(f)

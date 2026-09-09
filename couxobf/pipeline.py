@@ -215,28 +215,35 @@ def build(source: str, config: Optional[Config] = None,
 #: buy the same kind of noise and a build that lost three single knobs one at a
 #: time would report three things nobody could act on.
 _BUDGET_TRIMS = (
-    (("junk_level", 0), ("decoys", False), ("decoy_constants", 0)),
-    (("opaque_predicates", False),),
+    # Cheapest to give up first, in the sense of "what does the user lose per byte
+    # saved": decoy pool entries buy obscurity for a few hundred bytes and cost
+    # nothing to remove, while a second VM group costs kilobytes and removes a real
+    # obstacle.  A group whose fields the pipeline does not read would be a trim
+    # that changes nothing, so the list is exactly the optional passes that are
+    # wired -- nothing that guards against dumping or logging is here, because a
+    # size ceiling is not a licence to make the artifact observable.
+    (("decoys", False), ("decoy_constants", 0)),
     (("instruction_fusion", False), ("super_instructions", False)),
     (("opcode_aliases", 0),),
-    (("chunking_level", 0), ("lazy_decode", False)),
+    (("metadata_fragmentation", False),),
     (("vm_variety", 1), ("state_distribution", False)),
     (("control_flow_level", 0), ("block_permutation", False)),
     (("edge_indirection", False), ("instruction_formats", 0)),
-    (("string_protection_level", 1), ("numeric_protection_level", 0)),
+    (("pc_protection", False), ("opcode_randomization", False)),
+    (("string_protection_level", 1),),
 )
 
 #: Human-readable names for the same groups, in the same order, for the report.
 _BUDGET_LABELS = (
-    "junk states and decoy entries",
-    "opaque predicates",
-    "instruction fusion",
+    "decoy entries in the constant pool",
+    "instruction fusion and super-instructions",
     "opcode aliases",
-    "constant-pool chunking and lazy decode",
+    "split descriptor tables",
     "second VM group",
     "control-flow flattening and block permutation",
     "edge indirection and per-group formats",
-    "string and numeric protection",
+    "encoded jump targets and opcode randomization",
+    "string protection down to encoded literals",
 )
 
 
@@ -359,6 +366,7 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         # `decoy_constants` the budget, and both are read nowhere else.
         pool_decoys=(int(config.decoy_constants) if config.decoys else 0),
         fingerprint=bool(config.fingerprint),
+        metadata_fragmentation=bool(config.metadata_fragmentation),
         minify=config.minify,
         vm_level=config.virtualization_level,
         vm_rng=domains.get("vm"),
