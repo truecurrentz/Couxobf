@@ -261,8 +261,105 @@ def _handler(op: str, n: Dict[str, str],
     raise ValueError(f"{op} has no handler")
 
 
+def _emit_chain(lines: List[str], indent: str, ops: List[str],
+                opmap: "OpcodeMap", n: Dict[str, str], fam: "Family") -> None:
+    """A linear ``if/elseif`` chain over ``ops``, with a rejecting tail."""
+    first = True
+    for op in ops:
+        number = opmap.to_byte[op]
+        lines.append(f"{indent}{'if' if first else 'elseif'} op == {number} then")
+        first = False
+        for body_line in _handler(op, n, fam):
+            lines.append(f"{indent}  {body_line}")
+    lines.append(f"{indent}else")
+    lines.append(f'{indent}  error("unknown opcode " .. tostring(op))')
+    lines.append(f"{indent}end")
+
+
+def _emit_tree(lines: List[str], indent: str, ops: List[str],
+               opmap: "OpcodeMap", n: Dict[str, str], fam: "Family") -> None:
+    """A binary search over the opcode numbers, leaves guarded.
+
+    The leaves still test for equality.  Partitioning only the opcodes this
+    build assigns does not make an unassigned one impossible, and a leaf that
+    assumed otherwise would run the wrong handler for it.
+    """
+    if len(ops) == 1:
+        op = ops[0]
+        lines.append(f"{indent}if op == {opmap.to_byte[op]} then")
+        for body_line in _handler(op, n, fam):
+            lines.append(f"{indent}  {body_line}")
+        lines.append(f"{indent}else")
+        lines.append(f'{indent}  error("unknown opcode " .. tostring(op))')
+        lines.append(f"{indent}end")
+        return
+    ordered = sorted(ops, key=lambda o: opmap.to_byte[o])
+    # Split by index, not by a pivot value.  Choosing the middle opcode's
+    # number as the pivot and taking everything <= it leaves the pivot itself
+    # in the low half, so at two elements the low half is the whole list and
+    # the recursion never shrinks -- a RecursionError 995 frames deep.
+    cut = len(ordered) // 2
+    low, high = ordered[:cut], ordered[cut:]
+    mid = opmap.to_byte[low[-1]]
+    lines.append(f"{indent}if op <= {mid} then")
+    _emit_tree(lines, indent + "  ", low, opmap, n, fam)
+    lines.append(f"{indent}else")
+    _emit_tree(lines, indent + "  ", high, opmap, n, fam)
+    lines.append(f"{indent}end")
+
+
+def _emit_bucket(lines: List[str], ops: List[str], opmap: "OpcodeMap",
+                 n: Dict[str, str], fam: "Family", buckets: int,
+                 multiplier: int) -> None:
+    """Two levels: a computed bucket, then a short chain inside it.
+
+    ``(op * multiplier) % buckets`` rather than a plain ``op % buckets`` so the
+    grouping is not the obvious one and differs per build.  Multiplication by
+    an odd number is a bijection on the residues that matter here, so the
+    buckets stay a partition either way -- which is the property that makes
+    this correct rather than merely different.
+    """
+    groups: Dict[int, List[str]] = {}
+    for op in ops:
+        groups.setdefault((opmap.to_byte[op] * multiplier) % buckets, []).append(op)
+    lines.append(f"    local _bk = (op * {multiplier}) % {buckets}")
+    first = True
+    for key in sorted(groups):
+        lines.append(f"    {'if' if first else 'elseif'} _bk == {key} then")
+        first = False
+        _emit_chain(lines, "      ", groups[key], opmap, n, fam)
+    lines.append("    else")
+    lines.append('      error("unknown opcode " .. tostring(op))')
+    lines.append("    end")
+
+
+#: Dispatch shapes this can emit.  NESTED_IF is the flat chain every build used
+#: to have; the other two are genuinely different control structures, not the
+#: same chain with different spacing.
+DISPATCHERS = ("nested_if", "decision_tree", "bucket")
+
+
+def _emit_dispatch(lines: List[str], ops: List[str], opmap: "OpcodeMap",
+                   n: Dict[str, str], fam: "Family", dispatcher: str) -> None:
+    if dispatcher == "decision_tree":
+        _emit_tree(lines, "    ", ops, opmap, n, fam)
+    elif dispatcher == "bucket":
+        # derived from the opcode map, so it varies per build without needing
+        # another randomness stream threaded down here
+        seed = sum(opmap.to_byte.values())
+        buckets = 4 + seed % 5                       # 4..8 buckets
+        multiplier = 1 + 2 * ((seed // 5) % 17)      # odd, 1..33
+        _emit_bucket(lines, ops, opmap, n, fam, buckets, multiplier)
+    elif dispatcher == "nested_if":
+        _emit_chain(lines, "    ", ops, opmap, n, fam)
+    else:
+        raise ValueError(f"unknown dispatcher {dispatcher!r}; "
+                         f"expected one of {DISPATCHERS}")
+
+
 def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
-                       vm_family: str = "register") -> str:
+                       vm_family: str = "register",
+                       dispatcher: str = "nested_if") -> str:
     """The interpreter, with this build's opcode numbers inlined.
 
     ``names`` supplies the local names so the interpreter is not recognisable
@@ -326,17 +423,9 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         "    pc = pc + 1",
     ]
 
-    first = True
-    for op in sorted(opmap.to_byte, key=lambda o: opmap.to_byte[o]):
-        number = opmap.to_byte[op]
-        lines.append(f"    {'if' if first else 'elseif'} op == {number} then")
-        first = False
-        for body_line in _handler(op, n, fam):
-            lines.append(f"      {body_line}")
+    _emit_dispatch(lines, sorted(opmap.to_byte, key=lambda o: opmap.to_byte[o]),
+                   opmap, n, fam, dispatcher)
     lines += [
-        "    else",
-        '      error("unknown opcode " .. tostring(op))',
-        "    end",
         "  end",
         "end",
         f"local function {n['enter']}(p, E, ...)",

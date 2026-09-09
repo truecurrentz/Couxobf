@@ -59,6 +59,8 @@ class VMPlan:
     #: Randomness for that shuffle.  Its own domain, so changing the opcode map
     #: does not also re-layout every function.
     layout_rng: Any = None
+    #: Shape of the opcode dispatch.  One of runtime.DISPATCHERS.
+    dispatcher: str = "nested_if"
 
     def selects(self, proto: FuncIR) -> bool:
         return proto.proto_id in self.protos
@@ -80,7 +82,9 @@ def make_plan(rng: Rng, protos: Iterable[int],
               opmap: Optional[OpcodeMap] = None,
               family: str = "register",
               permute_blocks: bool = False,
-              layout_rng: Any = None) -> VMPlan:
+              layout_rng: Any = None,
+              dispatcher: str = "nested_if",
+              randomize_opcodes: bool = True) -> VMPlan:
     """Build a :class:`VMPlan` from the build's ``vm`` randomness stream.
 
     ``rng`` should be the domain-separated stream for VM generation, not the
@@ -106,13 +110,19 @@ def make_plan(rng: Rng, protos: Iterable[int],
         "iterpack": _SHARED[2],
         "itercheck": _SHARED[3],
     }
-    return VMPlan(opmap=opmap or OpcodeMap.shuffled(rng),
+    # A stable opcode numbering is a real option, not a placeholder: it makes
+    # two builds of the same source comparable byte for byte apart from the
+    # names, which is what you want when you are checking that a change did
+    # what you intended.  It is weaker, and the config says so.
+    return VMPlan(opmap=opmap or (OpcodeMap.shuffled(rng) if randomize_opcodes
+                                  else OpcodeMap.identity()),
                   names=names,
                   protos=set(protos),
                   table=table_name,
                   family=_family_name(family),
                   permute_blocks=bool(permute_blocks),
-                  layout_rng=layout_rng)
+                  layout_rng=layout_rng,
+                  dispatcher=_dispatcher_name(dispatcher, rng))
 
 
 #: Node-count floor per level, keyed on :class:`VirtualizationLevel` so the
@@ -154,6 +164,24 @@ def select_protos(module, level: Any = VirtualizationLevel.HEAVY) -> Set[int]:
     return chosen
 
 
+def _dispatcher_name(value: Any, rng: Rng) -> str:
+    """Resolve a dispatcher choice, picking one at random for ``mixed``.
+
+    ``mixed`` is the default, and it is what makes the dispatcher part of the
+    per-build fingerprint rather than a fixed shape.  Choosing here rather than
+    in the pipeline keeps the choice tied to the same rng stream that names the
+    interpreter's locals, so a build's shape and its names move together.
+    """
+    name = str(getattr(value, "value", value)).strip().lower()
+    if name in ("", "mixed", "none"):
+        return rng.choice(list(runtime.DISPATCHERS))
+    if name not in runtime.DISPATCHERS:
+        raise ValueError(
+            f"dispatcher family {value!r} is not implemented; this build can "
+            f"emit {', '.join(runtime.DISPATCHERS)} (or mixed)")
+    return name
+
+
 def _family_name(value: Any) -> str:
     """Normalise a family, which may arrive as a ``VMFamily`` enum."""
     name = getattr(value, "value", value)
@@ -174,7 +202,8 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
     path can pass literal emitters and the protected one can pass pool reads --
     the same bytecode, protected or not.
     """
-    parts = [runtime.interpreter_source(plan.opmap, plan.names, plan.family)]
+    parts = [runtime.interpreter_source(plan.opmap, plan.names, plan.family,
+                                        plan.dispatcher)]
     rows = []
     for pid in sorted(encoded):
         enc = encoded[pid]

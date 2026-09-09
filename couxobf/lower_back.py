@@ -660,6 +660,8 @@ def reconstruct_protected(module: IRModule,
                           vm_family: Any = "register",
                           block_permutation: bool = False,
                           layout_rng: Any = None,
+                          dispatcher_family: Any = "mixed",
+                          opcode_randomization: bool = True,
                           string_level: int = 0,
                           string_rng: Any = None,
                           string_cache_policy: str = "none",
@@ -709,7 +711,9 @@ def reconstruct_protected(module: IRModule,
         plan = _wiring.make_plan(vm_rng if vm_rng is not None else rng,
                                  selected, family=vm_family,
                                  permute_blocks=block_permutation,
-                                 layout_rng=layout_rng)
+                                 layout_rng=layout_rng,
+                                 dispatcher=dispatcher_family,
+                                 randomize_opcodes=opcode_randomization)
 
     # Strings get their own bank at level 2 and above: fragmented, scattered
     # across shuffled pages, and addressed by a per-occurrence ticket rather

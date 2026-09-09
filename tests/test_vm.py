@@ -29,6 +29,7 @@ Three of these tests exist because a bug taught me to write them:
     wrong.
 """
 
+import dataclasses
 import glob
 import os
 import re
@@ -694,3 +695,126 @@ def test_family_config_reaches_the_output():
         outs[fam] = build(src, config, verify=False).source
     assert len(set(outs.values())) == len(FAMILIES), (
         "some families produced identical output")
+
+
+# ---------------------------------------------------------------------------
+# dispatcher shapes
+# ---------------------------------------------------------------------------
+#
+# Every build used to emit the same flat if/elseif chain over 43 opcodes, which
+# is as good as a signature: find the chain once and the interpreter is known
+# for every build the tool will ever produce. There are now three genuinely
+# different control structures, and `mixed` -- the default -- picks one per
+# build, so the shape is part of the fingerprint rather than a constant.
+
+from couxobf.vm.runtime import DISPATCHERS  # noqa: E402
+
+DISPATCH_SOURCE = """local function accumulate(values, factor)
+  local total = 0
+  for i = 1, #values do
+    if values[i] % 2 == 0 then
+      total = total + values[i] * factor
+    else
+      total = total - 1
+    end
+  end
+  return total
+end
+local t = {}
+for i = 1, 12 do t[i] = i end
+print(accumulate(t, 3), accumulate({1, 2, 3}, 10))
+"""
+
+
+@pytest.mark.parametrize("dispatcher", list(DISPATCHERS))
+@pytest.mark.parametrize("vm_family", ("register", "stack"))
+def test_every_dispatcher_shape_computes_the_same_thing(dispatcher, vm_family):
+    """All three shapes, two operand disciplines, same answer as Luau.
+
+    The corpus differential cannot substitute for this: `mixed` picks a shape
+    per seed, so a given run only ever exercises whichever came up.
+    """
+    if not TOOLCHAIN.can_execute:
+        pytest.skip("luau runtime not available")
+    domains = rngmod.make_domains(b"\xd1" * 16)
+    # The plan's own fresh names and table name are replaced with the test's
+    # fixed ones: the reconstructor hardcodes _DESCRIPTOR_TABLE when it emits
+    # the call sites, so a plan that invented a different name would produce a
+    # body indexing a table that was never declared.
+    plan = dataclasses.replace(
+        wiring.make_plan(domains.get("vm"), {1}, family=vm_family,
+                         dispatcher=dispatcher),
+        names=NAMES, table=_DESCRIPTOR_TABLE)
+    module = ir.Lowerer().lower(parser.parse(DISPATCH_SOURCE, "d.luau"))
+    rec = _VMReconstructor(plan.opmap)
+    body = printer.emit(rec.reconstruct(module))
+    parts = [lower_back.HELPERS_SRC,
+             wiring.prelude_source(plan, dict(rec.encoded), _lit, _lit),
+             body]
+    out = "\n".join(parts)
+    assert rec.encoded, "nothing was virtualized"
+
+    original = execute(TOOLCHAIN, DISPATCH_SOURCE, "d.luau", timeout=30)
+    protected = execute(TOOLCHAIN, out, "p.luau", timeout=30)
+    assert original.returncode == protected.returncode, protected.stderr[:400]
+    assert original.stdout == protected.stdout, (
+        f"{dispatcher}/{vm_family}: {original.stdout!r} != {protected.stdout!r}")
+
+
+def test_dispatcher_shapes_are_structurally_different():
+    """Different control structures, not the same chain re-indented."""
+    names = dict(NAMES)
+    opmap = _opmap()
+    shapes = {d: runtime.interpreter_source(opmap, names, "register", d)
+              for d in DISPATCHERS}
+    for a in DISPATCHERS:
+        for b in DISPATCHERS:
+            if a < b:
+                assert shapes[a] != shapes[b], f"{a} and {b} are identical"
+    # the tree nests; the chain does not
+    def depth(src):
+        return max(len(l) - len(l.lstrip()) for l in src.splitlines())
+    assert depth(shapes["decision_tree"]) > depth(shapes["nested_if"])
+
+
+def test_mixed_picks_different_shapes_across_seeds():
+    """The default must actually vary, or per-build randomness is a claim.
+
+    Sixty seeds, not twelve.  At twelve the shape missing entirely is a
+    one-in-a-hundred occurrence -- this test failed that way on first run, with
+    8 bucket / 4 nested_if / 0 decision_tree, which looked exactly like a
+    biased generator.  It was not: over 300 seeds the first draw of the
+    dispatch stream splits 116/94/90, and ``rng.choice`` measures uniform over
+    30000 draws.  The test was wrong, not the randomness.
+    """
+    seen = set()
+    counts = {}
+    for i in range(60):
+        rng = rngmod.make_domains(b"\xd2" * 15 + bytes([i])).get("dispatch")
+        shape = wiring._dispatcher_name("mixed", rng)
+        seen.add(shape)
+        counts[shape] = counts.get(shape, 0) + 1
+    assert seen == set(DISPATCHERS), f"60 seeds produced only {sorted(seen)}"
+    assert min(counts.values()) >= 8, (
+        f"shape distribution looks skewed: {counts}")
+
+
+def test_an_unimplemented_dispatcher_is_refused():
+    """Silently falling back would report a protection it did not apply."""
+    with pytest.raises(ValueError, match="not implemented"):
+        wiring.make_plan(rngmod.make_domains(b"\x03" * 16).get("vm"), {1},
+                         dispatcher="state_transition")
+
+
+def test_opcode_randomization_changes_the_numbering():
+    """Off means a stable, comparable numbering -- weaker, and deliberately so."""
+    rng_a = rngmod.make_domains(b"\xd3" * 16).get("vm")
+    rng_b = rngmod.make_domains(b"\xd3" * 16).get("vm")
+    on = wiring.make_plan(rng_a, {1}, randomize_opcodes=True)
+    off = wiring.make_plan(rng_b, {1}, randomize_opcodes=False)
+    assert on.opmap.to_byte != off.opmap.to_byte
+    assert off.opmap.to_byte == isa.OpcodeMap.identity().to_byte
+    # and the same seed twice is still reproducible
+    again = wiring.make_plan(rngmod.make_domains(b"\xd3" * 16).get("vm"), {1},
+                             randomize_opcodes=True)
+    assert again.opmap.to_byte == on.opmap.to_byte

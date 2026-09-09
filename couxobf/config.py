@@ -295,6 +295,8 @@ class Config:
         "virtualization_level",
         "vm_family",
         "block_permutation",
+        "dispatcher_family",
+        "opcode_randomization",
         "string_protection_level",
         "cache_policy",
         "bounded_cache_size",
