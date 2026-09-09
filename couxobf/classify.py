@@ -103,7 +103,10 @@ def classify_module(module: IRModule, config: Config, rng: Rng) -> Classificatio
     the classification, so downstream passes can read either.
     """
     result = Classification()
-    cap = int(config.virtualization_level)
+    # Accept the enum or its name: the CLI parses, but a Config built by
+    # hand or from a dict may carry either, and int('maximum') is a
+    # crash rather than a diagnosis.
+    cap = int(VirtualizationLevel.parse(config.virtualization_level))
 
     if cap == 0:
         for proto in module.walk():

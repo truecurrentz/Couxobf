@@ -25,10 +25,11 @@ import sys
 from typing import List, Optional, Sequence
 
 from . import __version__
-from .config import Config
+from .config import Config, VirtualizationLevel
 from .pipeline import BuildError, build
 from .toolchain import find_toolchain
 from .vm.families import FAMILIES
+from .vm.runtime import DISPATCHERS
 from .verify.output import OutputValidationError, validate_output
 
 EXIT_OK = 0
@@ -47,9 +48,26 @@ def _config_from_args(args) -> Config:
     if args.seed is not None:
         config.reproducible_seed = args.seed
     if args.vm_level is not None:
-        config.virtualization_level = args.vm_level
+        # Parse to the enum here.  Assigning the raw string used to reach
+        # classify.classify_module, which does int(config.virtualization_level)
+        # and died with "invalid literal for int() with base 10: 'maximum'" --
+        # so --vm-level had been broken for every named level, and only the
+        # numeric-looking default hid it.
+        config.virtualization_level = VirtualizationLevel.parse(args.vm_level)
     if getattr(args, "vm_family", None) is not None:
         config.vm_family = args.vm_family
+    if getattr(args, "dispatcher", None) is not None:
+        config.dispatcher_family = args.dispatcher
+    if getattr(args, "string_level", None) is not None:
+        config.string_protection_level = args.string_level
+    if getattr(args, "cache_policy", None) is not None:
+        config.cache_policy = args.cache_policy
+    if getattr(args, "no_opcode_randomization", False):
+        config.opcode_randomization = False
+    if getattr(args, "no_block_permutation", False):
+        config.block_permutation = False
+    if getattr(args, "max_vm_functions", None) is not None:
+        config.max_vm_functions = args.max_vm_functions
     if args.minify:
         config.minify = True
     if args.no_strip_types:
@@ -170,6 +188,32 @@ def cmd_report(args, out=sys.stdout, err=sys.stderr) -> int:
     return EXIT_OK
 
 
+def _add_protection_knobs(sp) -> None:
+    """The protection options both building subcommands accept.
+
+    Shared rather than repeated: these two lists drifted once already, when
+    --vm-family was added to protect and forgotten on report, so `report`
+    described a build the CLI could not produce.
+    """
+    sp.add_argument("--vm-family", choices=list(FAMILIES), default=None,
+                    help="operand discipline of the generated interpreter")
+    sp.add_argument("--dispatcher", choices=list(DISPATCHERS) + ["mixed"],
+                    default=None,
+                    help="shape of the opcode dispatch; mixed (the default) "
+                         "picks one at random per build")
+    sp.add_argument("--string-level", type=int, choices=(0, 1, 2), default=None,
+                    help="0 none, 1 pooled, 2 fragmented+encrypted+ticketed")
+    sp.add_argument("--cache-policy", choices=("none", "bounded", "full"),
+                    default=None, help="decoded-string retention (none is safest)")
+    sp.add_argument("--no-opcode-randomization", action="store_true",
+                    help="use a stable opcode numbering (weaker, but makes two "
+                         "builds comparable)")
+    sp.add_argument("--no-block-permutation", action="store_true",
+                    help="lay VM blocks out in IR order")
+    sp.add_argument("--max-vm-functions", type=int, default=None,
+                    help="cap on how many prototypes go into the VM")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="couxobf",
@@ -188,8 +232,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--vm-level", choices=("none", "light", "medium", "heavy",
                                           "maximum"),
                    help="how much of the program runs in the VM")
-    p.add_argument("--vm-family", choices=list(FAMILIES), default=None,
-                   help="operand discipline of the generated interpreter")
+    _add_protection_knobs(p)
     p.add_argument("--minify", action="store_true", help="minify the output")
     p.add_argument("--min-nodes", type=int, default=None,
                    help="virtualize functions with at least this many\n"                        "AST nodes (default 12; lower it to virtualize\n"                        "small functions too)")
@@ -216,7 +259,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--seed", type=_parse_seed, default=None)
     r.add_argument("--vm-level", choices=("none", "light", "medium", "heavy",
                                           "maximum"))
-    r.add_argument("--vm-family", choices=list(FAMILIES), default=None)
+    _add_protection_knobs(r)
     r.add_argument("--minify", action="store_true")
     r.add_argument("--min-nodes", type=int, default=None)
 

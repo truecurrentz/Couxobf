@@ -286,3 +286,91 @@ def test_vm_family_output_executes(family, tmp_path):
                                text=True)
     assert original.returncode == protected.returncode, protected.stderr[:400]
     assert original.stdout == protected.stdout, family
+
+
+# ---------------------------------------------------------------------------
+# protection knobs
+# ---------------------------------------------------------------------------
+#
+# Several implemented config fields had no flag, so "every option on" was not
+# reachable from the command line at all. And --vm-level was broken for every
+# named level: the CLI assigned the raw string, classify did int() on it, and
+# the build died with "invalid literal for int() with base 10: 'maximum'".
+# Nothing caught it because no test ever passed a name.
+
+@pytest.mark.parametrize("level", ("none", "light", "medium", "heavy", "maximum"))
+def test_every_named_vm_level_is_accepted(level):
+    """Regression: `--vm-level maximum` crashed the build."""
+    code, _, err = run_captured(
+        ["report", FIXTURE, "--seed", "1", "--min-nodes", "1",
+         "--vm-level", level])
+    assert code == EXIT_OK, err
+
+
+@pytest.mark.parametrize("level", ("light", "heavy", "maximum"))
+def test_named_vm_level_changes_how_much_is_virtualized(level):
+    out = run_captured(["report", FIXTURE, "--seed", "1", "--min-nodes", "1",
+                        "--vm-level", level])[1]
+    assert f"virtualization      : {level}" in out
+
+
+@pytest.mark.parametrize("flag,value", [
+    (["--dispatcher", "bucket"], "dispatcher_family"),
+    (["--string-level", "2"], "string_protection_level"),
+    (["--cache-policy", "full"], "cache_policy"),
+    (["--max-vm-functions", "3"], "max_vm_functions"),
+    (["--no-opcode-randomization"], "opcode_randomization"),
+    (["--no-block-permutation"], "block_permutation"),
+])
+def test_protection_knobs_reach_the_config(flag, value):
+    args = build_parser().parse_args(["protect", FIXTURE] + flag)
+    config = cli._config_from_args(args)
+    got = getattr(config, value)
+    got = getattr(got, "value", got)
+    expected = {"dispatcher_family": "bucket", "string_protection_level": 2,
+                "cache_policy": "full", "max_vm_functions": 3,
+                "opcode_randomization": False, "block_permutation": False}[value]
+    assert got == expected, f"{value}: {got!r} != {expected!r}"
+
+
+def test_protect_and_report_take_the_same_knobs():
+    """They drifted once already, when --vm-family was added to protect only."""
+    parser = build_parser()
+    argv = {
+        "--dispatcher": ["bucket"],
+        "--string-level": ["2"],
+        "--cache-policy": ["none"],
+        "--no-block-permutation": [],
+        "--no-opcode-randomization": [],
+        "--max-vm-functions": ["4"],
+    }
+    for knob, extra in argv.items():
+        for command in ("protect", "report"):
+            try:
+                parser.parse_args([command, FIXTURE, knob] + extra)
+            except SystemExit:
+                pytest.fail(f"{command} does not accept {knob}")
+
+
+def test_dispatcher_choice_reaches_the_output():
+    outs = {}
+    for shape in ("nested_if", "bucket", "decision_tree"):
+        outs[shape] = run_captured(
+            ["protect", FIXTURE, "--seed", "7", "--min-nodes", "1",
+             "--dispatcher", shape, "--no-verify"])[1]
+    assert len(set(outs.values())) == 3, "the dispatcher flag changed nothing"
+
+
+def test_an_unimplemented_dispatcher_is_refused(capsys):
+    """At the argument, not at the build.
+
+    The flag's choices are the shapes that actually exist, so argparse rejects
+    the rest before anything runs -- a clearer failure than a build that gets
+    as far as emitting an interpreter.  wiring.make_plan raises the same way
+    for a Config built by hand, and test_vm covers that path.
+    """
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args(
+            ["protect", FIXTURE, "--dispatcher", "state_transition"])
+    assert exc.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
