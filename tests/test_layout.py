@@ -227,12 +227,19 @@ def test_permuted_build_still_computes_the_same_thing(seed):
 
 
 def test_block_permutation_config_reaches_the_output():
-    """On and off must produce different artifacts, or the flag is decorative."""
+    """On and off must produce different artifacts, or the flag is decorative.
+
+    `max_output_growth = 0` is load-bearing: this input is small enough that the
+    size ceiling gives up control flow first, which would make the two builds
+    identical for a reason that has nothing to do with the flag -- and a test that
+    fails because a *different* feature worked is a test nobody trusts afterwards.
+    """
     outs = {}
     for flag in (True, False):
         outs[flag] = build(LOOPING,
                            Config(reproducible_seed=3,
                                   min_virtualize_body_nodes=1,
+                                  max_output_growth=0,
                                   block_permutation=flag),
                            verify=False).source
     assert outs[True] != outs[False], "the flag changed nothing"

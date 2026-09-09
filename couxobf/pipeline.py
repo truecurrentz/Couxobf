@@ -128,9 +128,19 @@ class BuildStats:
     #: The build's structural fingerprint: a digest of the per-group format
     #: decisions, which the constant pool is also authenticated against.
     fingerprint: str = ""
+    #: Whether the digest was asked for, and whether it authenticated anything.  A
+    #: build with no virtualized prototype draws no format decisions and binds no
+    #: pool, and the report says which of the three states it is in.
+    fingerprint_requested: bool = False
+    fingerprint_bound: bool = False
     #: Decoy constants planted in the pool, counted at seal time so it reflects the
     #: pool the artifact carries rather than the budget it was given.
     pool_decoys: int = 0
+    #: One entry per VM group this artifact carries: family, dispatcher, opcode
+    #: count, instruction format and how many prototypes it runs.  Read out of the
+    #: plan rather than derived from the config, because with `vm_variety` above 1
+    #: the groups are not all the same and the config names only the first.
+    vm_groups: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -415,7 +425,10 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
     stats = _collect_stats(module, classification, out, source_size)
     stats.guard = dict(runtime_names.get("guard") or {})
     stats.fingerprint = str(runtime_names.get("fingerprint") or "")
+    stats.fingerprint_requested = bool(runtime_names.get("fingerprint_requested"))
+    stats.fingerprint_bound = bool(runtime_names.get("fingerprint_bound"))
     stats.pool_decoys = int(runtime_names.get("pool_decoys") or 0)
+    stats.vm_groups = list(runtime_names.get("vm_plan") or [])
     stats.elapsed_ms = (time.perf_counter() - started) * 1000.0
 
     # The emitted helper names, so helper uniqueness is checked against what
@@ -529,18 +542,51 @@ def cost_report(result: BuildResult) -> str:
     lines.append(f"virtualized         : {s.virtualized}")
     lines.append(f"virtualization      : "
                  f"{VirtualizationLevel.parse(c.virtualization_level).name.lower()}")
-    lines.append(f"vm family           : {getattr(c.vm_family, 'value', c.vm_family)}")
+    # The config's answer, labelled as such: with more than one group the artifact
+    # carries families the request never named, and the group lines below are the
+    # ones that describe the file.
+    lines.append(f"vm family (config)  : {getattr(c.vm_family, 'value', c.vm_family)}")
+    for group in s.vm_groups:
+        fmt = group.get("format") or {}
+        lines.append(
+            "  vm %d              : %-10s %-14s %2d protos, %2d opcodes, "
+            "%dB op + %dB reg + %dB wide, targets %s%s"
+            % (group.get("group", 0),
+               group.get("family", "?"),
+               group.get("dispatcher", "?"),
+               group.get("protos", 0),
+               group.get("opcodes", 0),
+               fmt.get("op_bytes", 1), fmt.get("reg_bytes", 1),
+               fmt.get("wide_bytes", 2),
+               fmt.get("target_mode", "abs"),
+               ", %d fused" % len(fmt.get("fused") or [])
+               if fmt.get("fused") else ""))
     guard = s.guard
     if guard:
         for line in _guard_report(guard):
             lines.append(line)
     lines.append("")
     if s.fingerprint:
+        if s.fingerprint_bound:
+            lines.append(
+                "fingerprint           : %s -- the digest of this build's format\n"
+                "                        decisions.  The constant pool is authenticated\n"
+                "                        against it, so a pool lifted out of this artifact\n"
+                "                        does not open in another build." % s.fingerprint)
+        else:
+            lines.append(
+                "fingerprint           : %s -- the digest of this build's format\n"
+                "                        decisions, which bind nothing here: this build\n"
+                "                        has no virtualized prototype, so there is no\n"
+                "                        interpreter whose shape the pool could key to."
+                % s.fingerprint)
+    elif s.fingerprint_requested:
         lines.append(
-            "fingerprint           : %s -- the digest of this build's format\n"
-            "                        decisions.  The constant pool is authenticated\n"
-            "                        against it, so a pool lifted out of this artifact\n"
-            "                        does not open in another build." % s.fingerprint)
+            "fingerprint           : asked for, not produced.  Nothing was\n"
+            "                        virtualized, so no format decisions were drawn to\n"
+            "                        digest.  The pool is bound to the file name only,\n"
+            "                        so a pool from one build opens in another whose\n"
+            "                        config happens to match.")
     else:
         lines.append(
             "fingerprint           : off.  The pool is bound to the file name only,\n"

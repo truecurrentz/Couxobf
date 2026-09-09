@@ -498,6 +498,36 @@ def test_a_pool_full_of_decoys_prints_what_the_source_prints():
         assert want.stdout == got.stdout, (count, want.stdout, got.stdout)
 
 
+def test_the_report_lists_every_vm_group_the_artifact_carries():
+    """One line per interpreter, read out of the plan rather than off the config.
+
+    `--vm-family register` names one family, and a build with `vm_variety` above 1
+    ships several: different dispatchers, opcode counts, field widths and target
+    modes per group.  A report that echoed the config would describe a build that
+    did not happen, and every structural claim in the checklist would rest on the
+    request instead of the artifact.
+    """
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(repo, "examples", "maze.luau"), encoding="utf-8") as fh:
+        source = fh.read()
+    out = build(source, _maze_config(vm_variety=3, state_distribution=True,
+                                     dispatcher_family="mixed"),
+                name="maze.luau", verify=False)
+    groups = out.stats.vm_groups
+    assert len(groups) == 3, [g.get("family") for g in groups]
+    assert len({(g.get("family"), g.get("dispatcher")) for g in groups}) > 1
+    # The group lines are the indented ones; "vm family (config)" is the request,
+    # which is a different fact and is printed as such.
+    lines = [l for l in out.report.splitlines() if l.startswith("  vm ")]
+    assert len(lines) == len(groups), lines
+    for group in groups:
+        line = lines[group["group"]]
+        assert group["family"] in line and group["dispatcher"] in line
+        assert "%d opcodes" % group["opcodes"] in line
+    # the request is still printed, and labelled as the request
+    assert "vm family (config)" in out.report
+
+
 def test_the_fingerprint_is_a_digest_of_the_decisions_not_of_the_file():
     """Same config and seed, same fingerprint; a different format, a different one.
 
@@ -518,6 +548,38 @@ def test_the_fingerprint_is_a_digest_of_the_decisions_not_of_the_file():
     assert fingerprint(reproducible_seed=7, vm_family="stack") != base
     assert fingerprint(reproducible_seed=7, opcode_randomization=False) != base
     assert fingerprint(reproducible_seed=8) != base
+
+
+def test_the_fingerprint_reports_three_states_not_two():
+    """Declined, drawn-but-unbound, and drawn-and-bound are different facts.
+
+    A digest of the format decisions exists as soon as a VM plan is drawn, which
+    happens even when every candidate prototype was rejected and the interpreter
+    never runs.  Binding that digest into the pool's AAD is a separate claim -- the
+    pool of *this* artifact cannot open under another artifact's running format --
+    and it is false for a build with nothing virtualized.  Reporting the one as the
+    other would let `--vm-family` look like it changed a program that has no VM, and
+    would tell a reader their pool is keyed when nothing is keying it.
+    """
+    tiny = "local function f(x) return x * 2 end\nprint(f(4))\n"
+
+    bound = build(tiny, Config(reproducible_seed=3, min_virtualize_body_nodes=1,
+                               fingerprint=True), verify=False)
+    assert bound.stats.virtualized == 1
+    assert bound.stats.fingerprint and bound.stats.fingerprint_bound
+    assert "The constant pool is authenticated" in bound.report
+
+    drawn = build(CONSTANTS_PROGRAM, _decoy_config(reproducible_seed=7), verify=False)
+    assert drawn.stats.virtualized == 0, "this fixture must be the no-VM case"
+    assert re.fullmatch(r"[0-9a-f]{16}", drawn.stats.fingerprint)
+    assert not drawn.stats.fingerprint_bound
+    assert "bind nothing here" in drawn.report
+
+    keyless = build(tiny, Config(reproducible_seed=3, virtualization_level="none",
+                                 fingerprint=True), verify=False)
+    assert not keyless.stats.fingerprint
+    assert keyless.stats.fingerprint_requested
+    assert "asked for, not produced" in keyless.report
 
 
 def test_the_fingerprint_can_be_declined_and_says_so():

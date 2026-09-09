@@ -901,16 +901,38 @@ def reconstruct_protected(module: IRModule,
                                          helper_map["iterpack"],
                                          helper_map["itercheck"]))
 
+    if names_out is not None:
+        # Asked for, as distinct from produced: with nothing virtualized there is no
+        # plan, so nothing gets digested, and the report must not read that as "the
+        # user declined".
+        names_out["fingerprint_requested"] = 1 if fingerprint else 0
     if plan is not None and fingerprint:
         from .vm.wiring import structural_fingerprint
         digest = structural_fingerprint(plan)
-        # The pool is not sealed yet -- interning happens during lowering and
-        # sealing at emit -- so the digest can still bind to it.  Tagged so a
-        # context that happens to end in eight bytes of its own cannot read as one
-        # that was extended here.
-        pool.context = context + _FINGERPRINT_AAD_TAG + digest
+        # Two facts, reported separately.  The digest describes the format
+        # decisions this build drew, which exist whether or not a prototype ended
+        # up on the interpreter.  Folding them into the pool's AAD is the claim
+        # that the pool cannot open under another *running* format -- and a build
+        # that virtualized nothing has no running format, so binding there let
+        # `--vm-family` change a program with no VM in it.  The digest is still
+        # reported, because it is true; it just authenticates nothing.
+        bound = bool(plan.protos)
+        if bound:
+            # The pool is not sealed yet -- interning happens during lowering and
+            # sealing at emit -- so the digest can still bind to it.  Tagged so a
+            # context that happens to end in eight bytes of its own cannot read as
+            # one that was extended here.
+            pool.context = context + _FINGERPRINT_AAD_TAG + digest
         if names_out is not None:
             names_out["fingerprint"] = digest.hex()
+            names_out["fingerprint_bound"] = 1 if bound else 0
+    if plan is not None and names_out is not None:
+        # What each VM group in this artifact actually is.  Reported rather than
+        # inferred: `--vm-family register` is what the user asked for, and with two
+        # groups the second one is a different family, dispatcher and format -- a
+        # report that echoed only the config would describe a build that did not
+        # happen.
+        names_out["vm_plan"] = plan.summary()
     # Strings get their own bank at level 2 and above: fragmented, scattered
     # across shuffled pages, and addressed by a per-occurrence ticket rather
     # than interned by value.  The pool interns, so one recovered accessor

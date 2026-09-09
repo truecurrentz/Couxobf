@@ -180,6 +180,44 @@ def test_the_response_lists_what_was_not_applied():
         assert probe in names, probe
 
 
+def test_the_response_shows_every_interpreter_the_build_actually_made():
+    """Several VMs in one file, and the panel has to say so rather than recite the request.
+
+    `vm_variety` asks for more than one interpreter and `state_distribution` gives
+    them different families; the options still name a single `vm_family`.  A row per
+    *request* would describe a build that did not happen, which is the same class of
+    dishonesty as an inert checkbox, so these rows come off the plan the pipeline
+    built and are asserted against it here.
+    """
+    status, body = handle({"source": INVENTORY, "options": {
+        "profile": "maximum", "virtualization_level": "maximum",
+        "min_virtualize_body_nodes": 1, "max_output_growth": 0,
+        "vm_variety": 3, "state_distribution": True,
+        "dispatcher_family": "mixed", "reproducible_seed": 7}})
+    assert status == 200, body
+    groups = body["vm_groups"]
+    assert len(groups) >= 2, groups
+    assert len({g["family"] for g in groups}) > 1, groups
+    assert len({g["dispatcher"] for g in groups}) > 1, groups
+    for group in groups:
+        assert group["opcodes"] > 0 and group["prototypes"] >= 1
+        assert group["op_bytes"] in (1, 2), group
+        assert group["reg_bytes"] in (1, 2), group
+        assert group["wide_bytes"] in (2, 3), group
+        assert group["target_mode"] in ("abs", "biased", "rel", "edges"), group
+    # The report is the same facts in prose, so the two cannot drift apart.
+    for group in groups:
+        assert "%d opcodes" % group["opcodes"] in body["report"], group
+
+
+def test_a_build_with_no_interpreter_says_it_has_none():
+    status, body = handle({"source": "print(1)\n", "options": {"profile": "compact"}})
+    assert status == 200, body
+    assert body["vm_groups"] == []
+    assert body["virtualized"] == 0
+    assert "vm 0" not in body["report"]
+
+
 def test_applied_reflects_the_request_not_the_defaults():
     status, body = handle({"source": SOURCE, "options": {
         "virtualization_level": "light", "vm_family": "register",

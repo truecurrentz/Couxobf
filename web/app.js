@@ -623,11 +623,28 @@ function renderMetrics(data) {
     ["growth", `${growth}×`],
     ["prototypes", String(data.prototypes)],
     ["virtualized", String(data.virtualized)],
+    ["vm groups", String((data.vm_groups || []).length)],
   ];
   $("metrics").innerHTML = cards
     .map(([label, value]) => `<div class="metric"><b>${value}</b><span>${label}</span></div>`)
     .join("");
   $("metrics").hidden = false;
+}
+
+/* The interpreters, as the build made them.  The preset says "vm_family: stack"
+   and the artifact can hold a stack machine, a register machine and an accumulator
+   in the same file; a panel that repeated the request would be decoration. */
+function renderVms(groups) {
+  const box = $("vmBox");
+  if (!groups || !groups.length) { box.hidden = true; return; }
+  const head = "<tr><td>vm</td><td>family / dispatch</td></tr>";
+  const rows = groups.map((g) => `<tr><td><code>vm ${g.group}</code></td>` +
+    `<td>${g.family} · ${g.dispatcher} · ${g.prototypes} ` +
+    `${g.prototypes === 1 ? "prototype" : "prototypes"} · ${g.opcodes} opcodes · ` +
+    `${g.op_bytes}B op + ${g.reg_bytes}B reg + ${g.wide_bytes}B wide · ` +
+    `targets ${g.target_mode}${g.fused ? ` · ${g.fused} fused` : ""}</td></tr>`).join("");
+  $("vmBody").innerHTML = head + rows;
+  box.hidden = false;
 }
 
 function renderApplied(applied) {
@@ -700,6 +717,7 @@ async function run() {
     renderMetrics(data);
     renderApplied(data.applied);
     renderNotes(data.notes);
+    renderVms(data.vm_groups);
     renderPending(data.pending);
     markPending(data.pending);
     $("report").textContent = data.report || "";

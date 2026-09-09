@@ -62,21 +62,34 @@ Qualitative, and deliberately so. A "security percentage" would be a number
 with no referent: cost depends on the analyst's skill, tooling, and patience,
 none of which the build controls.
 
-### Control-flow flattening (implemented)
+### Virtualization and dispatch (implemented)
 
-Every prototype is lowered to a table-backed register file driven by a
-`while true do if pc == K then ... end` dispatcher. There are no lexical
-blocks, no visible loop structure, and no `if`/`else` nesting to read.
+A selected prototype is lowered to a register file driven by a generated
+interpreter, with no lexical blocks and no visible loop structure. Four state
+models (`register`, `accumulator`, `stack`, `hybrid`) and three dispatch shapes
+(`nested_if`, `decision_tree`, `bucket`) are drawn per VM group, and `vm_variety`
+means one artifact can hold two or three of them at once, each with its own opcode
+map, field widths, jump-target mode and handler fusion. The report prints one line
+per group so the claim is checkable rather than asserted.
 
-**Cost added:** an analyst must reconstruct the CFG by hand before they can
-reason about the program at all. This is the single largest cost multiplier in
-the current build, because it attacks *structure*, which is what a human reads
-first.
+(The heading used to read "control-flow flattening". It was a misnomer: what is
+implemented is dispatch, not flattening -- there is no threaded code and no
+dispatcher state that outlives one instruction. `control_flow_level` feeds
+instruction reordering, which is real; graph flattening is not claimed.)
 
-**Cost not added:** the dispatcher is a linear `if`/`elseif` chain on a
-plaintext counter. Symbolically executing it, or just instrumenting the
-interpreter to log `pc`, recovers the CFG mechanically. This is
-straightforward to automate and someone will.
+**Cost added:** an analyst must reconstruct a CFG per group, under a numbering
+and an instruction geometry that exist only in this file, before they can reason
+about the program at all. A tool written against `nested_if` with 1-byte operands
+and absolute jump targets does not read a group that chose `decision_tree`, 2-byte
+operands and an edge table. This is the single largest cost multiplier in the
+current build, because it attacks *structure*, which is what a human reads first.
+
+**Cost not added:** handler bodies are plain Luau, and permuting opcode *numbers*
+does not change what a handler does -- step 4 of the build report is unaffected by
+every setting in the tool. The `nested_if` shape is a linear `if`/`elseif` chain on
+a plaintext counter; instrumenting the interpreter to log that counter recovers the
+execution order mechanically. `encoded_pc` would have hidden the counter and is
+declared-but-not-read, so the report lists it as pending rather than pretending.
 
 ### Constant pool encryption (implemented)
 
@@ -95,9 +108,13 @@ longer says what it does with them.
 
 **Cost not added:** essentially none at runtime. The key is in the artifact --
 it has to be, or the program could not run -- so the blob is decryptable by
-anyone holding the file, with no execution required. And the plaintext is in
-the heap the moment any constant is read, so a single breakpoint on the
-accessor function dumps the entire pool.
+anyone holding the file, with no execution required. Decrypting it is a script,
+not a debug session; and the pool's *plaintext* is in the heap the moment a
+constant is read, so a breakpoint on the accessor yields that constant. What it
+no longer yields is the whole pool for free: one read gives one value, so
+enumerating means driving reads, and any build with `decoys` on will collect
+planted entries that the program never touches and cannot tell from the encoded
+form. That is a cost, not a barrier -- the blob as a whole is recoverable.
 
 Treat this as *removing the easy static signal*, not as confidentiality. That
 is a real and useful property; it is not secrecy. The distinction matters
@@ -126,6 +143,15 @@ does not isolate the change.
 **Cost not added:** nothing against an analyst working on the single build they
 care about, which is the usual case.
 
+Alongside the shape changes, a build digests its own format decisions -- the
+family, dispatcher, opcode count and instruction format of each group -- and folds
+that 8-byte digest into the constant pool's additional authenticated data. The
+digest is printed in the report, so a pool lifted out of one artifact fails
+authentication in another whose config happens to match, without anything in the
+file advertising that it is Couxobf output. A build with nothing virtualized
+reports the digest as drawn-but-unbound, because there would be no running format
+to key anything to.
+
 ## Known limitations
 
 Stated explicitly, because an undocumented limitation is worse than a
@@ -143,10 +169,24 @@ quietly reintroduced.
 readable Luau. A Luau-level VM cannot hide from a Luau-level debugger, because
 the debugger is running the same language.
 
-**Helpers are shared across prototypes.** `_kpack`, `_kunpk`, `_kiter`,
-`_kiterpack`, `_kitercheck`, `_kapp` appear once, with fixed shapes. They are
-immediately recognizable as scaffolding and are the obvious place to start
-reading. Diversifying them is on the roadmap and is not done yet.
+**Helpers are recognizable scaffolding.** The six runtime helpers used to be
+named `_kpack`, `_kunpk`, `_kiter`, `_kiterpack`, `_kitercheck` and `_kapp` in
+every artifact ever produced; their names are now drawn per build (a fixed string
+appearing a hundred-odd times is a signature by itself). What is unchanged: there
+is one implementation per operation, they are emitted as one statement, and their
+position in the file is decided by the emitter rather than by the build seed.
+Diversifying the implementations is on the roadmap and is not done (#23, #24).
+
+**The environment guard raises cost and prevents nothing.** `env_guard` and
+`dump_guard` capture the interesting library names at load and re-check five
+surfaces (`string.dump`, `getbytecode`, `getscriptbytecode`, `debug.getinfo`,
+`debug.gethook`) at every VM entry; at level 2 the build can neutralize a logging
+`__index` or refuse once a surface has been swapped. None of that is a boundary.
+A dumper that patches the in-memory proto never calls any of those functions; a
+hook installed before the artifact loads sees the capture happen; and a debugger
+runs the same language the guard is written in. The artifact's own report states
+what the guard captured and whether it tripped, because a build should not claim
+more than it did.
 
 **Semantic fidelity constrains transformation.** The tool must preserve Luau
 semantics exactly, including observable error messages (user code matches on
@@ -170,6 +210,23 @@ Every claim above is checked by execution, not asserted:
   stops the runtime rather than yielding wrong constants.
 - `tests/test_luau_crypto.py` cross-checks the generated Luau crypto against
   Python's `hashlib`/`hmac` and a Python ChaCha20, in both directions.
+
+- `tests/test_guard.py` builds the same program at all three guard levels and
+  requires the same stdout from all of them, then runs it under a hostile
+  environment: a `_G` with a logging `__index`/`__newindex`, and `getbytecode`
+  swapped for a trapping stub mid-run. Level 0 prints and exits 0; level 2 with
+  `policy=fail` exits non-zero. A defence test that only inspects emitted text
+  would pass on a build that does nothing.
+- `tests/test_config.py` greps the tree for reads of every field in
+  `Config.IMPLEMENTED` and fails on a field nothing consumes; `tests/test_web.py`
+  renders the generated form against a stub DOM and fails if a live field is
+  missing from it or a pending one is present in it. Those two are what keep the
+  site's option list honest as the pipeline changes underneath it -- the grep is
+  on attribute reads, which is why `FormatPrefs.from_config` reads its fields as
+  attributes rather than through `getattr(config, "name", default)`.
+- The build report's own "requested but not applied" section is the artifact-level
+  view of the same rule, and `api/obfuscate.py` refuses to accept a pending
+  field. A claim and a knob have to be backed by a read.
 
 The conformance corpus has two documented exclusions, each replaced by a narrow
 test covering the behaviour it also exercises: `calls.luau` asserts on *which*

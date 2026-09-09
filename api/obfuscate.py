@@ -396,6 +396,7 @@ def run(source: str, options: Dict[str, Any]) -> Dict[str, Any]:
         "notes": _notes(result),
         "options": OPTIONS,
         "pending": pending,
+        "vm_groups": _vm_groups(result.stats),
         "report": result.report,
     }
 
@@ -419,6 +420,33 @@ def _applied(config: Config, profile: Any) -> Dict[str, Any]:
     out.update({name: _applied_value(config, name)
                 for name in sorted(Config.IMPLEMENTED)})
     return out
+
+
+def _vm_groups(stats):
+    """One row per interpreter this artifact carries, read off the build itself.
+
+    `vm_variety` above 1 really does emit several VMs with different state models,
+    dispatch shapes, opcode counts and instruction formats, and the flag the user
+    set names only the first of them.  Showing the request as the result is the
+    kind of thing a UI should not be able to do, so the panel is built from the
+    plan the pipeline returned.
+    """
+    rows = []
+    for group in getattr(stats, "vm_groups", None) or []:
+        fmt = group.get("format") or {}
+        rows.append({
+            "group": group.get("group", len(rows)),
+            "family": group.get("family"),
+            "dispatcher": group.get("dispatcher"),
+            "prototypes": group.get("protos", 0),
+            "opcodes": group.get("opcodes", 0),
+            "op_bytes": fmt.get("op_bytes", 1),
+            "reg_bytes": fmt.get("reg_bytes", 1),
+            "wide_bytes": fmt.get("wide_bytes", 2),
+            "target_mode": fmt.get("target_mode", "abs"),
+            "fused": len(fmt.get("fused") or []),
+        })
+    return rows
 
 
 def _notes(result: Any) -> list:
