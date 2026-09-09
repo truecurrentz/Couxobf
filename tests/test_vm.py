@@ -44,7 +44,7 @@ from couxobf import ir, lower_back, parser, rng as rngmod
 from couxobf.emit import printer
 from couxobf.ir import FuncIR
 from couxobf.toolchain import execute, find_toolchain
-from couxobf.vm import encode, isa, runtime
+from couxobf.vm import encode, isa, runtime, wiring
 from test_roundtrip import EXCLUDED, MICRO_DIR, _conformance_dir
 
 TOOLCHAIN = find_toolchain()
@@ -56,6 +56,10 @@ NAMES = {
     "enter": "_kGo",
     "call": "_kAp",
     "getfenv": "_kGe",
+    # the accumulator/stack locals the non-register families declare
+    "acc": "_kAc",
+    "stack": "_kSt",
+    "sp": "_kSp",
     "append": "_kapp",
     "iter": "_kiter",
     "iterpack": "_kiterpack",
@@ -110,17 +114,17 @@ def _lit(value) -> str:
     return p.w.value()
 
 
-def _descriptors(encoded) -> str:
-    """Every prototype's runtime descriptor, as one keyed table."""
-    rows = []
-    for pid, enc in sorted(encoded):
-        consts = ", ".join(_lit(v) for v in enc.consts)
-        rows.append("  [%d] = { code = %s, consts = { %s }, entry = %d, "
-                    "nparams = %d },"
-                    % (pid, _lit(enc.code), consts, enc.lua_entry, enc.nparams))
-    if not rows:
-        return ""
-    return "local %s = {\n%s\n}" % (_DESCRIPTOR_TABLE, "\n".join(rows))
+def _plan(seed: bytes = b"\x07" * 16) -> wiring.VMPlan:
+    """A plan over the fixed test names, for driving the real emitter.
+
+    These tests used to carry their own copy of the descriptor row.  That copy
+    is exactly how a bug like the unauthenticated plaintext ``entry`` survives:
+    the production emitter changed, the test emitter did not, and the tests
+    kept passing against the shape they were asserting instead of the shape
+    that ships.
+    """
+    return wiring.VMPlan(opmap=_opmap(seed), names=NAMES, protos=set(),
+                         table=_DESCRIPTOR_TABLE, family="register")
 
 
 def _opmap(seed: bytes = b"\x07" * 16) -> isa.OpcodeMap:
@@ -137,8 +141,8 @@ def vm_reconstruct(src: str, name: str = "test.luau", seed: bytes = b"\x07" * 16
     module = ir.Lowerer().lower(parser.parse(src, name))
     rec = _VMReconstructor(_opmap(seed))
     body = printer.emit(rec.reconstruct(module))
-    parts = [lower_back.HELPERS_SRC, runtime.interpreter_source(_opmap(seed), NAMES)]
-    parts.append(_descriptors(rec.encoded.items()))
+    parts = [lower_back.HELPERS_SRC,
+             wiring.prelude_source(_plan(seed), dict(rec.encoded), _lit, _lit)]
     parts.append(body)
     return "\n".join(parts), set(rec.encoded)
 
@@ -407,7 +411,6 @@ def test_different_seed_changes_the_opcode_numbering():
 from couxobf.config import Config  # noqa: E402
 from couxobf.crypto.kdf import KeyMaterial  # noqa: E402
 from couxobf.pipeline import build  # noqa: E402
-from couxobf.vm import wiring  # noqa: E402
 
 
 def protected_vm_reconstruct(src: str, name: str, seed: bytes = b"\x21" * 16,

@@ -726,7 +726,14 @@ def reconstruct_protected(module: IRModule,
     # still has to be right.
     vm_src = ""
     if plan is not None and rec.vm_encoded:
+        from .integrity import validate_module as _validate_payload
         from .vm import wiring as _wiring
+        # Checked before emission, not after: a payload whose entry point or
+        # jump targets do not line up with the instruction boundaries the
+        # encoder laid down will run and compute the wrong thing, and nothing
+        # downstream points back here.  This is the check that catches the
+        # encoder bug, as opposed to the MAC, which catches the edit.
+        _validate_payload(rec.vm_encoded, plan.opmap)
         pooled = lambda value: "%s(%d)" % (names["get"], pool.slot(value))
         vm_src = _wiring.prelude_source(plan, rec.vm_encoded, pooled, pooled)
 

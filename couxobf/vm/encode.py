@@ -71,6 +71,10 @@ class EncodedProto:
     entry: int
     #: Constant values, in the order the bytecode indexes them.
     consts: List[Any]
+    #: Byte offset of every instruction, in emission order.  Used by
+    #: :mod:`couxobf.integrity.payload` to check a decoded stream against the
+    #: boundaries the encoder actually laid down.
+    starts: Tuple[int, ...] = ()
 
     @property
     def lua_entry(self) -> int:
@@ -148,10 +152,16 @@ def encode_proto(proto: FuncIR, opmap: OpcodeMap) -> EncodedProto:
     # First pass: lay blocks out and record where each one starts, so jump
     # operands (which name block ids in the IR) can become byte offsets.
     offsets: Dict[int, int] = {}
+    starts: List[int] = []
     pc = HEADER.size
     for block in proto.blocks:
         offsets[block.id] = pc
         for ins in block.instrs:
+            # Recorded for the integrity check: a payload validator can only
+            # rediscover instruction boundaries by decoding, and decoding from
+            # a wrong offset sometimes succeeds by luck.  Carrying the real
+            # boundaries turns that check from probabilistic into exact.
+            starts.append(pc)
             pc += _instruction_size(ins)
 
     def target(block_id: int, op: str) -> int:
@@ -181,6 +191,7 @@ def encode_proto(proto: FuncIR, opmap: OpcodeMap) -> EncodedProto:
         is_vararg=proto.is_vararg,
         entry=offsets[proto.entry],
         consts=consts,
+        starts=tuple(starts),
     )
 
 

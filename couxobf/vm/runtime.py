@@ -310,7 +310,16 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         f"local function {n['exec']}(p, R, E)",
         f"  local {n['code']} = p.code",
         "  local K = p.consts",
-        "  local pc = p.entry",
+        # entry is read out of the payload header, which is inside the
+        # authenticated blob, rather than from the descriptor table next to it.
+        # The two agreed by construction, and nothing checked that they still
+        # agreed: editing the plaintext `entry` in the emitted source moved the
+        # program counter into the middle of the bytecode without ever touching
+        # the MAC. Measured on a one-prototype build -- entry 13/17/21 out of
+        # 59 scanned values ran to completion with exit code 0 and produced
+        # silently wrong output. Header layout is <BBHHH, so entry is the u16
+        # at bytes 7..8 and +1 for the 1-based string.byte index.
+        f"  local pc = _byte({n['code']}, 7) + _byte({n['code']}, 8) * 256 + 1",
     ] + ["  " + decl for decl in fam.state] + [
         "  while true do",
         f"    local op = _byte({n['code']}, pc)",
@@ -333,7 +342,8 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         f"local function {n['enter']}(p, E, ...)",
         "  local R = {}",
         "  local args = _pack(...)",
-        "  for i = 1, p.nparams do",
+        # same reason as the entry point above: nparams is header byte 1
+        f"  for i = 1, _byte(p.code, 1) do",
         "    R[i] = args[i]",
         "  end",
         f"  return {n['exec']}(p, R, E)",

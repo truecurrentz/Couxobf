@@ -170,10 +170,13 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
     for pid in sorted(encoded):
         enc = encoded[pid]
         consts = ", ".join(const_expr(v) for v in enc.consts)
-        rows.append("  [%d] = { code = %s, consts = { %s }, entry = %d, "
-                    "nparams = %d },"
-                    % (pid, code_expr(enc.code), consts,
-                       enc.lua_entry, enc.nparams))
+        # Deliberately no `entry` or `nparams` here.  Both are already in the
+        # payload header, which travels inside the authenticated blob; the
+        # interpreter reads them from there.  Putting them here as well created
+        # a second, plaintext, unauthenticated copy that an editor could
+        # change without invalidating any tag.
+        rows.append("  [%d] = { code = %s, consts = { %s } },"
+                    % (pid, code_expr(enc.code), consts))
     if not rows:
         # No prototype made it in, so there is nothing to dispatch.  Emitting
         # the interpreter anyway would be dead weight an analyst could study
