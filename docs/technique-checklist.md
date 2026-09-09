@@ -1,7 +1,7 @@
 # Technique checklist
 
 All 80 points, each checked against what this build actually does. Every claim
-below was measured on the artifact or read out of the code at commit `609c9e1`
+below was measured on the artifact or read out of the code at commit `549886a`
 — not inferred from intent. Where the measurement contradicted an earlier
 assumption, the measurement is what is written here.
 
@@ -14,7 +14,7 @@ assumption, the measurement is what is written here.
 | 🔶 | Partially implemented — the gap is stated |
 | ⬜ | Not implemented |
 
-**Tally: 26 done · 20 partial · 34 not built.** Of the 26 done, 16 are ✅ and 10 are ⭐ (implemented and improved beyond the point as written). All 80 points are scored exactly once.
+**Tally: 27 done · 20 partial · 33 not built.** Of the 27 done, 16 are ✅ and 11 are ⭐ (implemented and improved beyond the point as written). All 80 points are scored exactly once.
 
 Two standing caveats that apply to the whole document. Client-side
 obfuscation raises the cost of reversing; it does not make reversing
@@ -78,11 +78,11 @@ is unbreakable.
 
 | # | Technique | Status | Evidence |
 | --- | --- | --- | --- |
-| 16 | Break obvious names (`R0`, `R1`, `stack`, `pc`, `opcode`) | 🔶 | `stack`, `sp`, `acc`, `code`, `exec`, `enter`, `call`, `getfenv` are per-build. **Measured gap:** `pc` appears 228 times in a maximum-profile build, and `R`/`K`/`E` are literal inside the interpreter. `R0`/`R1` appear 0 times. |
+| 16 | Break obvious names (`R0`, `R1`, `stack`, `pc`, `opcode`) | ✅ | **Fixed.** `pc`, `R`, `K`, `E`, `stack`, `opcode` and the six helper names now all count **0** in the output, down from 228 / 111 / 7 / 5 / 0 / 1 plus six fixed helper names. Each build draws its own from the `vm` stream. |
 | 39 | Build-specific structural fingerprint | 🔶 | Per-build name prefixes now exist (see #69), but there is no deliberate marker that lets our own tooling recognize its output. |
 | 69 | Continuously change the generated format | ⭐ | **Improved this build.** The pool and bank prefixes were the constants `_kQ` and `_kS`, identical in every build ever produced — `_kQ` alone appears 115 times in a typical output. Each build now draws its own: 12 builds produced 24 prefixes, all distinct, none stable. |
 | 25 | Avoid repeated decoder boilerplate | ✅ | Measured on a maximum build: 30 long string literals, 30 distinct, 0 repeated. |
-| 23 | Randomize helper placement | ⬜ | **Known remaining fingerprint.** `_kpack`, `_kunpk`, `_kapp`, `_kiter`, `_kiterpack`, `_kitercheck` are fixed in every build and always sit in the same position in the prelude. They are tracked in `lower_back.EMITTED_HELPERS`, which is what randomizing them needs. |
+| 23 | Randomize helper placement | 🔶 | **Names fixed, placement not.** The six helpers were `_kpack`/`_kunpk`/`_kiter`/`_kiterpack`/`_kitercheck`/`_kapp` in every build ever produced; each build now draws its own, verified distinct across 6 seeds with no collision within a build. But the point asks about *placement*, and all six are still declared together, in the same order, at the same point in the prelude. That ordering is the remaining signature. |
 | 24 | Different helper implementations for equivalent operations | ⬜ | One implementation each. |
 | 40 | Avoid a recognizable VM → decrypt → execute sequence | ⬜ | The prelude order is fixed: crypto runtime, constant pool, helpers, body. |
 
@@ -104,7 +104,7 @@ is unbreakable.
 | --- | --- | --- | --- |
 | 45 | Don't claim anti-tamper from hashing alone | ✅ | Documented, not faked. Data tamper-resistance is real and measured; **code** tamper-resistance is not achievable in client-side Luau and the docs say so rather than implying otherwise. |
 | 47 | Make integrity failures indistinguishable from ordinary failures | ✅ | **Fixed this build.** All five `error()` sites across both runtimes now raise one identical message. A test asserts the set of distinct `error(...)` call sites has size 1. |
-| 48 | Avoid obvious strings (`"integrity"`, `"invalid instruction"`, `"VM error"`) | ✅ | **Fixed this build.** Measured on production output, all zero: `integrity`, `invalid instruction`, `VM error`, `failed authentication`, `authentication`, `tamper`, `checksum`, `constant pool`, `string bank`, `protected payload`. Three of those previously said "failed authentication", which named the check and confirmed the edit had been noticed. |
+| 48 | Avoid obvious strings (`"integrity"`, `"invalid instruction"`, `"VM error"`) | ⭐ | **Fixed, then fixed again.** Measured on production output, all zero: `integrity`, `invalid instruction`, `VM error`, `failed authentication`, `authentication`, `tamper`, `checksum`, `constant pool`, `string bank`, `protected payload`. Three sites said "failed authentication", naming the check and confirming the edit had been noticed. Improved further: the dispatcher fallthrough said `"unknown opcode "` — literally the "invalid instruction" phrasing this point calls out, and the last place `opcode` reached the artifact. All three sites now raise the neutral message. |
 | 46 | Integrity checks at multiple semantic boundaries | ⬜ | One MAC per blob, verified once on first load. |
 | 50 | Differential tests against unprotected execution | ⭐ | 18 differential tests, plus the web suite executing all four VM families × three dispatcher shapes and comparing to the original. Measured: 12/12 builds of `inventory.luau` byte-identical in output. |
 
@@ -210,9 +210,9 @@ of one build, not an illustration.
 BUILD     examples/maze.luau
 PROFILE   maximum | virtualization maximum | vm_family stack | dispatcher mixed
 SEED      00000000000000000000000000c0ffee
-RESULT    3484 B -> 52412 B  (15.0x)
+RESULT    3484 B -> 53713 B  (15.4x)
           8 prototypes, 3 virtualized
-          sha256 86b25338391ace7dee5d1181...
+          sha256 24da5bea4da0d7e0fd1d66b9...
           executes byte-identically to the original under the Luau runtime
 ```
 
@@ -229,17 +229,17 @@ Scoring that build against the checklist:
 | Any diagnostic vocabulary? | 0 hits across 10 phrases | ✅ #48 |
 | Any repeated decoder boilerplate? | 29 long literals in the output, 0 repeats | ✅ #25 |
 | Does the seed change the shape? | Yes — different dispatcher across seeds | ✅ #32 |
-| Is the helper block a stable signature? | **Yes** — `_kiterpack` and friends are identical in every build | ⬜ #23 |
-| Is `pc` an obvious name? | **Yes** — 228 occurrences | 🔶 #16 |
+| Is the helper block a stable signature? | **Names no** — per-build now. **Order still yes** — all six declared together in the same sequence | 🔶 #23 |
+| Any recognisable VM identifier left? | **No** — `pc`/`R`/`K`/`E`/`stack`/`opcode` and the six legacy helper names all count 0 | ✅ #16 |
 | Would a devirtualizer for this build generalize? | **Yes** — one family, one instruction format | ⬜ #2, #72 |
 | Is output growth bounded? | **No** — 15.0× here, 515× on `hello.luau` | ⬜ #62 |
 
-Six passes, four fails. The four failures are the next four items of work, in
-the order they should be done:
+Seven passes, three fails. The remaining failures, in the order they should be
+done:
 
-1. **#23 + #16** — randomize helper names and the interpreter's `pc`/`R`/`K`/`E`.
-   Cheapest of the four and it removes the last stable identifiers.
-   `EMITTED_HELPERS` already tracks what needs renaming.
+1. **#23** — the helper *names* are randomized now; their *placement* is not.
+   Scattering the six declarations through the output is what the point asks
+   for, and it is still the one stable structural feature left.
 2. **#62** — enforce `max_output_growth`. A 515× expansion is a fingerprint on
    its own, independent of anything inside it.
 3. **#4** — per-operand encoding. The blob is authenticated as a whole today;
