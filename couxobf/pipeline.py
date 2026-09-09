@@ -26,24 +26,77 @@ so anything a determined analyst wants badly enough they can eventually get.
 
 from __future__ import annotations
 
+import re
 import secrets
 import textwrap
 import time
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
 from . import classify as _classify
+from . import comments as _comments
+from .vm import format as _vm_format
+from .vm import runtime as _vm_runtime
 from . import ir as _ir
 from . import lower_back as _lower_back
 from . import parser as _parser
 from . import sema as _sema
-from .config import Config, VirtualizationLevel
+from .config import Config, VirtualizationLevel, VMFamily
 from .crypto.kdf import KeyMaterial
 from .rng import make_domains
 from .verify.output import ValidationReport, validate_or_raise, validate_output
 
 #: How many bytes of seed material a build uses.
 SEED_BYTES = 16
+
+
+def _alias_ratio(config) -> float:
+    """Chance that an opcode is given an extra number this build.
+
+    A ratio rather than a count, because the useful property is "the number of
+    dispatch arms moves with the build" and that depends on how many opcodes the
+    ISA has, which is itself a constant of the tool only until the aliases are
+    added.
+    """
+    return {0: 0.0, 1: 0.35, 2: 0.6, 3: 0.8}[int(config.opcode_aliases)]
+
+
+def _family_rotation(vm_family) -> tuple:
+    """Every family this build can spread across, with the pinned one first.
+
+    ``state_distribution`` asks for different VMs in one artifact and
+    ``vm_family`` asks for a specific one.  Both are real options, so the
+    rotation honors the pin for group 0 and spreads the rest behind it, instead
+    of one silently cancelling the other.
+    """
+    wanted = str(getattr(vm_family, "value", vm_family))
+    ordered = [wanted] + [f.value for f in VMFamily if f.value != wanted]
+    return tuple(ordered)
+
+
+def _dispatcher_rotation(dispatcher_family) -> tuple:
+    """Every dispatcher shape this build can spread across, pinned one first.
+
+    The mirror of :func:`_family_rotation`, for the same reason: ``--dispatcher
+    bucket`` has to be observable.  Handing ``DISPATCHERS`` over directly let
+    ``_make_groups`` shuffle the pool and index it, so a build with a single group
+    drew a shape at random and the flag changed nothing an analyst could see.
+    ``mixed`` is the value that means "I do not care", so it is the only one that
+    leaves group 0 unpinned.
+    """
+    wanted = str(getattr(dispatcher_family, "value", dispatcher_family))
+    pool = list(_vm_runtime.DISPATCHERS)
+    if wanted not in pool or wanted in ("", "mixed", "none"):
+        return tuple(pool)
+    return tuple([wanted] + [d for d in pool if d != wanted])
+
+
+def _format_variety(config) -> int:
+    """How much the instruction format is allowed to move. 0 means never."""
+    if not config.operand_randomization:
+        return 0
+    return int(config.instruction_formats)
 
 
 class BuildError(Exception):
@@ -64,6 +117,30 @@ class BuildStats:
     elapsed_ms: float = 0.0
     #: Virtualization level per prototype, from the classifier.
     decisions: List[Any] = field(default_factory=list)
+    #: `#` comments removed from the input before parsing (#5's input side).
+    hash_comments: int = 0
+    #: Size ratio the build was asked to stay under, 0 when unset.
+    budget_ceiling: float = 0.0
+    #: Which pass groups were given up to stay under that ceiling, in order.
+    budget_trimmed: List[str] = field(default_factory=list)
+    #: What the environment/dump guard ended up doing, from the build itself.
+    guard: Dict[str, Any] = field(default_factory=dict)
+    #: The build's structural fingerprint: a digest of the per-group format
+    #: decisions, which the constant pool is also authenticated against.
+    fingerprint: str = ""
+    #: Whether the digest was asked for, and whether it authenticated anything.  A
+    #: build with no virtualized prototype draws no format decisions and binds no
+    #: pool, and the report says which of the three states it is in.
+    fingerprint_requested: bool = False
+    fingerprint_bound: bool = False
+    #: Decoy constants planted in the pool, counted at seal time so it reflects the
+    #: pool the artifact carries rather than the budget it was given.
+    pool_decoys: int = 0
+    #: One entry per VM group this artifact carries: family, dispatcher, opcode
+    #: count, instruction format and how many prototypes it runs.  Read out of the
+    #: plan rather than derived from the config, because with `vm_variety` above 1
+    #: the groups are not all the same and the config names only the first.
+    vm_groups: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -100,6 +177,20 @@ def build(source: str, config: Optional[Config] = None,
           toolchain: Any = None, verify: bool = True) -> BuildResult:
     """Run the whole pipeline and return the protected source.
 
+    Two things happen here that a single pass through the stages cannot:
+
+    *the source is prepared* -- :attr:`Config.hash_comments` decides whether
+    ``#`` comments are stripped first, and the strip is followed by a re-parse so
+    that a comment which looked like one but was inside a string fails the build
+    instead of changing the program (:mod:`couxobf.comments`);
+
+    *the output has a budget* -- :attr:`Config.max_output_growth` is a ceiling on
+    the size ratio, and the pipeline meets it by giving up transformations in a
+    fixed order, least-protection-per-byte first, then says in the report what it
+    gave up (:func:`_within_budget`).  Both exist because a build that quietly
+    grows 300x or quietly deletes the user's comments is a build whose report is
+    fiction.
+
     ``verify`` defaults to True and raises
     :class:`~couxobf.verify.output.OutputValidationError` on invalid output.
     Turn it off only when the caller intends to validate separately -- an
@@ -110,12 +201,146 @@ def build(source: str, config: Optional[Config] = None,
     seed = seed if seed is not None else seed_from_config(config)
     if len(seed) < SEED_BYTES:
         raise BuildError(f"seed must be at least {SEED_BYTES} bytes")
+    source_size = len(source.encode("utf-8", "surrogatepass"))
+
+    try:
+        text, stripped = _comments.prepare(source, name, config.hash_comments,
+                                           _parser.parse)
+    except ValueError as exc:
+        # A build error, not a ValueError: the caller asked for a build, and the
+        # CLI and the web API both report BuildError with the file name in it.
+        raise BuildError(str(exc)) from None
+    result = _build_once(text, config, seed, name, toolchain, verify,
+                         source_size)
+    result = _within_budget(text, result, seed, name, toolchain, verify,
+                            source_size)
+    result.stats.hash_comments = stripped
+    result.stats.elapsed_ms = (time.perf_counter() - started) * 1000.0
+    result.report = cost_report(result)
+    return result
+
+
+#: What the size budget gives up, in order, least useful per byte first.  Each
+#: entry is one rebuild: every field in it is turned off together, because they
+#: buy the same kind of noise and a build that lost three single knobs one at a
+#: time would report three things nobody could act on.
+_BUDGET_TRIMS = (
+    # Cheapest to give up first, in the sense of "what does the user lose per byte
+    # saved": decoy pool entries buy obscurity for a few hundred bytes and cost
+    # nothing to remove, while a second VM group costs kilobytes and removes a real
+    # obstacle.  A group whose fields the pipeline does not read would be a trim
+    # that changes nothing, so the list is exactly the optional passes that are
+    # wired -- nothing that guards against dumping or logging is here, because a
+    # size ceiling is not a licence to make the artifact observable.
+    (("decoys", False), ("decoy_constants", 0)),
+    (("instruction_fusion", False), ("super_instructions", False)),
+    (("opcode_aliases", 0),),
+    (("metadata_fragmentation", False),),
+    (("vm_variety", 1), ("state_distribution", False)),
+    (("control_flow_level", 0), ("block_permutation", False)),
+    (("edge_indirection", False), ("instruction_formats", 0)),
+    (("pc_protection", False), ("opcode_randomization", False)),
+    (("string_protection_level", 1),),
+)
+
+#: Human-readable names for the same groups, in the same order, for the report.
+_BUDGET_LABELS = (
+    "decoy entries in the constant pool",
+    "instruction fusion and super-instructions",
+    "opcode aliases",
+    "split descriptor tables",
+    "second VM group",
+    "control-flow flattening and block permutation",
+    "edge indirection and per-group formats",
+    "encoded jump targets and opcode randomization",
+    "string protection down to encoded literals",
+)
+
+
+def _within_budget(text: str, result: "BuildResult", seed: bytes, name: str,
+                   toolchain: Any, verify: bool, source_size: int
+                   ) -> "BuildResult":
+    """Rebuild with the cheapest-to-drop passes off until the ratio fits.
+
+    A ceiling is only honest if exceeding it costs something real, and the only
+    thing worth giving up is the padding: dropping it makes the artifact smaller
+    *and* easier to read, which is precisely the trade the user should be told
+    about rather than have made for them silently.  The report names every group
+    that was given up, so a build that trimmed does not look like a build that
+    configured less.
+    """
+    ceiling = float(result.config.max_output_growth or 0.0)
+    if ceiling < 1.0:
+        result.stats.budget_ceiling = 0.0
+        return result
+    stats = result.stats
+    stats.budget_ceiling = ceiling
+    ratio = stats.output_bytes / max(1, source_size)
+    if ratio <= ceiling:
+        return result
+    config = result.config
+    current = result
+    given_up: List[str] = []
+    for trims, label in zip(_BUDGET_TRIMS, _BUDGET_LABELS):
+        changes = {field_name: value for field_name, value in trims
+                   if getattr(config, field_name) != value}
+        if not changes:
+            continue
+        config = dataclasses.replace(config, **changes)
+        candidate = _build_once(text, config, seed, name, toolchain, verify,
+                                source_size)
+        current = candidate
+        ratio = candidate.stats.output_bytes / max(1, source_size)
+        given_up.append(label)
+        if ratio <= ceiling:
+            break
+    # The list is attached at the end rather than appended per rebuild: every
+    # rebuild brings a fresh stats object, and a report that named only the last
+    # thing given up would understate what the ceiling cost.
+    current.stats.budget_ceiling = ceiling
+    current.stats.budget_trimmed = given_up
+    return current
+
+
+#: A `#` with code before it and a space on at least one side: the shape a
+#: trailing comment takes, and the one shape the stripper cannot legally touch.
+_TRAILING_HASH = re.compile(r"\S\s+#\s")
+
+
+def _parse_hint(source: str, exc: Exception) -> str:
+    """The parser's message, plus the one explanation it cannot give itself.
+
+    `#` mid-line is Luau's length operator, so a stripper that removed it would
+    corrupt real code -- which means a file whose author used trailing `#`
+    comments fails to parse, and a bare "unexpected token" sends them looking
+    through their own code for a typo that is not there.
+    """
+    text = str(exc)
+    for line in source.splitlines():
+        if _TRAILING_HASH.search(line):
+            return (text + " -- a `#` after code on the same line is the length "
+                    "operator in Luau; hash_comments strips only a `#` that starts"
+                    " a line, so use `--` for a trailing comment")
+    return text
+
+
+def _build_once(source: str, config: Config, seed: bytes, name: str,
+                toolchain: Any, verify: bool, source_size: int) -> BuildResult:
+    """One full pass over the stages, with no source preparation and no retry.
+
+    Split out of :func:`build` because the budget loop has to run it more than
+    once against the same seed: a rebuild that also re-drew the seed would change
+    two things at a time, and nothing in the report would be attributable.
+    """
+    started = time.perf_counter()
+    config = config or Config()
 
     # -- front end --------------------------------------------------------
     try:
         ast = _parser.parse(source, name)
     except Exception as exc:
-        raise BuildError(f"{name} does not parse: {exc}") from None
+        raise BuildError(f"{name} does not parse: {_parse_hint(source, exc)}"
+                         ) from None
 
     # Semantic analysis runs for its own sake: it is what the identifier
     # renamer and the classifier read, and running it here means a source file
@@ -147,15 +372,22 @@ def build(source: str, config: Optional[Config] = None,
         cache_policy=str(getattr(config.cache_policy, "value",
                                  config.cache_policy)),
         cache_bound=config.bounded_cache_size,
+        # Decoys are the pool's, so the count is too: `decoys` is the switch and
+        # `decoy_constants` the budget, and both are read nowhere else.
+        pool_decoys=(int(config.decoy_constants) if config.decoys else 0),
+        fingerprint=bool(config.fingerprint),
+        metadata_fragmentation=bool(config.metadata_fragmentation),
         minify=config.minify,
         vm_level=config.virtualization_level,
         vm_rng=domains.get("vm"),
         vm_protos=selected,
         vm_family=config.vm_family,
         block_permutation=config.block_permutation,
+        isa_subset=bool(config.vm_isa_subset),
         layout_rng=domains.get("cfg"),
         dispatcher_family=config.dispatcher_family,
         opcode_randomization=config.opcode_randomization,
+        fmt_prefs=_vm_format.FormatPrefs.from_config(config),
         string_level=config.string_protection_level,
         # Its own stream: reusing the constant pool's randomness for the string
         # bank would correlate two unrelated layouts, which is exactly what
@@ -163,10 +395,41 @@ def build(source: str, config: Optional[Config] = None,
         string_rng=domains.get("strings"),
         string_cache_policy=str(getattr(config.cache_policy, "value",
                                         config.cache_policy)),
+        # One VM per build is the historical behaviour.  Asking for more groups
+        # is what makes "several VM families per artifact" true, and
+        # `state_distribution` is the config's name for exactly that spread.
+        vm_variety=(max(1, int(config.vm_variety))
+                    if (config.state_distribution or config.vm_variety > 1)
+                    else 1),
+        # Spread, but starting where the user pointed: a build that pinned
+        # ``vm_family`` and turned state distribution on still gets that family
+        # for group 0, with the rest rotated behind it.  Ignoring the pin would
+        # make the config's own field unobservable, which is the one thing a
+        # knob is not allowed to be.
+        families=(_family_rotation(config.vm_family)
+                  if config.state_distribution else None),
+        dispatchers=(_dispatcher_rotation(config.dispatcher_family)
+                     if config.dispatcher_splitting else None),
+        fusion_level=(1 if config.instruction_fusion
+                      and config.super_instructions else 0),
+        alias_ratio=_alias_ratio(config),
+        alias_chance=(0.35 if config.opcode_aliases else 0.0),
+        # The environment-logging and dump defences.  Both are read here and
+        # nowhere else, so "the guard did not turn on" can only mean one of these
+        # two fields was set to 0 -- which is what the report then says.
+        env_guard=int(config.env_guard),
+        dump_guard=int(config.dump_guard),
+        guard_policy=str(config.guard_policy),
         names_out=runtime_names,
     )
 
-    stats = _collect_stats(module, classification, out, source)
+    stats = _collect_stats(module, classification, out, source_size)
+    stats.guard = dict(runtime_names.get("guard") or {})
+    stats.fingerprint = str(runtime_names.get("fingerprint") or "")
+    stats.fingerprint_requested = bool(runtime_names.get("fingerprint_requested"))
+    stats.fingerprint_bound = bool(runtime_names.get("fingerprint_bound"))
+    stats.pool_decoys = int(runtime_names.get("pool_decoys") or 0)
+    stats.vm_groups = list(runtime_names.get("vm_plan") or [])
     stats.elapsed_ms = (time.perf_counter() - started) * 1000.0
 
     # The emitted helper names, so helper uniqueness is checked against what
@@ -177,10 +440,23 @@ def build(source: str, config: Optional[Config] = None,
     validation = (validate_or_raise(out, source, toolchain, helpers) if verify
                   else validate_output(out, source, toolchain, helpers))
 
-    result = BuildResult(source=out, seed=seed, config=config, stats=stats,
-                         validation=validation, runtime_names=runtime_names)
-    result.report = cost_report(result)
-    return result
+    return BuildResult(source=out, seed=seed, config=config, stats=stats,
+                       validation=validation, runtime_names=runtime_names)
+
+
+def _guard_report(guard: Dict[str, Any]) -> List[str]:
+    """The guard's own words, from the summary the build recorded.
+
+    Printed through :func:`couxobf.guard.Guard.report_lines` rather than
+    re-derived here: a report that recomputed what the guard did would be a
+    second answer to the same question, and the two drift.
+    """
+    from . import guard as _guard
+    obj = _guard.Guard(env_level=guard.get("env_guard", 0),
+                       dump_level=guard.get("dump_guard", 0),
+                       policy=guard.get("policy", "fail"),
+                       bound=tuple(guard.get("captured") or ()))
+    return ["", *obj.report_lines()]
 
 
 def _select_for_vm(module, classification) -> Set[int]:
@@ -204,10 +480,13 @@ def _select_for_vm(module, classification) -> Set[int]:
     return chosen
 
 
-def _collect_stats(module, classification, out: str, source: str) -> BuildStats:
+def _collect_stats(module, classification, out: str, source_size: int) -> BuildStats:
     from .vm import encode as _encode
 
-    stats = BuildStats(input_bytes=len(source.encode("utf-8", "surrogatepass")),
+    # ``source_size`` is the caller's, because the honest denominator for the
+    # growth ratio is what the user handed in -- not the comment-stripped text
+    # this pass happened to parse.
+    stats = BuildStats(input_bytes=source_size,
                        output_bytes=len(out.encode("utf-8", "surrogatepass")))
     # The classifier's own reason, not a guess: it is the thing that decided,
     # so it is the thing that can explain itself.  Reporting "not selected"
@@ -250,11 +529,78 @@ def cost_report(result: BuildResult) -> str:
     lines.append(f"input               : {s.input_bytes} bytes")
     lines.append(f"output              : {s.output_bytes} bytes "
                  f"({s.output_bytes / max(1, s.input_bytes):.1f}x)")
+    if s.hash_comments:
+        # Said out loud because the artifact was built from text that is not
+        # byte-identical to what was handed in; a report that hides which
+        # convention it accepted is a report that cannot be reproduced from.
+        lines.append(f"# comments stripped : {s.hash_comments}")
+    if s.budget_ceiling >= 1.0:
+        lines.append(f"size ceiling        : {s.budget_ceiling:.1f}x input")
+        if s.budget_trimmed:
+            lines.append("given up to fit     : "
+                         + ", ".join(s.budget_trimmed))
     lines.append(f"prototypes          : {s.prototypes}")
     lines.append(f"virtualized         : {s.virtualized}")
     lines.append(f"virtualization      : "
                  f"{VirtualizationLevel.parse(c.virtualization_level).name.lower()}")
-    lines.append(f"vm family           : {getattr(c.vm_family, 'value', c.vm_family)}")
+    # The config's answer, labelled as such: with more than one group the artifact
+    # carries families the request never named, and the group lines below are the
+    # ones that describe the file.
+    lines.append(f"vm family (config)  : {getattr(c.vm_family, 'value', c.vm_family)}")
+    for group in s.vm_groups:
+        fmt = group.get("format") or {}
+        lines.append(
+            "  vm %d              : %-10s %-14s %2d protos, %2d opcodes, "
+            "%dB op + %dB reg + %dB wide, targets %s, opcode cipher %s%s"
+            % (group.get("group", 0),
+               group.get("family", "?"),
+               group.get("dispatcher", "?"),
+               group.get("protos", 0),
+               group.get("opcodes", 0),
+               fmt.get("op_bytes", 1), fmt.get("reg_bytes", 1),
+               fmt.get("wide_bytes", 2),
+               fmt.get("target_mode", "abs"),
+               fmt.get("op_cipher", "none"),
+               ", %d fused" % len(fmt.get("fused") or [])
+               if fmt.get("fused") else ""))
+    guard = s.guard
+    if guard:
+        for line in _guard_report(guard):
+            lines.append(line)
+    lines.append("")
+    if s.fingerprint:
+        if s.fingerprint_bound:
+            lines.append(
+                "fingerprint           : %s -- the digest of this build's format\n"
+                "                        decisions.  The constant pool is authenticated\n"
+                "                        against it, so a pool lifted out of this artifact\n"
+                "                        does not open in another build." % s.fingerprint)
+        else:
+            lines.append(
+                "fingerprint           : %s -- the digest of this build's format\n"
+                "                        decisions, which bind nothing here: this build\n"
+                "                        has no virtualized prototype, so there is no\n"
+                "                        interpreter whose shape the pool could key to."
+                % s.fingerprint)
+    elif s.fingerprint_requested:
+        lines.append(
+            "fingerprint           : asked for, not produced.  Nothing was\n"
+            "                        virtualized, so no format decisions were drawn to\n"
+            "                        digest.  The pool is bound to the file name only,\n"
+            "                        so a pool from one build opens in another whose\n"
+            "                        config happens to match.")
+    else:
+        lines.append(
+            "fingerprint           : off.  The pool is bound to the file name only,\n"
+            "                        so a pool from one build opens in another whose\n"
+            "                        config happens to match.")
+    if s.pool_decoys:
+        lines.append(
+            "pool decoys           : %d planted among the real constants, encoded the\n"
+            "                        same way they are.  Telling them apart means\n"
+            "                        running the payload against the pool." % s.pool_decoys)
+    else:
+        lines.append("pool decoys           : none.  Every entry in the pool is referenced.")
     lines.append(f"elapsed             : {s.elapsed_ms:.1f} ms")
     lines.append("")
 
@@ -263,9 +609,8 @@ def cost_report(result: BuildResult) -> str:
     lines.append("1. Locate the interpreter.  Its local names come from the")
     lines.append("   build's identifier stream, so they differ per build.")
     if s.virtualized:
-        lines.append(f"2. Recover the opcode numbering.  {_opcode_count()} opcodes")
-        lines.append("   are permuted per build; the numbers are only meaningful")
-        lines.append("   inside this artifact.")
+        for line in _opcode_lines(s):
+            lines.append(line)
         lines.append("3. Decode the bytecode.  It is encrypted in the constant")
         lines.append("   pool, so the pool has to be decrypted first -- which")
         lines.append("   means recovering a key that is present in the file.")
@@ -321,3 +666,35 @@ def _opcode_count() -> int:
     """How many opcodes the VM permutes, for the report."""
     from .vm.isa import SUPPORTED
     return len(SUPPORTED)
+
+
+def _opcode_lines(s: "BuildStats") -> List[str]:
+    """Step 2 of the analyst's list, from what this build actually emitted.
+
+    It used to print ``len(SUPPORTED)`` -- "43 opcodes are permuted per build" --
+    which was true when every build carried one flat map.  With per-group
+    instruction sets the honest sentence names the interpreters, how many arms
+    each has, and whether the payload's numbers are disguised at all; a report
+    that described the tool's ISA instead of the artifact would be overstating
+    the work in one direction and understating it in two others.
+    """
+    groups = list(getattr(s, "vm_groups", None) or [])
+    arms = [int(g.get("opcodes") or 0) for g in groups] or [_opcode_count()]
+    ciphers = {str((g.get("format") or {}).get("op_cipher", "none"))
+               for g in groups}
+    disguised = ciphers - {"none"}
+    count = ("%d arms" % arms[0] if len(arms) == 1
+             else "%s or %d arms" % (", ".join(str(a) for a in arms[:-1]), arms[-1]))
+    lines = ["2. Recover the opcode numbering.  %d interpreter%s with %s,"
+             % (len(arms), "s" if len(arms) > 1 else "", count)]
+    lines.append("   permuted per build and meaningful only inside this")
+    lines.append("   artifact.")
+    if disguised:
+        lines.append("   The payload carries a disguised image of each number")
+        lines.append("   (%s), so a byte in the stream is not a selector:"
+                     % ", ".join(sorted(disguised)))
+        lines.append("   it has to be read through this build's reader first.")
+    else:
+        lines.append("   The opcode numbers appear in the payload as written --")
+        lines.append("   `opcode_cipher` is off, so nothing undoes them.")
+    return lines

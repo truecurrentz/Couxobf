@@ -209,7 +209,12 @@ def test_vm_family_flag_is_accepted(family):
         ["report", FIXTURE, "--seed", "1", "--min-nodes", "4",
          "--vm-family", family])
     assert code == EXIT_OK
-    assert f"vm family           : {family}" in out, out
+    assert f"vm family (config)  : {family}" in out, out
+    # The request and the artifact have to agree, not merely both be printed:
+    # group 0 runs the family the flag named.  (`vm_variety` gives the later
+    # groups different ones, which the group lines report in full.)
+    group0 = [l for l in out.splitlines() if l.strip().startswith("vm 0")][0]
+    assert family in group0, (family, group0)
 
 
 def test_vm_family_rejects_an_unknown_value(capsys):
@@ -235,7 +240,9 @@ def test_vm_family_shows_up_in_the_report():
         ["report", FIXTURE, "--seed", "1", "--min-nodes", "4",
          "--vm-family", "accumulator"])
     assert code == EXIT_OK
-    assert "vm family           : accumulator" in out
+    assert "vm family (config)  : accumulator" in out
+    assert any("accumulator" in l for l in out.splitlines()
+               if l.strip().startswith("vm 0")), out
 
 
 def test_vm_family_changes_the_output():

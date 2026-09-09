@@ -441,3 +441,191 @@ def test_protected_output_preserves_behaviour(path):
         original.stdout[:400], protected.stdout[:400],
         " | ".join(protected.stderr.splitlines()[:2])[:300],
     )
+
+
+# ---------------------------------------------------------------------------
+# decoy entries (Config.decoys, Config.decoy_constants)
+#
+# A decoy is a fully encoded pool entry that no instruction reaches.  These tests
+# are about the two ways that can fail to be true: the count drifting out of
+# control, and a "decoy" that is really just a duplicate of a live constant --
+# which the interner would have folded anyway, so the pool would claim noise it
+# does not have.
+# ---------------------------------------------------------------------------
+
+def _seed(tag: bytes) -> bytes:
+    """A 16-byte seed built from a short label, so each test is reproducible.
+
+    KeyMaterial wants the full build width; padding a short literal would be a
+    second way to be nondeterministic if the padding ever moved.
+    """
+    return (tag * 4)[:16]
+
+
+def _pool(seed: bytes, **kw) -> ConstantPool:
+    """A pool with a fixed seed, so a planting pattern is reproducible."""
+    return ConstantPool(KeyMaterial.from_seed(seed),
+                        make_domains(seed).get("constants"),
+                        b"decoy-build", **kw)
+
+
+REAL = [b"GetPartsC", 45.0, b"inventory", 3.25, b"total", 12.5, b"sku"]
+
+
+def test_no_decoys_leaves_the_pool_exactly_as_the_intererner_made_it():
+    pool = _pool(_seed(b"seed-0"))
+    slots = [pool.slot(v) for v in REAL]
+    assert pool.values == REAL
+    assert slots == list(range(1, len(REAL) + 1))
+    assert pool.decoys_planted == 0
+
+
+def test_decoys_are_planted_between_the_real_entries_not_after_them():
+    pool = _pool(_seed(b"seed-1"), decoys=10)
+    for v in REAL:
+        pool.slot(v)
+    values = pool.values
+    assert pool.decoys_planted > 0, "the budget was there and nothing was planted"
+    positions = [i for i, v in enumerate(values) if v not in REAL]
+    # Trailing-only noise is the shape that costs an analyst nothing: cut the tail
+    # and the pool is clean again.  A decoy inside the range the payload indexes is
+    # the one that has to be reasoned about.
+    assert min(positions) < len(REAL), (
+        f"every decoy is after the last live entry: {positions}")
+    assert positions != list(range(min(positions), min(positions) + len(positions))), (
+        f"the decoys are one contiguous block, which is a run to delete: {positions}")
+
+
+def test_a_decoy_is_a_real_constant_not_a_placeholder():
+    """Each one has to survive the same encode/decode round trip a live entry does.
+
+    A decoy that decodes to nil, or that the decoder cannot walk, is not noise --
+    it is a marker that says "the entries around me are the real ones".
+    """
+    pool = _pool(_seed(b"seed-2"), decoys=10)
+    for v in REAL:
+        pool.slot(v)
+    decoded = decode_pool(pool.plaintext())
+    assert len(decoded) == len(pool.values)
+    decoys = [v for v in decoded if v not in REAL]
+    assert decoys, decoded
+    for value in decoys:
+        assert value is not None and not isinstance(value, bool)
+        assert isinstance(value, (bytes, int, float)), value
+        if isinstance(value, (int, float)):
+            assert math.isfinite(value), f"{value!r} is a sentinel, not a constant"
+            assert abs(value) < 1e6, f"{value!r} is out of scale with the pool"
+        else:
+            assert 1 <= len(value) <= 24, value
+
+
+def test_a_decoy_never_duplicates_a_live_constant():
+    pool = _pool(_seed(b"seed-3"), decoys=24)
+    for v in REAL:
+        pool.slot(v)
+    seen = [pool._key_for(v) for v in pool.values]
+    assert len(seen) == len(set(seen)), "the pool holds the same value twice"
+
+
+def test_the_budget_is_a_ceiling_and_a_small_pool_spends_part_of_it():
+    """`decoy_constants` scales with the pool instead of padding small files.
+
+    A 7-constant pool asked for 200 decoys must not gain 200: a block of noise
+    much larger than the data is its own signature.  And the ceiling has to hold,
+    or the size cost of the option is not bounded.
+    """
+    small = _pool(_seed(b"seed-4"), decoys=200)
+    for v in REAL:
+        small.slot(v)
+    assert 0 < small.decoys_planted < len(REAL) * 2, small.decoys_planted
+
+    big = _pool(_seed(b"seed-5"), decoys=6)
+    for i in range(80):
+        big.slot(b"key%d" % i)
+        big.slot(float(i))
+    assert big.decoys_planted == 6, "the budget is a ceiling, not a rate"
+
+
+def test_the_same_seed_plants_the_same_pool():
+    """Everything about the artifact is a function of the seed; noise included.
+
+    Otherwise "reproduce this build" and "the decoys were different" cannot both be
+    true, and a regression test for the pool would have nothing to compare.
+    """
+    def build(seed):
+        pool = _pool(seed, decoys=8)
+        for v in REAL:
+            pool.slot(v)
+        return pool.plaintext()
+
+    seed = _seed(b"seed-6")
+    assert build(seed) == build(seed)
+    assert build(_seed(b"seed-7")) != build(seed)
+
+
+def test_sealing_reports_the_count_the_decoder_has_to_walk():
+    """`SealedPool.count` is what the runtime's index loop reads.
+
+    The decoder walks `count` entries, so a count that ignores the decoys would
+    stop mid-pool and every slot after the cut would be nil -- a silent wrong
+    answer rather than a failure.
+    """
+    pool = _pool(_seed(b"seed-8"), decoys=8)
+    for v in REAL:
+        pool.slot(v)
+    sealed = pool.seal()
+    assert sealed.count == len(pool.values) > len(REAL)
+    assert len(decode_pool(sealed.open_plaintext())) == sealed.count
+
+
+def test_the_slot_number_of_a_real_constant_is_its_position_in_the_pool():
+    """Decoys shift later slots; they must never shift an earlier one.
+
+    This is the one invariant a reader cannot recover from the artifact, so it is
+    the one worth writing down: every site that asked for slot 3 has to get the
+    value it interned, whatever noise was planted after it.
+    """
+    pool = _pool(_seed(b"seed-9"), decoys=12)
+    slots = {}
+    for v in REAL:
+        slots[v] = pool.slot(v)
+    decoded = decode_pool(pool.plaintext())
+    for value, slot in slots.items():
+        assert same_value(decoded[slot - 1], value), (value, slot)
+
+
+def test_the_context_binds_the_pool_to_a_build_and_nothing_else_does():
+    """The AAD is the whole of the "you cannot move a pool between builds" claim.
+
+    Two pools sealed with the same key material but different contexts must not open
+    in each other, and the ciphertext alone must not be enough to read a pool.  This
+    is what makes the build fingerprint (Config.fingerprint) worth a byte of the
+    header: the digest of the format decisions goes into the context here, so a pool
+    lifted into a build whose format differs fails authentication rather than
+    returning constants that belong to another artifact.
+    """
+    from couxobf.crypto.protected import open_ as open_pool
+
+    def sealed_with(context):
+        pool = _pool(_seed(b"bind"), decoys=0)
+        pool.context = context
+        for value in REAL:
+            pool.slot(value)
+        return pool.seal()
+
+    a = sealed_with(b"build-a")
+    b = sealed_with(b"build-b")
+    assert a.aad != b.aad
+    assert a.key == b.key, "same seed should give same key material"
+    # The *tag* is what changes, not the ciphertext: an additional authenticated
+    # data value authenticates the context, it does not decorrelate the keystream
+    # (which depends on key and nonce alone).  Same pool, same key, same nonce here
+    # -- so the ciphertexts match, and that is not a leak of anything an attacker
+    # did not already have.
+    assert a.tag != b.tag
+    # Opening your own pool works; opening it with the other build's AAD does not.
+    assert decode_pool(open_pool(a.key, a.nonce, a.ciphertext, a.tag, a.aad))
+    with pytest.raises(Exception):
+        open_pool(b.key, b.nonce, a.ciphertext, a.tag, b.aad)
+    with pytest.raises(Exception):
+        open_pool(a.key, a.nonce, a.ciphertext, a.tag, b.aad)

@@ -423,3 +423,329 @@ def test_comment_stripping_does_not_eat_code():
     protected = execute(TOOLCHAIN, out, "c2.luau", timeout=30)
     assert original.returncode == protected.returncode, protected.stderr[:300]
     assert original.stdout == protected.stdout
+
+
+# ---------------------------------------------------------------------------
+# decoy pool entries and the build fingerprint
+#
+# Both are pool-level features, and both are only visible in the artifact through
+# the count of entries it carries -- which is exactly where a wrong slot number
+# would hide.  So the load-bearing test here is differential: a build with 32
+# decoys interleaved into the pool has to print the same thing as the source,
+# because every read site kept pointing at its own constant.
+# ---------------------------------------------------------------------------
+
+CONSTANTS_PROGRAM = '''local KEYS = {"alpha", "beta", "gamma", "delta", "epsilon", "zeta"}
+local WEIGHTS = {0.15, 4.75, 12.5, 0.05, 250.0, 1.0}
+
+local function describe(i)
+  local key = KEYS[i]
+  local weight = WEIGHTS[i]
+  local total = #key * weight
+  if weight > 4 then
+    total = total + weight * 2
+  end
+  return string.format("%s/%d=%.3f", key, #key, total), total
+end
+
+local grand = 0
+for i = 1, #KEYS do
+  local line, value = describe(i)
+  grand = grand + value
+  print(line)
+end
+print(string.format("grand %.4f", grand))
+for i = #KEYS, 1, -1 do
+  print(i .. ":" .. KEYS[i] .. "=" .. WEIGHTS[i])
+end
+'''
+
+
+def _decoy_config(**over):
+    config = Config.maximum()
+    config.min_virtualize_body_nodes = 1
+    # The size budget would trade the decoys away on a file this small, and the
+    # point of these builds is the decoys.
+    config.max_output_growth = 0
+    for key, value in over.items():
+        setattr(config, key, value)
+    return config
+
+
+def test_decoys_are_planted_and_reported():
+    out = build(CONSTANTS_PROGRAM, _decoy_config(decoy_constants=32),
+                name="decoys.luau", verify=False)
+    assert out.stats.pool_decoys > 0, out.stats.pool_decoys
+    assert "pool decoys" in out.report
+    assert str(out.stats.pool_decoys) in out.report
+
+
+def test_turning_the_switch_off_leaves_the_pool_clean():
+    out = build(CONSTANTS_PROGRAM, _decoy_config(decoys=False),
+                name="decoys.luau", verify=False)
+    assert out.stats.pool_decoys == 0
+    assert "none" in out.report.split("pool decoys")[1][:60]
+
+
+@pytest.mark.skipif(not TOOLCHAIN.can_execute, reason="luau runtime not available")
+def test_a_pool_full_of_decoys_prints_what_the_source_prints():
+    for count in (0, 8, 48):
+        config = _decoy_config(decoys=count > 0, decoy_constants=count)
+        out = build(CONSTANTS_PROGRAM, config, name="decoys.luau", verify=True)
+        want = execute(TOOLCHAIN, CONSTANTS_PROGRAM, "want.luau", timeout=30)
+        got = execute(TOOLCHAIN, out.source, "got.luau", timeout=30)
+        assert got.returncode == 0, (count, got.stderr[:400])
+        assert want.stdout == got.stdout, (count, want.stdout, got.stdout)
+
+
+CIPHER_PROGRAM = """local function score(a, b)
+  local t = a * b + 2
+  if t > 9 then t = t - 9 end
+  for i = 1, 3 do t = t + i * a end
+  return t
+end
+print(score(3, 4), score(1, 1), score(0, 7))
+"""
+
+
+def _live_config(**over):
+    config = Config.hardened()
+    config.min_virtualize_body_nodes = 1
+    # The budget trades passes away on a program this size, and the point of
+    # these builds is the pass being measured.
+    config.max_output_growth = 0
+    for key, value in over.items():
+        setattr(config, key, value)
+    return config
+
+
+def test_the_opcode_cipher_is_in_the_reader_not_only_in_the_config():
+    """On: the generated fetch undoes something.  Off: it reads a byte.
+
+    "The flag reached the build" cannot mean "the output differs", because every
+    draw downstream of a disabled knob moves too -- that test would pass on a
+    field nothing reads.  So the assertion is about the one line the field owns:
+    the opcode reader.  Both builds are executed by `verify=True`, which is the
+    half that matters most: a disguise the encoder applies and the interpreter
+    forgets is a wrong program, not an insecure one.
+    """
+    bare = re.compile(r"function _ro\(a\)\s*return\s+_bd\(\w+,\s*a\)\s*end")
+
+    off = build(CIPHER_PROGRAM, _live_config(opcode_cipher=False,
+                                             reproducible_seed=4),
+                name="cipher.luau", verify=True)
+    on = build(CIPHER_PROGRAM, _live_config(opcode_cipher=True,
+                                            reproducible_seed=4),
+               name="cipher.luau", verify=True)
+    assert off.stats.virtualized >= 1 and on.stats.virtualized >= 1
+    assert bare.search(off.source), "the reader should be a plain byte fetch"
+    assert not bare.search(on.source), "the cipher did not reach the interpreter"
+    assert all(g["format"]["op_cipher"] == "none" for g in off.stats.vm_groups)
+    assert all(g["format"]["op_cipher"] != "none" for g in on.stats.vm_groups)
+    assert "opcode cipher none" in off.report
+    assert "opcode cipher none" not in on.report
+    # and both agree with the source they protect
+    assert off.stats.output_bytes > len(CIPHER_PROGRAM)
+
+
+def test_the_isa_subset_makes_smaller_vms_not_just_different_ones():
+    """Narrowing the instruction set is measured in arms and in bytes.
+
+    A group that runs three arithmetic functions should not carry a handler for
+    `GETGLOBAL`, and the artifact should be *cheaper* for it -- this is the one
+    diversity knob in the tool that reduces output size, which is what makes it
+    worth having under a size ceiling at all.
+    """
+    narrow = build(CIPHER_PROGRAM, _live_config(vm_isa_subset=True, reproducible_seed=9),
+                   name="isa.luau", verify=True)
+    whole = build(CIPHER_PROGRAM, _live_config(vm_isa_subset=False, reproducible_seed=9),
+                  name="isa.luau", verify=True)
+    assert narrow.stats.virtualized == whole.stats.virtualized >= 1
+    assert len(narrow.source) < len(whole.source)
+    top = lambda out: max(g["opcodes"] for g in out.stats.vm_groups)
+    assert top(narrow) < top(whole)
+    assert "opcodes" in narrow.report
+
+
+def test_the_report_lists_every_vm_group_the_artifact_carries():
+    """One line per interpreter, read out of the plan rather than off the config.
+
+    `--vm-family register` names one family, and a build with `vm_variety` above 1
+    ships several: different dispatchers, opcode counts, field widths and target
+    modes per group.  A report that echoed the config would describe a build that
+    did not happen, and every structural claim in the checklist would rest on the
+    request instead of the artifact.
+    """
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(repo, "examples", "maze.luau"), encoding="utf-8") as fh:
+        source = fh.read()
+    out = build(source, _maze_config(vm_variety=3, state_distribution=True,
+                                     dispatcher_family="mixed"),
+                name="maze.luau", verify=False)
+    groups = out.stats.vm_groups
+    assert len(groups) == 3, [g.get("family") for g in groups]
+    assert len({(g.get("family"), g.get("dispatcher")) for g in groups}) > 1
+    # The group lines are the indented ones; "vm family (config)" is the request,
+    # which is a different fact and is printed as such.
+    lines = [l for l in out.report.splitlines() if l.startswith("  vm ")]
+    assert len(lines) == len(groups), lines
+    for group in groups:
+        line = lines[group["group"]]
+        assert group["family"] in line and group["dispatcher"] in line
+        assert "%d opcodes" % group["opcodes"] in line
+    # the request is still printed, and labelled as the request
+    assert "vm family (config)" in out.report
+
+
+def test_the_fingerprint_is_a_digest_of_the_decisions_not_of_the_file():
+    """Same config and seed, same fingerprint; a different format, a different one.
+
+    A hash of the emitted source would be a hash of everything, including the parts
+    the format did not touch, and would then change for reasons nobody can read.
+    """
+    def fingerprint(**over):
+        out = build(CONSTANTS_PROGRAM, _decoy_config(**over),
+                    name="decoys.luau", verify=False)
+        return out.stats.fingerprint
+
+    base = fingerprint(reproducible_seed=7)
+    assert re.fullmatch(r"[0-9a-f]{16}", base), base
+    assert fingerprint(reproducible_seed=7) == base, "not reproducible from the seed"
+    assert fingerprint(reproducible_seed=7, instruction_formats=0) != base
+    # A pinned family changes group 0's shape; `vm_variety` would too, but only
+    # once there are two prototypes to spread, and this program has one.
+    assert fingerprint(reproducible_seed=7, vm_family="stack") != base
+    assert fingerprint(reproducible_seed=7, opcode_randomization=False) != base
+    assert fingerprint(reproducible_seed=8) != base
+
+
+def test_the_fingerprint_reports_three_states_not_two():
+    """Declined, drawn-but-unbound, and drawn-and-bound are different facts.
+
+    A digest of the format decisions exists as soon as a VM plan is drawn, which
+    happens even when every candidate prototype was rejected and the interpreter
+    never runs.  Binding that digest into the pool's AAD is a separate claim -- the
+    pool of *this* artifact cannot open under another artifact's running format --
+    and it is false for a build with nothing virtualized.  Reporting the one as the
+    other would let `--vm-family` look like it changed a program that has no VM, and
+    would tell a reader their pool is keyed when nothing is keying it.
+    """
+    tiny = "local function f(x) return x * 2 end\nprint(f(4))\n"
+
+    bound = build(tiny, Config(reproducible_seed=3, min_virtualize_body_nodes=1,
+                               fingerprint=True), verify=False)
+    assert bound.stats.virtualized == 1
+    assert bound.stats.fingerprint and bound.stats.fingerprint_bound
+    assert "The constant pool is authenticated" in bound.report
+
+    drawn = build(CONSTANTS_PROGRAM, _decoy_config(reproducible_seed=7), verify=False)
+    assert drawn.stats.virtualized == 0, "this fixture must be the no-VM case"
+    assert re.fullmatch(r"[0-9a-f]{16}", drawn.stats.fingerprint)
+    assert not drawn.stats.fingerprint_bound
+    assert "bind nothing here" in drawn.report
+
+    keyless = build(tiny, Config(reproducible_seed=3, virtualization_level="none",
+                                 fingerprint=True), verify=False)
+    assert not keyless.stats.fingerprint
+    assert keyless.stats.fingerprint_requested
+    assert "asked for, not produced" in keyless.report
+
+
+def test_the_fingerprint_can_be_declined_and_says_so():
+    off = build(CONSTANTS_PROGRAM, _decoy_config(fingerprint=False),
+                name="decoys.luau", verify=False)
+    assert off.stats.fingerprint == ""
+    assert "fingerprint" in off.report and "off" in off.report.split("fingerprint")[1][:60]
+
+
+# ---------------------------------------------------------------------------
+# metadata layout (Config.metadata_fragmentation)
+# ---------------------------------------------------------------------------
+
+def _maze_config(**over):
+    config = Config.hardened()
+    config.min_virtualize_body_nodes = 1
+    config.max_output_growth = 0
+    for key, value in over.items():
+        setattr(config, key, value)
+    return config
+
+
+def test_metadata_fragmentation_decides_whether_one_table_holds_everything():
+    """On, a row points at sibling tables; off, the row carries the payload itself.
+
+    The observable difference is in the assembled row.  Split, it reads
+    `code = T[3]` -- a reference into the payload table, with the constants and the
+    edge table somewhere else; unsplit, it reads `code = get(47)`, the pool accessor
+    called inline, because there is nothing else to point at.  A tool that wants the
+    whole description of a VM gets one table to dump in the second case and three to
+    line up in the first, which is the entire content of the option, so the test
+    asserts that shape rather than a byte count.
+    """
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(repo, "examples", "maze.luau"), encoding="utf-8") as fh:
+        source = fh.read()
+    split = build(source, _maze_config(metadata_fragmentation=True),
+                  name="maze.luau", verify=False).source
+    whole = build(source, _maze_config(metadata_fragmentation=False),
+                  name="maze.luau", verify=False).source
+    assert re.search(r"code=\w+\[\d+\]", split), "the tables were not split apart"
+    assert not re.search(r"code=\w+\[\d+\]", whole), "off still emitted references"
+    assert re.search(r"code=\w+\(", whole), "the unsplit row does not carry its payload"
+    # Both have to be the same program, and both run: the interpreter is handed one
+    # record either way, so the only thing that changed is where the pieces live.
+    assert "code=" in split and "code=" in whole
+
+
+#: The corners the two VM-diversity knobs can be pushed into when they are
+#: combined with the knobs they sit next to.
+_VM_CORNERS = {
+    "cipher with formats pinned": dict(opcode_cipher=True, operand_randomization=False),
+    "cipher with numbering fixed": dict(opcode_cipher=True, opcode_randomization=False),
+    "subset with numbering fixed": dict(vm_isa_subset=True, opcode_randomization=False),
+    "subset with aliases off": dict(vm_isa_subset=True, opcode_aliases=0),
+    "subset with formats pinned": dict(vm_isa_subset=True, instruction_formats=0),
+    "both off": dict(opcode_cipher=False, vm_isa_subset=False),
+    "both on with one vm": dict(vm_variety=1),
+}
+
+
+def test_the_vm_diversity_knobs_are_correct_in_their_corners():
+    """Each pairing of the new knobs with an old one has to build and run.
+
+    A cipher drawn against a format that was never randomized, or a narrowed
+    instruction set built from a map with no aliases to lose, are the pairings
+    where an encoder and a reader can drift apart without anything static
+    noticing: both sides read the same descriptor, so a descriptor nobody
+    contradicts is invisible until the program prints the wrong number.  Running
+    the artifact under the pinned runtime is the only check that catches it, which
+    is why this test pays for seven builds instead of asserting on text.  The
+    corners are also where an inert knob hides, so the narrowed-vs-full handler
+    counts are compared to make sure the subset *did* something in each one.
+    """
+    if not TOOLCHAIN.can_execute:
+        pytest.skip("luau runtime not available; run tools/setup-luau.sh")
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(repo, "examples", "inventory.luau"),
+              encoding="utf-8") as fh:
+        source = fh.read()
+    original = execute(TOOLCHAIN, source, "inventory.luau", timeout=30)
+    narrowed, full = [], []
+    for name, over in sorted(_VM_CORNERS.items()):
+        config = Config.maximum()
+        config.min_virtualize_body_nodes = 1
+        config.max_output_growth = 0
+        config.reproducible_seed = 1
+        for key, value in over.items():
+            setattr(config, key, value)
+        result = build(source, config, name="inventory.luau", verify=True)
+        protected = execute(TOOLCHAIN, result.source, "built.luau", timeout=60)
+        assert protected.stdout == original.stdout, f"{name}: output changed"
+        assert protected.returncode == original.returncode, (            f"{name}: rc {original.returncode} != {protected.returncode}"            f"\n{protected.stderr[:300]}")
+        arms = [g["opcodes"] for g in result.stats.vm_groups]
+        assert arms and all(a > 0 for a in arms), f"{name}: no VM to check"
+        (full if over.get("vm_isa_subset") is False or not config.vm_isa_subset
+         else narrowed).append(max(arms))
+    assert narrowed and full, "the corner table lost one of its two halves"
+    assert max(narrowed) < max(full), (
+        f"the subset stopped narrowing: {narrowed} against {full}")

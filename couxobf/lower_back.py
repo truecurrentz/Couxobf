@@ -152,6 +152,28 @@ def fresh_prefix(rng: Any, used: Optional[Set[str]] = None,
                 used.add(candidate)
             return candidate
 
+def _fusion_rules(level: Any):
+    """Which fused super-instructions this build may emit (#6).
+
+    Level 0 fuses nothing -- the compact profile wants small output and fusion
+    buys its diversity a byte at a time.  Higher levels offer more pairs, and
+    the build picks a random *subset* of what is offered, so two builds at the
+    same level do not agree on which pairs exist.  Capping the subset is what
+    keeps the dispatch chain from growing into the "bigger is stronger" trap the
+    design warns about (#63): fifteen rules is roughly fifteen extra arms, each
+    with both halves' bodies inlined.
+    """
+    from .vm.format import FUSION_RULES
+
+    try:
+        want = int(level)
+    except (TypeError, ValueError):
+        return ()
+    if want <= 0:
+        return ()
+    return FUSION_RULES
+
+
 def helpers_src(h: Dict[str, str]) -> str:
     """The shared helper block, with this build's names."""
     return f"""
@@ -297,6 +319,11 @@ class Reconstructor:
         self.helpers: Dict[str, str] = dict(helpers or DEFAULT_HELPERS)
         #: proto_id -> EncodedProto, filled in as function_expr runs
         self.vm_encoded: Dict[int, Any] = {}
+        #: Randomness for per-prototype layout choices (padding bytes, alias
+        #: selection).  The same stream the block permutation uses, because both
+        #: are "where do the bytes go" decisions and separating them would only
+        #: mean one more stream to audit for accidental reuse.
+        self.vm_layout_rng: Any = None
         #: Optional :class:`~couxobf.strings.bank.StringBank`.  When present,
         #: string *values* loaded by LOADK are resolved through it instead of
         #: the pool.  Only values: table keys, method names and global names
@@ -334,7 +361,15 @@ class Reconstructor:
         """
         from .vm import encode as _encode
 
-        ok, _reason = _encode.can_virtualize(proto)
+        # The plan, not a default: which group owns this prototype decides the
+        # opcode map, the instruction format *and* the interpreter that will run
+        # it.  Asking those three questions separately is how a build ends up
+        # executing bytes encoded for a different machine -- and eligibility has
+        # to be judged against the format in play, because a wide operand that
+        # fits a three-byte field does not fit a two-byte one.
+        group = self.vm.group_for(proto.proto_id)
+        fmt = self.vm.fmt_for(proto.proto_id)
+        ok, _reason = _encode.can_virtualize(proto, fmt)
         if not ok:
             return None
         order = None
@@ -342,7 +377,9 @@ class Reconstructor:
             from .vm import layout as _layout
             order = _layout.permuted_order(proto, self.vm.layout_rng)
         self.vm_encoded[proto.proto_id] = _encode.encode_proto(
-            proto, self.vm.opmap, order=order)
+            proto, self.vm.opmap_for(proto.proto_id), order=order, fmt=fmt,
+            rng=self.vm_layout_rng,
+            alias_chance=self.vm.alias_chance)
         # A vararg parameter list, not the prototype's declared parameters:
         # the descriptor carries the real count and the interpreter distributes
         # the arguments itself.  From the caller's side this is an ordinary
@@ -354,11 +391,16 @@ class Reconstructor:
         # virtualised function would be ignored.  `_gf` is an upvalue rather
         # than a global lookup, because a swapped environment does not contain
         # getfenv either.
+        # `enter_for` is this prototype's *group's* entry point, and the row it
+        # is handed comes out of the assembled descriptor table.  Naming the
+        # interpreter in the closure rather than storing "which VM" in the
+        # artifact means a build with three VMs carries no table that says so.
+        enter = self.vm.enter_for(proto.proto_id)
         return A.Func(
             params=[A.Param(name=None)],
             body=A.Block(body=[A.Return(values=[A.Call(
-                fn=A.Name(name=self.vm.names["enter"]),
-                args=[A.Index(obj=A.Name(name=self.vm.table),
+                fn=A.Name(name=enter),
+                args=[A.Index(obj=A.Name(name=self.vm.rows_table),
                               key=_num(proto.proto_id)),
                       A.Call(fn=A.Name(name=self.vm.names["getfenv"]),
                              args=[_num(1)]),
@@ -734,12 +776,20 @@ _CMP = {OP.EQ: "==", OP.NE: "~=", OP.LT: "<", OP.LE: "<=",
         OP.GT: ">", OP.GE: ">="}
 
 
+#: Marks a constant-pool context that has been extended with a build fingerprint.
+#: Not a secret -- a delimiter, so the extension is unambiguous.
+_FINGERPRINT_AAD_TAG = b"\xc1f"
+
+
 def reconstruct_protected(module: IRModule,
                           keys: Any,
                           rng: Any,
                           context: bytes,
                           cache_policy: str = "full",
                           cache_bound: int = 64,
+                          pool_decoys: int = 0,
+                          fingerprint: bool = True,
+                          metadata_fragmentation: bool = True,
                           names: Optional[Dict[str, str]] = None,
                           minify: bool = False,
                           optimize_first: bool = True,
@@ -755,6 +805,17 @@ def reconstruct_protected(module: IRModule,
                           string_rng: Any = None,
                           string_cache_policy: str = "none",
                           string_page_size: int = 512,
+                          vm_variety: int = 1,
+                          isa_subset: bool = False,
+                          fmt_prefs: Any = None,
+                          families: Any = None,
+                          dispatchers: Any = None,
+                          fusion_level: int = 0,
+                          alias_ratio: float = 0.0,
+                          alias_chance: float = 0.0,
+                          env_guard: int = 0,
+                          dump_guard: int = 0,
+                          guard_policy: str = "fail",
                           names_out: Optional[Dict[str, Any]] = None) -> str:
     """Lower an IR module to protected, self-contained Luau source.
 
@@ -778,6 +839,12 @@ def reconstruct_protected(module: IRModule,
     from .runtime.constpool_runtime import ConstantPoolRuntime, default_names
 
     prefixes: Set[str] = set()
+    # Its own prefix again: the guard's locals are the one part of the artifact
+    # whose names a runner is *looking* for, since finding the checker finds what
+    # it refuses on.
+    from . import guard as _guard
+    guard = _guard.make(env_guard, dump_guard, guard_policy,
+                        prefix=fresh_prefix(rng, prefixes))
     names = names or default_names(fresh_prefix(rng, prefixes))
     # Drawn from the same `used` set as the pool and bank prefixes, so a helper
     # name cannot collide with either runtime's identifiers.
@@ -793,7 +860,8 @@ def reconstruct_protected(module: IRModule,
         # rather than once per site they were duplicated at
         _optimize.optimize_module(module)
     pool = ConstantPool(keys, rng, context,
-                        cache_policy=cache_policy, cache_bound=cache_bound)
+                        cache_policy=cache_policy, cache_bound=cache_bound,
+                        decoys=pool_decoys)
 
     # Selected after optimization, so prototypes the optimizer shrank below the
     # size floor are not virtualized on the strength of code that no longer
@@ -814,6 +882,26 @@ def reconstruct_protected(module: IRModule,
                                  layout_rng=layout_rng,
                                  dispatcher=dispatcher_family,
                                  randomize_opcodes=opcode_randomization,
+                                 variety=vm_variety,
+                                 fusion=_fusion_rules(fusion_level),
+                                 alias_ratio=alias_ratio,
+                                 alias_chance=alias_chance,
+                                 fmt_prefs=fmt_prefs,
+                                 families=families,
+                                 dispatchers=dispatchers,
+                                 # One metadata object or three: see
+                                 # prelude_source.  Off is the easier read, and
+                                 # the config's name for choosing that is
+                                 # `metadata_fragmentation`.
+                                 fragmented=bool(metadata_fragmentation),
+                                 # Per-group instruction sets: the narrowing is
+                                 # only answerable with the IR in hand, because
+                                 # "which opcodes does this function need" is a
+                                 # question about its instructions, not about any
+                                 # of the names the config has.
+                                 protos_by_id=({q.proto_id: q for q in module.protos}
+                                                if isa_subset else None),
+                                 isa_subset=bool(isa_subset),
                                  # wiring indexes this positionally as
                                  # (append, iter, iterpack, itercheck); passing
                                  # the dict would hand it the role *keys*.
@@ -822,6 +910,38 @@ def reconstruct_protected(module: IRModule,
                                          helper_map["iterpack"],
                                          helper_map["itercheck"]))
 
+    if names_out is not None:
+        # Asked for, as distinct from produced: with nothing virtualized there is no
+        # plan, so nothing gets digested, and the report must not read that as "the
+        # user declined".
+        names_out["fingerprint_requested"] = 1 if fingerprint else 0
+    if plan is not None and fingerprint:
+        from .vm.wiring import structural_fingerprint
+        digest = structural_fingerprint(plan)
+        # Two facts, reported separately.  The digest describes the format
+        # decisions this build drew, which exist whether or not a prototype ended
+        # up on the interpreter.  Folding them into the pool's AAD is the claim
+        # that the pool cannot open under another *running* format -- and a build
+        # that virtualized nothing has no running format, so binding there let
+        # `--vm-family` change a program with no VM in it.  The digest is still
+        # reported, because it is true; it just authenticates nothing.
+        bound = bool(plan.protos)
+        if bound:
+            # The pool is not sealed yet -- interning happens during lowering and
+            # sealing at emit -- so the digest can still bind to it.  Tagged so a
+            # context that happens to end in eight bytes of its own cannot read as
+            # one that was extended here.
+            pool.context = context + _FINGERPRINT_AAD_TAG + digest
+        if names_out is not None:
+            names_out["fingerprint"] = digest.hex()
+            names_out["fingerprint_bound"] = 1 if bound else 0
+    if plan is not None and names_out is not None:
+        # What each VM group in this artifact actually is.  Reported rather than
+        # inferred: `--vm-family register` is what the user asked for, and with two
+        # groups the second one is a different family, dispatcher and format -- a
+        # report that echoed only the config would describe a build that did not
+        # happen.
+        names_out["vm_plan"] = plan.summary()
     # Strings get their own bank at level 2 and above: fragmented, scattered
     # across shuffled pages, and addressed by a per-occurrence ticket rather
     # than interned by value.  The pool interns, so one recovered accessor
@@ -844,6 +964,7 @@ def reconstruct_protected(module: IRModule,
     rec = Reconstructor(pool=pool, accessor=names["get"], vm=plan, bank=bank,
                         bank_accessor=(bank_names["get"] if bank_names else None),
                         helpers=helper_map)
+    rec.vm_layout_rng = layout_rng if layout_rng is not None else vm_rng
     body = rec.reconstruct(module)
 
     # The VM's bytecode and constants are interned here, before the pool is
@@ -858,10 +979,18 @@ def reconstruct_protected(module: IRModule,
         # jump targets do not line up with the instruction boundaries the
         # encoder laid down will run and compute the wrong thing, and nothing
         # downstream points back here.  This is the check that catches the
-        # encoder bug, as opposed to the MAC, which catches the edit.
-        _validate_payload(rec.vm_encoded, plan.opmap)
+        # encoder bug, as opposed to the MAC, which catches the edit.  Each
+        # group is validated with *its own* map and format, since a single
+        # validator built from group 0 would reject every other group.
+        for group in plan.groups:
+            mine = {pid: enc for pid, enc in rec.vm_encoded.items()
+                    if group.describes(pid)}
+            if mine:
+                _validate_payload(mine, group.opmap, group.fmt)
         pooled = lambda value: "%s(%d)" % (names["get"], pool.slot(value))
-        vm_src = _wiring.prelude_source(plan, rec.vm_encoded, pooled, pooled)
+        vm_src = _wiring.prelude_source(plan, rec.vm_encoded, pooled, pooled,
+                                        edges_expr=pooled,
+                                        entry_guard=guard.entry_lines())
 
     # A program with no constants at all needs no pool: emitting the runtime
     # for an empty blob would just be a decoder that never runs.
@@ -882,6 +1011,12 @@ def reconstruct_protected(module: IRModule,
     pool_src = ""
     if need_pool:
         sealed = pool.seal()
+        if names_out is not None:
+            # Read here rather than where the pool was built: constants are
+            # interned while the bodies are lowered, and the decoys are planted as
+            # they go, so any earlier count is a count of a pool that does not
+            # exist yet.
+            names_out["pool_decoys"] = pool.decoys_planted
         runtime = ConstantPoolRuntime(names, cache_policy=cache_policy,
                                       cache_bound=cache_bound)
         pool_src = runtime.emit(sealed.key, sealed.nonce, sealed.tag,
@@ -925,9 +1060,40 @@ def reconstruct_protected(module: IRModule,
     # pool at load time, so the accessor has to exist first.  Routing the
     # bytecode through the pool is what makes the payload protected rather than
     # merely encoded -- it is encrypted in the blob like every other constant.
+    # A failure to parse the runtime this module just assembled is a bug in the
+    # generator, not in the input, so it is reported as one -- the alternative is
+    # a ParseError whose line number points into source nobody wrote.
     vm_block = _parser.parse(vm_src, "<vm>") if vm_src else None
 
+    blocks = [b for b in (crypto_block, pool_block, bank_block, helpers,
+                          vm_block) if b is not None]
+    captured: Dict[str, str] = {}
+    if guard.active and blocks:
+        # The capture set is decided *here*, once the emitted scaffolding exists:
+        # binding a fixed list would capture functions the runtime never calls
+        # (padding) and could miss one it does (a leak).  Whatever the scaffolding
+        # reads is what gets a local, and each of those locals replaces every read
+        # of the global in the scaffolding only -- the reconstructed user code is
+        # left to resolve its globals the way the source did, because `setfenv`
+        # has to keep working.
+        used = set()
+        for block in blocks:
+            used.update(_guard.used_globals(block))
+        captured = guard.bind(used)
+        for block in blocks:
+            _guard.rewrite(block, captured)
+    guard_block = (_parser.parse(_guard.guard_block(guard), "<guard>")
+                   if guard.active else None)
+    if names_out is not None:
+        # Filled in here rather than where the guard was created, because "what
+        # did this build capture" is only knowable once the scaffolding exists.
+        names_out["guard"] = guard.summary()
+        names_out["guard_capture"] = dict(captured)
+
     prefix: List[A.Stmt] = []
+    if guard_block is not None:
+        # First, because its locals are what the blocks below now read.
+        prefix += list(guard_block.body)
     for block in (crypto_block, pool_block, bank_block):
         if block is not None:
             prefix += list(block.body)

@@ -133,15 +133,63 @@ class Config:
     mixed_execution: bool = True
 
     # ---- virtualization tuning ------------------------------------------
+    #: Permute the opcode numbering.  Off means "the canonical numbers", which
+    #: is weaker but makes two builds comparable byte for byte.
     opcode_randomization: bool = True
+    #: How many instructions per *number*: 0 is one number per opcode, 1 gives
+    #: some opcodes a second alias, 2 and 3 widen both the alias set and the
+    #: numbering space.  The count of numbers the dispatcher branches on is
+    #: thereby a build-time variable instead of a constant of the tool.
+    opcode_aliases: int = 1
+    #: Field widths, field order, padding and operand masks -- see
+    #: :mod:`couxobf.vm.format`.  This is the switch for "a devirtualizer
+    #: written against one artifact does not transfer to another".
     operand_randomization: bool = True
+    #: 0 keeps the historical layout, 1 mixes, 2 spends every knob.  A level
+    #: rather than a bool because the size cost is real and per-group.
+    instruction_formats: int = 1
+    #: How many distinct VMs one build emits.  Each group gets its own family,
+    #: dispatcher and format, so 2 means two interpreters in the artifact.
+    vm_variety: int = 1
+    #: Register fields are widened and masked.  A full register permutation is
+    #: not on the table: FORLOOP, CALL and SETLIST all address base+1, base+2,
+    #: base+3, so a sound permutation needs live-range splitting the lowerer
+    #: cannot provide.  Randomizing the *numbering* is available and is what
+    #: this does.
     register_randomization: bool = True
+    #: Fuse independent instruction pairs into super-instructions (#6).
     instruction_fusion: bool = True
+    #: Offer fused pairs as distinct opcodes, growing the handler set.
+    super_instructions: bool = True
     handler_splitting: bool = True
     dispatcher_family: DispatcherFamily = DispatcherFamily.MIXED
+    #: When several VMs are emitted, give each one a different dispatch shape
+    #: instead of drawing one shape for all of them.
     dispatcher_splitting: bool = True
-    super_instructions: bool = True
+    #: Protect jump targets by biasing or by relative offsets rather than raw
+    #: positions, so the numbers in the stream mean nothing without the format.
     pc_protection: bool = True
+    #: Disguise the opcode *number* in the payload: the dispatcher still branches
+    #: on the number its map assigned, but the stream carries a bijective image
+    #: of it (a rotation, an affine map, or a halves swap).  Costs no bytes -- it
+    #: is arithmetic on the fetch, not a wider field -- and it is what stops a
+    #: table of "byte 7 is ADD", recovered from one build and pointed at another.
+    #: Lives inside the instruction format, so it needs `operand_randomization`
+    #: on: with variety 0 `FormatSpec.draw` returns the historical format untouched
+    #: and there is no cipher field to draw.  `instruction_formats` then decides
+    #: how much the format -- and with it the choice of image -- is allowed to move.
+    opcode_cipher: bool = True
+    #: Give each VM group only the opcodes the prototypes on it actually use,
+    #: instead of the full instruction set with handlers nobody calls.  The
+    #: dispatcher shrinks per group, so the number of arms becomes a property of
+    #: the function; a build whose one VM runs three numeric helpers is not the
+    #: build that virtualized a table-heavy one.
+    vm_isa_subset: bool = True
+    #: Keep control-flow edges out of the instruction stream: the payload
+    #: carries an ordinal and the destinations live in their own blob.
+    edge_indirection: bool = False
+    #: Spread VM state across the families (accumulator/stack/register) rather
+    #: than one discipline for the whole build.
     state_distribution: bool = True
     call_frame_obfuscation: bool = True
 
@@ -156,6 +204,13 @@ class Config:
 
     # ---- data protection -------------------------------------------------
     string_protection_level: int = 2
+    #: How numbers are stored in the pool.  0 stores the double; 1 stores an
+    #: additively or multiplicatively disguised form; 2 also splits large
+    #: integers into two halves.  Every scheme is exact in Luau's float
+    #: semantics -- the point is that a decoder that only looks for
+    #: `string.unpack(">d")` sees nothing -- and NaN, signed zero and the
+    #: infinities stay on the exact path because no arithmetic encoding is safe
+    #: for them.
     numeric_protection_level: int = 1
     constant_protection_level: int = 2
     table_key_protection: bool = True
@@ -170,23 +225,77 @@ class Config:
     self_test: bool = True
 
     # ---- output shaping --------------------------------------------------
+    #: Dead-but-valid padding in the flattened dispatcher: 0 none, 1 a few
+    #: unreachable states, 2 more.  Bounded on purpose (#63) -- padding is a
+    #: fingerprint of its own once it dominates the artifact.
     junk_level: int = 1
+    #: Decoy constants in the pool and decoy opcodes in the dispatch chain.
+    #: Both are real entries that the program never uses, deliberately without a
+    #: recognisable pattern in which ones they are.
     decoys: bool = True
+    #: Number of decoy pool entries, per protected build.  Scales with the real
+    #: pool so a small file does not gain a conspicuous block of noise.
+    decoy_constants: int = 12
     metadata_fragmentation: bool = True
     identifier_polymorphism: bool = True
     fingerprint_reduction: bool = True
     minify: bool = False
     strip_types: bool = True
 
+    # ---- runtime guards --------------------------------------------------
+    #: Anti environment-logging: the artifact resolves its own runtime lookups
+    #: through a snapshot of the real environment rather than whatever `getfenv`
+    #: reports, and refuses to run if that environment has been given a logging
+    #: `__index`/`__newindex` pair.  0 off, 1 snapshot, 2 snapshot plus refusal.
+    env_guard: int = 1
+    #: Anti-dump: the payload is never held in a shape a dumper can print (no
+    #: decoded instruction table, no live bytecode for the virtualized
+    #: functions), and the guard refuses when the standard dump surfaces --
+    #: `string.dump`, `getbytecode`, `getscriptbytecode`, `debug.getinfo` --
+    #: have been replaced by something that is not what the runtime captured.
+    #: 0 off, 1 detect, 2 detect plus neutralise.
+    dump_guard: int = 1
+    #: When a guard fires: fail like any other invalid state (the default, and
+    #: indistinguishable from a corrupt payload), or keep running.  "ignore"
+    #: exists so the checks can be measured without a build dying on a machine
+    #: that legitimately has a hooked environment.
+    guard_policy: str = "fail"
+
     # ---- environment -----------------------------------------------------
+    #: Compile-check the emitted runtime against the Roblox API surface, and use
+    #: only globals Roblox actually provides.  It does not make the build run
+    #: Roblox code -- there is no runtime here to run it against, and pretending
+    #: otherwise would be the fake verification the design rules out.
     roblox_mode: bool = True
     debug_build: bool = False
+
+    # ---- source handling -------------------------------------------------
+    #: Tolerate `#`-style comments (and a `#!` shebang) on input by stripping
+    #: them before parsing, and guarantee the output carries no comments at all
+    #: -- not `#`, not `--`, not `--[[ ]]`.  Re-parsing after the strip is what
+    #: proves the strip did not cut through a string.
+    hash_comments: str = "auto"
+    #: Emit a build-specific structural fingerprint into the report and the
+    #: AAD, so our own tooling can recognise the format this build produced
+    #: without a marker string in the artifact itself.
+    fingerprint: bool = True
 
     # ---- determinism -----------------------------------------------------
     reproducible_seed: Optional[int] = None
 
     # ---- budgets ---------------------------------------------------------
-    max_output_growth: float = 8.0
+    #: Refuse to keep transformations whose cost is out of proportion.  The
+    #: pipeline enforces this by disabling the most expensive optional passes
+    #: and rebuilding, then reporting what it gave up -- rather than emitting a
+    #: 500x artifact and calling the user satisfied.
+    #:
+    #: 24 is not a guess at "how much bloat is fine": it is the measured cost of
+    #: the most aggressive profile (a maximum build of a small example runs
+    #: 12-16x), plus room for a file whose functions are mostly virtualizable.
+    #: A ceiling below that would quietly downgrade every maximum build, which
+    #: is worse than no ceiling at all, because the user asked for those passes.
+    #: 0 disables the check.
+    max_output_growth: float = 24.0
     max_vm_functions: int = 64
     min_virtualize_body_nodes: int = 12
 
@@ -199,8 +308,17 @@ class Config:
         self.max_vm_depth = max(0, min(3, int(self.max_vm_depth)))
         for name in ("control_flow_level", "string_protection_level",
                      "numeric_protection_level", "constant_protection_level",
-                     "chunking_level", "junk_level"):
-            setattr(self, name, max(0, min(3, int(getattr(self, name)))))
+                     "chunking_level", "junk_level", "opcode_aliases",
+                     "instruction_formats", "env_guard", "dump_guard",
+                     "decoy_constants"):
+            setattr(self, name, max(0, min(3, int(getattr(self, name)))
+                                    if name != "decoy_constants"
+                                    else max(0, int(getattr(self, name)))))
+        self.vm_variety = max(1, min(4, int(self.vm_variety)))
+        if self.guard_policy not in ("fail", "ignore"):
+            raise ValueError("guard_policy must be 'fail' or 'ignore'")
+        if self.hash_comments not in ("auto", "strip", "strict"):
+            raise ValueError("hash_comments must be auto, strip or strict")
         self.chunk_size = max(256, int(self.chunk_size))
         if self.reproducible_seed is not None:
             self.reproducible_seed = int(self.reproducible_seed)
@@ -210,6 +328,10 @@ class Config:
     def compact(cls) -> "Config":
         return cls(
             virtualization_level=VirtualizationLevel.NONE,
+            instruction_formats=0,
+            vm_variety=1,
+            opcode_aliases=0,
+            edge_indirection=False,
             control_flow_level=0,
             string_protection_level=1,
             numeric_protection_level=0,
@@ -222,6 +344,8 @@ class Config:
             super_instructions=False,
             instruction_fusion=False,
             handler_splitting=False,
+            opcode_cipher=False,
+            vm_isa_subset=False,
             minify=True,
         )
 
@@ -250,6 +374,14 @@ class Config:
             constant_protection_level=3,
             chunking_level=3,
             junk_level=2,
+            # Two VMs, every format knob, fused super-ops, indirect edges.  The
+            # price is stated in the report rather than hidden: roughly one
+            # extra interpreter.
+            vm_variety=2,
+            instruction_formats=2,
+            opcode_aliases=2,
+            edge_indirection=True,
+            decoy_constants=24,
         )
 
     PROFILES = ("compact", "balanced", "hardened", "maximum")
@@ -297,13 +429,36 @@ class Config:
         "block_permutation",
         "dispatcher_family",
         "opcode_randomization",
+        "opcode_aliases",
+        "operand_randomization",
+        "instruction_formats",
+        "vm_variety",
+        "register_randomization",
+        "instruction_fusion",
+        "super_instructions",
+        "pc_protection",
+        "opcode_cipher",
+        "vm_isa_subset",
+        "edge_indirection",
+        "state_distribution",
+        "dispatcher_splitting",
+        "metadata_fragmentation",
         "string_protection_level",
         "cache_policy",
         "bounded_cache_size",
+        "decoys",
+        "decoy_constants",
+        "control_flow_level",
+        "env_guard",
+        "dump_guard",
+        "guard_policy",
+        "hash_comments",
+        "fingerprint",
         "minify",
         "strip_types",
         "reproducible_seed",
         "max_vm_functions",
+        "max_output_growth",
         "min_virtualize_body_nodes",
     })
 
@@ -329,6 +484,12 @@ class Config:
         out: List[Tuple[str, Any]] = []
         for f in dataclasses.fields(self):
             if f.name in self.IMPLEMENTED:
+                continue
+            # A field that only the pass it belongs to would read is not a request
+            # for that pass: `chunk_size = 4096` next to `chunking_level = 0` names
+            # no unmet capability, and because the size has a legal minimum equal to
+            # its default there is no value of it that could ever mean "off".
+            if f.name == "chunk_size" and self.chunking_level <= 0:
                 continue
             value = getattr(self, f.name)
             off = self._off_value(f)

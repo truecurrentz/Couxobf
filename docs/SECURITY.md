@@ -62,21 +62,57 @@ Qualitative, and deliberately so. A "security percentage" would be a number
 with no referent: cost depends on the analyst's skill, tooling, and patience,
 none of which the build controls.
 
-### Control-flow flattening (implemented)
+### Virtualization and dispatch (implemented)
 
-Every prototype is lowered to a table-backed register file driven by a
-`while true do if pc == K then ... end` dispatcher. There are no lexical
-blocks, no visible loop structure, and no `if`/`else` nesting to read.
+A selected prototype is lowered to a register file driven by a generated
+interpreter, with no lexical blocks and no visible loop structure. Four state
+models (`register`, `accumulator`, `stack`, `hybrid`) and three dispatch shapes
+(`nested_if`, `decision_tree`, `bucket`) are drawn per VM group, and `vm_variety`
+means one artifact can hold two or three of them at once, each with its own opcode
+map, field widths, jump-target mode and handler fusion. Two more axes are per group
+as well: `vm_isa_subset` gives a VM only the operations its own protos were lowered
+to, and `opcode_cipher` stores a bijective image of the dispatcher's number in the
+bytecode, with the order of the dispatch arms drawn alongside it. The report prints
+one line per group so the claim is checkable rather than asserted, and the web
+result panel shows the same table, cipher included.
 
-**Cost added:** an analyst must reconstruct the CFG by hand before they can
-reason about the program at all. This is the single largest cost multiplier in
-the current build, because it attacks *structure*, which is what a human reads
-first.
+(The heading used to read "control-flow flattening". It was a misnomer: what is
+implemented is dispatch, not flattening -- there is no threaded code and no
+dispatcher state that outlives one instruction. `control_flow_level` feeds
+instruction reordering, which is real; graph flattening is not claimed.)
 
-**Cost not added:** the dispatcher is a linear `if`/`elseif` chain on a
-plaintext counter. Symbolically executing it, or just instrumenting the
-interpreter to log `pc`, recovers the CFG mechanically. This is
-straightforward to automate and someone will.
+**Cost added:** an analyst must reconstruct a CFG per group, under a numbering
+and an instruction geometry that exist only in this file, before they can reason
+about the program at all. A tool written against `nested_if` with 1-byte operands
+and absolute jump targets does not read a group that chose `decision_tree`, 2-byte
+operands and an edge table. A group that narrowed its instruction set also has
+fewer arms than the tool expects, and its payload numbers have to pass through
+that build's reader before they mean anything. This is the single largest cost
+multiplier in the current build, because it attacks *structure*, which is what a
+human reads first.
+
+**What that cost is, measured.** `tools/reuse-audit.py` builds the same program
+under several configurations, learns a "stored value means operation" table from
+each build the way a static tool would, and scores it against every other build.
+Across two seeds of `examples/maze.luau`: numbering transfers 12% of the time, the
+payload table 1%, instruction layout 0%, arm order 0%. A protector that varies
+nothing scores 100% on all four, which is what makes those numbers mean something.
+The measurement is one weak matcher over straight-line sweeps, so it is a floor on
+the analyst's work rather than a ceiling on it: the *number of handlers per group*
+does transfer (100%), because how many operations a function needs is a property
+of the function, not a secret.
+
+**Cost not added:** handler bodies are plain Luau, and permuting or re-encoding
+opcode *numbers* does not change what a handler does -- step 4 of the build report
+is unaffected by every setting in the tool. The `nested_if` shape is a linear
+`if`/`elseif` chain on a plaintext counter: after the reader decodes the field, the
+comparison is on an ordinary local, so instrumenting the interpreter to log that
+local recovers the execution order mechanically. The fetch itself is no longer
+`byte(code, pc)` written at the dispatch site -- it is a generated per-group reader
+whose offsets, widths and masks come from the same descriptor as the encoder, which
+means a grep for the fetch misses, and a recovered reader is per-group rather than
+one per artifact. `encoded_pc` would hide the program counter and is
+declared-but-not-read, so the report lists it as pending rather than pretending.
 
 ### Constant pool encryption (implemented)
 
@@ -95,9 +131,13 @@ longer says what it does with them.
 
 **Cost not added:** essentially none at runtime. The key is in the artifact --
 it has to be, or the program could not run -- so the blob is decryptable by
-anyone holding the file, with no execution required. And the plaintext is in
-the heap the moment any constant is read, so a single breakpoint on the
-accessor function dumps the entire pool.
+anyone holding the file, with no execution required. Decrypting it is a script,
+not a debug session; and the pool's *plaintext* is in the heap the moment a
+constant is read, so a breakpoint on the accessor yields that constant. What it
+no longer yields is the whole pool for free: one read gives one value, so
+enumerating means driving reads, and any build with `decoys` on will collect
+planted entries that the program never touches and cannot tell from the encoded
+form. That is a cost, not a barrier -- the blob as a whole is recoverable.
 
 Treat this as *removing the easy static signal*, not as confidentiality. That
 is a real and useful property; it is not secrecy. The distinction matters
@@ -120,11 +160,25 @@ structurally different output; the same source, seed and version produce
 byte-identical output.
 
 **Cost added:** defeats copy-paste analysis. A deobfuscator written against one
-build does not transfer to the next, and diffing two builds of the same source
-does not isolate the change.
+build does not transfer to the next -- see the measured transfer rates under
+*Virtualization and dispatch* above -- and diffing two builds of the same source
+does not isolate the change, because the diff is most of the file.
 
 **Cost not added:** nothing against an analyst working on the single build they
-care about, which is the usual case.
+care about, which is the usual case. Per-build variation is a *reusability* tax:
+it makes a tool, a script or a note expensive to write once and reuse, and it
+buys an attacker who intends to read one artifact a directory of the same file in
+a different order.
+
+Alongside the shape changes, a build digests its own format decisions -- the
+family, dispatcher, opcode count (each group's own narrowed set, not the published
+ISA) and instruction format of each group -- and folds
+that 8-byte digest into the constant pool's additional authenticated data. The
+digest is printed in the report, so a pool lifted out of one artifact fails
+authentication in another whose config happens to match, without anything in the
+file advertising that it is Couxobf output. A build with nothing virtualized
+reports the digest as drawn-but-unbound, because there would be no running format
+to key anything to.
 
 ## Known limitations
 
@@ -143,10 +197,49 @@ quietly reintroduced.
 readable Luau. A Luau-level VM cannot hide from a Luau-level debugger, because
 the debugger is running the same language.
 
-**Helpers are shared across prototypes.** `_kpack`, `_kunpk`, `_kiter`,
-`_kiterpack`, `_kitercheck`, `_kapp` appear once, with fixed shapes. They are
-immediately recognizable as scaffolding and are the obvious place to start
-reading. Diversifying them is on the roadmap and is not done yet.
+**Helpers are recognizable scaffolding.** The six runtime helpers used to be
+named `_kpack`, `_kunpk`, `_kiter`, `_kiterpack`, `_kitercheck` and `_kapp` in
+every artifact ever produced; their names are now drawn per build (a fixed string
+appearing a hundred-odd times is a signature by itself). What is unchanged: there
+is one implementation per operation, they are emitted as one statement, and their
+position in the file is decided by the emitter rather than by the build seed.
+Diversifying the implementations is on the roadmap and is not done (#23, #24).
+
+**The environment guard raises cost and prevents nothing.** `env_guard` and
+`dump_guard` capture the interesting library names at load and re-check five
+surfaces (`string.dump`, `getbytecode`, `getscriptbytecode`, `debug.getinfo`,
+`debug.gethook`) at every VM entry; at level 2 the build can neutralize a logging
+`__index` or refuse once a surface has been swapped. None of that is a boundary.
+A dumper that patches the in-memory proto never calls any of those functions; a
+hook installed before the artifact loads sees the capture happen; and a debugger
+runs the same language the guard is written in. The artifact's own report states
+what the guard captured and whether it tripped, because a build should not claim
+more than it did.
+
+**One pool and one bank per artifact.** Constant data lives in exactly two places
+-- the sealed pool and the string bank -- each authenticated as a whole. So the
+"single point of extraction" criticism is only half answered: there is one reader
+per interpreter for *code*, and one for *data* for the entire program. Per-VM-group
+pools, each keyed and AAD-bound to the format of the interpreter that reads it, are
+the next structural change and are not built; until then a dumper who recovers the
+pool accessor has every literal in the program, decoys included.
+
+**One function, one interpreter.** `vm_variety` gives a program several VMs and
+`vm_isa_subset` gives each one its own instruction set, but a prototype belongs to
+exactly one group. Nothing splits a single function across two VM families: that
+means moving a live frame -- registers, program counter, open upvalues, yield state
+-- between interpreters mid-function, which the lowering cannot express yet. The
+same missing prerequisite is why there is no per-region data representation and no
+run-time rescheduling of work between interpreters.
+
+**The string system varies its order, not its structure.** Fragments are packed
+into 512-byte pages with shuffled page order and per-occurrence tickets instead of
+ids, and each page's keystream is separately addressed. Page size is fixed -- it is
+a `StringBank` constructor argument constrained to multiples of 64, not a `Config`
+field, so there is no knob to advertise and no diversity to claim -- and there is
+one implementation of the bank reader. `chunking_level`, `numeric_protection_level`,
+`constant_protection_level` and `table_key_protection` are declared and reported
+pending.
 
 **Semantic fidelity constrains transformation.** The tool must preserve Luau
 semantics exactly, including observable error messages (user code matches on
@@ -170,6 +263,30 @@ Every claim above is checked by execution, not asserted:
   stops the runtime rather than yielding wrong constants.
 - `tests/test_luau_crypto.py` cross-checks the generated Luau crypto against
   Python's `hashlib`/`hmac` and a Python ChaCha20, in both directions.
+
+- `tests/test_reuse.py` runs `tools/reuse-audit.py` over a four-function program
+  and asserts what the audit measures: a `stable` configuration must transfer 100%
+  on all five metrics -- a positive control, so an audit that quietly stopped
+  extracting reads as perfect diversity and fails the suite instead -- while a
+  hardened build must transfer under 5% of its payload table, 0% of its
+  instruction layouts and 0% of its arm orders, with per-group handler counts that
+  differ from each other and stay stable across seeds.
+- `tests/test_guard.py` builds the same program at all three guard levels and
+  requires the same stdout from all of them, then runs it under a hostile
+  environment: a `_G` with a logging `__index`/`__newindex`, and `getbytecode`
+  swapped for a trapping stub mid-run. Level 0 prints and exits 0; level 2 with
+  `policy=fail` exits non-zero. A defence test that only inspects emitted text
+  would pass on a build that does nothing.
+- `tests/test_config.py` greps the tree for reads of every field in
+  `Config.IMPLEMENTED` and fails on a field nothing consumes; `tests/test_web.py`
+  renders the generated form against a stub DOM and fails if a live field is
+  missing from it or a pending one is present in it. Those two are what keep the
+  site's option list honest as the pipeline changes underneath it -- the grep is
+  on attribute reads, which is why `FormatPrefs.from_config` reads its fields as
+  attributes rather than through `getattr(config, "name", default)`.
+- The build report's own "requested but not applied" section is the artifact-level
+  view of the same rule, and `api/obfuscate.py` refuses to accept a pending
+  field. A claim and a knob have to be backed by a read.
 
 The conformance corpus has two documented exclusions, each replaced by a narrow
 test covering the behaviour it also exercises: `calls.luau` asserts on *which*
