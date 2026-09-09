@@ -251,8 +251,9 @@ class FormatSpec:
     #: bijective image of it, so the byte at an instruction's start is not the
     #: selector an analyst can tabulate.  Modes: ``none`` (the historical
     #: format), ``add`` (rotate through the number space), ``affine`` (rotate
-    #: after multiplying by a unit) and ``swap`` (exchange the field's halves).
-    #: Costs no bytes: it is arithmetic on the fetch, not a wider field.
+    #: after multiplying by a unit), ``swap`` (exchange the field's halves), and
+    #: ``pcadd`` (a per-instruction rotation keyed by the byte offset).  Costs no
+    #: bytes: it is arithmetic on the fetch, not a wider field.
     op_cipher: str = "none"
     #: The additive half of ``add``/``affine``, and the multiplier of ``affine``.
     #: ``op_mult_inv`` is its inverse mod :attr:`op_modulus`, computed once at
@@ -260,6 +261,9 @@ class FormatSpec:
     op_bias: int = 0
     op_mult: int = 1
     op_mult_inv: int = 1
+    #: Extra multiplier for pc-keyed opcode images.  The position is the Luau
+    #: byte index (one-based), so Python callers pass ``instr_start + 1``.
+    op_pos_mult: int = 0
     #: Non-zero permutes the handler arms by a hash of their numbers.  Every arm
     #: matches on a disjoint set of numbers, so the order they are tested in is
     #: free -- and leaving it fixed made "the arm at position 3 is LOADK" a fact
@@ -446,7 +450,18 @@ class FormatSpec:
         base = 1 << self.op_swap_bits
         return (value % base) * base + (value // base)
 
-    def encode_op(self, number: int) -> int:
+    def op_tweak(self, position: int) -> int:
+        """Per-instruction opcode rotation for pc-keyed images.
+
+        ``position`` is one-based, matching the value the Luau reader receives.
+        The result lives in the same 1..mod number space as the opcode image, so
+        the stored field still never becomes zero.
+        """
+        if self.op_cipher != "pcadd":
+            return 0
+        return (int(position) * int(self.op_pos_mult or 1) + self.op_bias) % self.op_modulus
+
+    def encode_op(self, number: int, position: int = 1) -> int:
         """The value to write into the stream for dispatcher number ``number``."""
         mod = self.op_modulus
         if self.op_cipher == "none":
@@ -460,9 +475,11 @@ class FormatSpec:
             # a hand-built FormatSpec cannot be self-contradictory the way a
             # shared formula with a leftover multiplier would be.
             return (number - 1 + self.op_bias) % mod + 1
+        if self.op_cipher == "pcadd":
+            return (number - 1 + self.op_tweak(position)) % mod + 1
         return ((number - 1) * self.op_mult + self.op_bias) % mod + 1
 
-    def decode_op(self, stored: int) -> int:
+    def decode_op(self, stored: int, position: int = 1) -> int:
         """The dispatcher number a stored value corresponds to.  Exact inverse."""
         if self.op_cipher == "none":
             return stored
@@ -471,9 +488,11 @@ class FormatSpec:
             return self.swap_op(stored)
         if self.op_cipher == "add":
             return (stored - 1 - self.op_bias) % mod + 1
+        if self.op_cipher == "pcadd":
+            return (stored - 1 - self.op_tweak(position)) % mod + 1
         return ((stored - 1 - self.op_bias) * self.op_mult_inv) % mod + 1
 
-    def op_decode_expr(self, value: str) -> str:
+    def op_decode_expr(self, value: str, position: str = "1") -> str:
         """Luau for :meth:`decode_op`, over an expression, for the generated reader."""
         if self.op_cipher == "none":
             return value
@@ -486,6 +505,10 @@ class FormatSpec:
                 base, base, base, base)
         if self.op_cipher == "add":
             return "((%s - 1 - %d) %% %d) + 1" % (value, self.op_bias, self.op_modulus)
+        if self.op_cipher == "pcadd":
+            tweak = "((%s * %d + %d) %% %d)" % (
+                position, self.op_pos_mult or 1, self.op_bias, self.op_modulus)
+            return "((%s - 1 - %s) %% %d) + 1" % (value, tweak, self.op_modulus)
         return "(((%s - 1 - %d) * %d) %% %d) + 1" % (
             value, self.op_bias, self.op_mult_inv, self.op_modulus)
 
@@ -511,6 +534,7 @@ class FormatSpec:
             "fused": [r.name for r in self.fused],
             "reorder": self.reorder,
             "arm_seed": self.arm_seed,
+            "op_pos_mult": self.op_pos_mult,
         }
 
 
@@ -543,10 +567,10 @@ def reader_source(fmt: FormatSpec, code_var: str,
         fetch = "_bd(%s, a) + _bd(%s, a + 1) * 256" % (code_var, code_var)
     if fmt.op_cipher == "swap":
         lines.append("local function _ro(a) local v = %s return %s end"
-                     % (fetch, fmt.op_decode_expr("v")))
+                     % (fetch, fmt.op_decode_expr("v", "a")))
     else:
         lines.append("local function _ro(a) return %s end"
-                     % fmt.op_decode_expr(fetch))
+                     % fmt.op_decode_expr(fetch, "a"))
     if fmt.reg_bytes == 1:
         lines.append(f"local function _r8(a) return _bd({code_var}, a) end")
     else:
@@ -765,11 +789,14 @@ def draw(rng: Optional[Rng], prefs: Optional[FormatPrefs] = None, *,
     # randomizing its format at all, which is what `variety` above means.
     cipher = "none"
     op_bias = op_mult = op_mult_inv = 0
+    op_pos_mult = 0
     if prefs.allow_op_cipher:
-        cipher = rng.choice(("add", "affine", "swap"))
+        cipher = rng.choice(("add", "affine", "swap", "pcadd"))
         mod = (1 << (8 * op_bytes)) - 1
         if cipher != "swap":
             op_bias = rng.randint(1, mod - 1)
+        if cipher == "pcadd":
+            op_pos_mult = rng.randint(1, mod - 1)
         if cipher == "affine":
             # A multiplier has to be a unit mod `mod`, or the map is not a
             # bijection and two opcodes could share a stored byte.
@@ -805,6 +832,7 @@ def draw(rng: Optional[Rng], prefs: Optional[FormatPrefs] = None, *,
         op_bias=op_bias,
         op_mult=op_mult or 1,
         op_mult_inv=op_mult_inv or 1,
+        op_pos_mult=op_pos_mult,
         arm_seed=arm_seed,
         reg_bytes=reg_bytes,
         wide_bytes=wide_bytes,

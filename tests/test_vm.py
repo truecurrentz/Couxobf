@@ -869,10 +869,11 @@ def test_opcode_randomization_changes_the_numbering():
 def _cipher_spec(cipher: str, op_bytes: int = 1) -> FormatSpec:
     mod = (1 << (8 * op_bytes)) - 1
     return FormatSpec(op_bytes=op_bytes, op_cipher=cipher, op_bias=37,
-                      op_mult=7, op_mult_inv=pow(7, -1, mod))
+                      op_mult=7, op_mult_inv=pow(7, -1, mod),
+                      op_pos_mult=13)
 
 
-@pytest.mark.parametrize("cipher", ("none", "add", "affine", "swap"))
+@pytest.mark.parametrize("cipher", ("none", "add", "affine", "swap", "pcadd"))
 @pytest.mark.parametrize("op_bytes", (1, 2))
 def test_the_cipher_is_a_bijection_over_the_number_space(cipher, op_bytes):
     """Every number survives, none lands on 0, and 0 is never produced.
@@ -888,7 +889,8 @@ def test_the_cipher_is_a_bijection_over_the_number_space(cipher, op_bytes):
     stored = [fmt.encode_op(n) for n in range(1, mod + 1)]
     assert len(set(stored)) == mod, "not injective"
     assert all(1 <= v <= mod for v in stored), "image leaves 1..mod"
-    assert all(fmt.decode_op(fmt.encode_op(n)) == n for n in range(1, mod + 1))
+    assert all(fmt.decode_op(fmt.encode_op(n, 19), 19) == n
+               for n in range(1, mod + 1))
     if cipher != "none":
         # The number space excludes 0 by construction, so a cipher that could
         # produce it would be a bug: the reader would treat a payload overrun as
@@ -900,7 +902,7 @@ def test_the_cipher_is_a_bijection_over_the_number_space(cipher, op_bytes):
 
 
 @pytest.mark.skipif(not TOOLCHAIN.can_execute, reason="luau runtime unavailable")
-@pytest.mark.parametrize("cipher", ("none", "add", "affine", "swap"))
+@pytest.mark.parametrize("cipher", ("none", "add", "affine", "swap", "pcadd"))
 @pytest.mark.parametrize("op_bytes", (1, 2))
 def test_the_emitted_reader_decodes_what_the_encoder_wrote(cipher, op_bytes):
     """Two implementations of a decoder have to be compared by running them.
@@ -915,7 +917,8 @@ def test_the_emitted_reader_decodes_what_the_encoder_wrote(cipher, op_bytes):
     fmt = _cipher_spec(cipher, op_bytes)
     numbers = list(range(1, min(fmt.op_modulus, 255) + 1))
     payload = b"".join(struct.pack("<H" if op_bytes == 2 else "<B",
-                                   fmt.encode_op(n)) for n in numbers)
+                                   fmt.encode_op(n, 1 + i * op_bytes))
+                       for i, n in enumerate(numbers))
     lines = ["local _bd = string.byte", "local t = {}"]
     for i, byte in enumerate(payload, 1):
         lines.append("t[%d] = string.char(%d)" % (i, byte))

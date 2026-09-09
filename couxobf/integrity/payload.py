@@ -203,7 +203,7 @@ class _FormatReader:
             raw = code[at]
         else:
             raw = code[at] + code[at + 1] * 256
-        return self.fmt.decode_op(raw)
+        return self.fmt.decode_op(raw, at + 1)
 
     def body_at(self, op: str, code: bytes, at: int, key) -> int:
         """The raw integer in one operand field, before masks are undone."""
