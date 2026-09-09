@@ -1,10 +1,10 @@
-"""The four VM families: where operands live while an instruction executes.
+"""The VM families: where operands live while an instruction executes.
 
-``Config.vm_family`` has promised these for a while and only ``REGISTER``
-existed.  This is the other three.
+``Config.vm_family`` first promised register/stack/accumulator/hybrid machines;
+polymorphic mode now also has ``woven``, a per-build mix inside one interpreter.
 
 Being precise about what differs, because the distinction matters and an
-overclaim here would be worse than the gap: **all four share one encoding.**
+overclaim here would be worse than the gap: these families share one encoding.
 The bytecode is three-address and register-indexed in every family; what
 changes is the *execution machinery* -- how a value travels from its source to
 its destination, and what state the interpreter carries to do it.
@@ -132,6 +132,71 @@ def _hybrid(acc: str, stack: str, sp: str) -> Family:
                   store, binary, unary)
 
 
+def _woven(acc: str, stack: str, sp: str, salt: str) -> Family:
+    """A per-build mixture of all operand disciplines inside one interpreter.
+
+    This is not a fake family: each operation really moves values through a
+    different live path selected from the build's names.  The destination value is
+    identical, but a devirtualizer can no longer classify one interpreter as
+    "the stack VM" or "the register VM" and apply one transfer rule globally.
+    """
+
+    def pick(*parts: str) -> int:
+        h = 2166136261
+        for ch in "|".join((salt, *parts)):
+            h = ((h ^ ord(ch)) * 16777619) & 0xffffffff
+        return h % 4
+
+    def store(dst: str, value: str) -> List[str]:
+        mode = pick("store", dst, value)
+        if mode == 0:
+            return [f"{dst} = {value}"]
+        if mode == 1:
+            return [f"{acc} = {value}", f"{dst} = {acc}"]
+        if mode == 2:
+            return [f"{sp} = {sp} + 1", f"{stack}[{sp}] = {value}",
+                    f"{dst} = {stack}[{sp}]", f"{sp} = {sp} - 1"]
+        return [f"{acc} = {value}", f"{sp} = {sp} + 1",
+                f"{stack}[{sp}] = {acc}", f"{dst} = {stack}[{sp}]",
+                f"{sp} = {sp} - 1"]
+
+    def binary(dst: str, x: str, y: str, sym: str) -> List[str]:
+        mode = pick("binary", dst, x, y, sym)
+        if mode == 0:
+            return [f"{dst} = {x} {sym} {y}"]
+        if mode == 1:
+            return [f"{acc} = {x} {sym} {y}", f"{dst} = {acc}"]
+        if mode == 2:
+            return [
+                f"{sp} = {sp} + 1", f"{stack}[{sp}] = {x}",
+                f"{sp} = {sp} + 1", f"{stack}[{sp}] = {y}",
+                f"local sb = {stack}[{sp}]", f"{sp} = {sp} - 1",
+                f"local sa = {stack}[{sp}]",
+                f"{stack}[{sp}] = sa {sym} sb",
+                f"{dst} = {stack}[{sp}]", f"{sp} = {sp} - 1",
+            ]
+        return [f"{acc} = {x} {sym} {y}", f"{sp} = {sp} + 1",
+                f"{stack}[{sp}] = {acc}", f"{dst} = {stack}[{sp}]",
+                f"{sp} = {sp} - 1"]
+
+    def unary(dst: str, wrap: Callable[[str], str]) -> List[str]:
+        mode = pick("unary", dst)
+        if mode == 0:
+            return [f"{dst} = {wrap('__X__')}"]
+        if mode == 1:
+            return [f"{acc} = {wrap('__X__')}", f"{dst} = {acc}"]
+        if mode == 2:
+            return [f"{sp} = {sp} + 1", f"{stack}[{sp}] = __X__",
+                    f"{stack}[{sp}] = {wrap(stack + '[' + sp + ']')}",
+                    f"{dst} = {stack}[{sp}]", f"{sp} = {sp} - 1"]
+        return [f"{acc} = {wrap('__X__')}", f"{sp} = {sp} + 1",
+                f"{stack}[{sp}] = {acc}", f"{dst} = {stack}[{sp}]",
+                f"{sp} = {sp} - 1"]
+
+    return Family("woven", [f"local {acc}", f"local {stack}, {sp} = {{}}, 0"],
+                  store, binary, unary)
+
+
 def family(name: str, names: Dict[str, str]) -> Family:
     """Build a family, using the build's own identifier names.
 
@@ -147,10 +212,13 @@ def family(name: str, names: Dict[str, str]) -> Family:
         return _stack(names["stack"], names["sp"])
     if key == "hybrid":
         return _hybrid(names["acc"], names["stack"], names["sp"])
+    if key == "woven":
+        return _woven(names["acc"], names["stack"], names["sp"],
+                      names.get("code", "woven"))
     raise ValueError(f"unknown VM family {name!r}")
 
 
-FAMILIES = ("register", "accumulator", "stack", "hybrid")
+FAMILIES = ("register", "accumulator", "stack", "hybrid", "woven")
 
 
 def substitute(lines: List[str], source_expr: str) -> List[str]:

@@ -685,7 +685,7 @@ def test_families_generate_different_interpreters():
     assert "local" not in texts["register"].split("while true do")[0].split("\n")[-1] \
         or True  # register has no extra state; the others must
     for fam, marker in (("accumulator", "acc"), ("stack", "stack"),
-                        ("hybrid", "acc")):
+                        ("hybrid", "acc"), ("woven", "acc")):
         plan = wiring.make_plan(rngmod.make_domains(b"\xcc" * 16).get("vm"),
                                 {1}, family=fam)
         assert plan.names[marker] in texts[fam], (

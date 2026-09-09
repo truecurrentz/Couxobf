@@ -407,7 +407,7 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         # family/dispatcher menus.  On means use a best-of blend: hybrid first,
         # then the other state machines, with every dispatcher shape available
         # to split across groups.  Off keeps the pinned values for debugging.
-        families=(("hybrid", "stack", "accumulator", "register")
+        families=(("woven", "hybrid", "stack", "accumulator", "register")
                   if config.vm_polymorphism else (getattr(config.vm_family, "value", config.vm_family),)),
         dispatchers=(tuple(_vm_runtime.DISPATCHERS)
                      if config.vm_polymorphism else _dispatcher_rotation(config.dispatcher_family)),

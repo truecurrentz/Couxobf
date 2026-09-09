@@ -52,7 +52,7 @@ class VirtualizationLevel(enum.IntEnum):
 class VMFamily(enum.Enum):
     """The shape of the VM's state machine.
 
-    All four execute the same instruction set semantics; they differ in where
+    Each family executes the same instruction set semantics; they differ in where
     operands live, which changes the interpreter's shape enough that a
     deobfuscator written for one does not transfer to the others.
     """
@@ -61,6 +61,7 @@ class VMFamily(enum.Enum):
     STACK = "stack"
     ACCUMULATOR = "accumulator"
     HYBRID = "hybrid"
+    WOVEN = "woven"
 
     @classmethod
     def parse(cls, value: Any) -> "VMFamily":

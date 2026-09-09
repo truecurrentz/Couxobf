@@ -36,9 +36,9 @@ const SPEC = [
       ["max_vm_functions", "Max virtualized functions", "int",
        "A cap, not a target. 0 means no limit."],
       ["vm_polymorphism", "Polymorphic VM", "bool",
-       "One best-mode switch: blends hybrid/register/stack/accumulator state with " +
-       "nested, bucket, decision-tree, computed-state and threaded dispatch. Turn it " +
-       "off only for debugging a simpler single-family VM."],
+       "One best-mode switch: blends woven/hybrid/register/stack/accumulator data " +
+       "paths with nested, bucket, decision-tree, computed-state and threaded " +
+       "dispatch. Turn it off only for debugging a simpler single-family VM."],
       ["vm_variety", "VMs per artifact", "int",
        "Distinct interpreters in one artifact. In polymorphic mode this is a floor; " +
        "the build uses multiple architectures when enough functions are available."],
@@ -139,25 +139,14 @@ const SPEC = [
        "own library lookups become chunk locals, so an __index logger does not see " +
        "them at all."],
       ["dump_guard", "Anti dump", "select",
-       "Checks the surfaces a dumper replaces -- string.dump, getbytecode, " +
-       "getscriptbytecode, debug.getinfo -- and, at 2, the hook state."],
+       "Checks Luau and executor-style dump/introspection surfaces -- debug.info, " +
+       "debug.getconstants/protos/upvalues, string.dump, getgc, hookfunction, " +
+       "getbytecode/saveinstance -- and, at 2, refuses before plaintext access."],
       ["guard_policy", "When a guard fires", "select",
        "`fail` refuses the same way a corrupt payload does, so the trip is not a " +
        "message that names the check. `ignore` keeps running, which is how you " +
        "measure the checks on a machine that legitimately has a hooked " +
        "environment."],
-    ],
-  },
-  {
-    id: "noise",
-    title: "Padding and integrity",
-    help: "Dead-but-valid code, bounded on purpose: padding that dominates the " +
-          "artifact is a fingerprint of its own. Integrity checking always runs -- " +
-          "each payload authenticates its own header, opcode map and instruction " +
-          "count -- but the fields that would let you choose how far to take it " +
-          "(integrity_level, self_test, encoded_pc) are declared and not applied, " +
-          "and this page lists them as such after a build.",
-    fields: [
     ],
   },
   {
