@@ -125,6 +125,12 @@ class BuildStats:
     budget_trimmed: List[str] = field(default_factory=list)
     #: What the environment/dump guard ended up doing, from the build itself.
     guard: Dict[str, Any] = field(default_factory=dict)
+    #: The build's structural fingerprint: a digest of the per-group format
+    #: decisions, which the constant pool is also authenticated against.
+    fingerprint: str = ""
+    #: Decoy constants planted in the pool, counted at seal time so it reflects the
+    #: pool the artifact carries rather than the budget it was given.
+    pool_decoys: int = 0
 
 
 @dataclass
@@ -349,6 +355,10 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         cache_policy=str(getattr(config.cache_policy, "value",
                                  config.cache_policy)),
         cache_bound=config.bounded_cache_size,
+        # Decoys are the pool's, so the count is too: `decoys` is the switch and
+        # `decoy_constants` the budget, and both are read nowhere else.
+        pool_decoys=(int(config.decoy_constants) if config.decoys else 0),
+        fingerprint=bool(config.fingerprint),
         minify=config.minify,
         vm_level=config.virtualization_level,
         vm_rng=domains.get("vm"),
@@ -396,6 +406,8 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
 
     stats = _collect_stats(module, classification, out, source_size)
     stats.guard = dict(runtime_names.get("guard") or {})
+    stats.fingerprint = str(runtime_names.get("fingerprint") or "")
+    stats.pool_decoys = int(runtime_names.get("pool_decoys") or 0)
     stats.elapsed_ms = (time.perf_counter() - started) * 1000.0
 
     # The emitted helper names, so helper uniqueness is checked against what
@@ -514,6 +526,25 @@ def cost_report(result: BuildResult) -> str:
     if guard:
         for line in _guard_report(guard):
             lines.append(line)
+    lines.append("")
+    if s.fingerprint:
+        lines.append(
+            "fingerprint           : %s -- the digest of this build's format\n"
+            "                        decisions.  The constant pool is authenticated\n"
+            "                        against it, so a pool lifted out of this artifact\n"
+            "                        does not open in another build." % s.fingerprint)
+    else:
+        lines.append(
+            "fingerprint           : off.  The pool is bound to the file name only,\n"
+            "                        so a pool from one build opens in another whose\n"
+            "                        config happens to match.")
+    if s.pool_decoys:
+        lines.append(
+            "pool decoys           : %d planted among the real constants, encoded the\n"
+            "                        same way they are.  Telling them apart means\n"
+            "                        running the payload against the pool." % s.pool_decoys)
+    else:
+        lines.append("pool decoys           : none.  Every entry in the pool is referenced.")
     lines.append(f"elapsed             : {s.elapsed_ms:.1f} ms")
     lines.append("")
 

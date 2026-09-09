@@ -144,6 +144,40 @@ class VMPlan:
         } for g in self.groups]
 
 
+def structural_fingerprint(plan: "VMPlan") -> bytes:
+    """A short digest of what this build decided about its own format.
+
+    Not a hash of the artifact: a hash of the *decisions* -- family, dispatcher,
+    opcode count and instruction format per group -- so the same config and seed
+    reproduce it and a single changed field does not.
+
+    Two uses, both of them ours.  It goes into the constant pool's additional
+    authenticated data, so a pool lifted out of one build fails to open in another
+    even when the config looks the same; and it goes into the report, which is how
+    our own tooling recognises the format a build produced without a marker string
+    sitting in the artifact for somebody to find and delete.
+
+    It is not a tamper seal.  Everything it digests is already visible in the
+    emitted code, so an attacker who wants a matching fingerprint changes the build
+    and recomputes it.  What it buys is that the *pool* cannot be moved between
+    builds, which is a supply-chain accident rather than an adversary.
+    """
+    import hashlib
+    import json
+
+    h = hashlib.sha256()
+    for group in plan.groups:
+        h.update(json.dumps({
+            "group": group.index,
+            "family": group.family,
+            "dispatcher": group.dispatcher,
+            "opcodes": group.opmap.opcode_count(),
+            "format": group.fmt.summary(),
+        }, sort_keys=True, default=str).encode("utf-8"))
+        h.update(b"\n")
+    return h.digest()[:8]
+
+
 def _fresh_names(rng: Rng, count: int, reserved: Iterable[str] = ()) -> List[str]:
     """Unique names outside the ``_k`` space the rest of the output uses."""
     gen = make_name_generator(rng, reserved=set(_SHARED) | set(reserved))

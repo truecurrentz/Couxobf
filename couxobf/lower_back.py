@@ -776,12 +776,19 @@ _CMP = {OP.EQ: "==", OP.NE: "~=", OP.LT: "<", OP.LE: "<=",
         OP.GT: ">", OP.GE: ">="}
 
 
+#: Marks a constant-pool context that has been extended with a build fingerprint.
+#: Not a secret -- a delimiter, so the extension is unambiguous.
+_FINGERPRINT_AAD_TAG = b"\xc1f"
+
+
 def reconstruct_protected(module: IRModule,
                           keys: Any,
                           rng: Any,
                           context: bytes,
                           cache_policy: str = "full",
                           cache_bound: int = 64,
+                          pool_decoys: int = 0,
+                          fingerprint: bool = True,
                           names: Optional[Dict[str, str]] = None,
                           minify: bool = False,
                           optimize_first: bool = True,
@@ -851,7 +858,8 @@ def reconstruct_protected(module: IRModule,
         # rather than once per site they were duplicated at
         _optimize.optimize_module(module)
     pool = ConstantPool(keys, rng, context,
-                        cache_policy=cache_policy, cache_bound=cache_bound)
+                        cache_policy=cache_policy, cache_bound=cache_bound,
+                        decoys=pool_decoys)
 
     # Selected after optimization, so prototypes the optimizer shrank below the
     # size floor are not virtualized on the strength of code that no longer
@@ -887,6 +895,16 @@ def reconstruct_protected(module: IRModule,
                                          helper_map["iterpack"],
                                          helper_map["itercheck"]))
 
+    if plan is not None and fingerprint:
+        from .vm.wiring import structural_fingerprint
+        digest = structural_fingerprint(plan)
+        # The pool is not sealed yet -- interning happens during lowering and
+        # sealing at emit -- so the digest can still bind to it.  Tagged so a
+        # context that happens to end in eight bytes of its own cannot read as one
+        # that was extended here.
+        pool.context = context + _FINGERPRINT_AAD_TAG + digest
+        if names_out is not None:
+            names_out["fingerprint"] = digest.hex()
     # Strings get their own bank at level 2 and above: fragmented, scattered
     # across shuffled pages, and addressed by a per-occurrence ticket rather
     # than interned by value.  The pool interns, so one recovered accessor
@@ -956,6 +974,12 @@ def reconstruct_protected(module: IRModule,
     pool_src = ""
     if need_pool:
         sealed = pool.seal()
+        if names_out is not None:
+            # Read here rather than where the pool was built: constants are
+            # interned while the bodies are lowered, and the decoys are planted as
+            # they go, so any earlier count is a count of a pool that does not
+            # exist yet.
+            names_out["pool_decoys"] = pool.decoys_planted
         runtime = ConstantPoolRuntime(names, cache_policy=cache_policy,
                                       cache_bound=cache_bound)
         pool_src = runtime.emit(sealed.key, sealed.nonce, sealed.tag,

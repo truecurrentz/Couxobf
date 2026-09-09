@@ -50,6 +50,15 @@ class ConstantPoolError(Exception):
     pass
 
 
+#: Suffixes that keep a decoy string the same shape as its neighbours.  All are
+#: plausible in the kind of source this tool is pointed at, and none of them is a
+#: word that would make a reader stop and look.
+DECOY_SUFFIXES = (b"_v2", b"_x", b"2", b"Impl", b"_tmp", b"Id", b"Len")
+
+#: "no decoy this time" -- a sentinel rather than None, which is a real constant.
+_NO_DECOY = object()
+
+
 def encode_value(value: Any) -> bytes:
     """Serialize one constant to its tagged wire form."""
     if value is None:
@@ -103,6 +112,7 @@ class ConstantPool:
         context: bytes,
         cache_policy: str = "full",
         cache_bound: int = 64,
+        decoys: int = 0,
     ) -> None:
         if cache_policy not in CACHE_POLICIES:
             raise ConstantPoolError(f"unknown cache policy {cache_policy!r}")
@@ -114,6 +124,11 @@ class ConstantPool:
         self._values: List[Any] = []
         self._index: Dict[Any, int] = {}
         self._sealed: Optional[SealedPool] = None
+        # See :meth:`_plant_decoys`.  The budget is per build, not per prototype,
+        # because a fixed number per function would make the decoy count a
+        # function of how many functions there are -- which is a signal in itself.
+        self._decoy_budget = max(0, int(decoys))
+        self.decoys_planted = 0
 
     # -- collection -------------------------------------------------------
 
@@ -138,7 +153,62 @@ class ConstantPool:
         self._values.append(value)
         index = len(self._values)
         self._index[key] = index
+        self._plant_decoys()
         return index
+
+    # -- decoys ------------------------------------------------------------
+
+    def _plant_decoys(self) -> None:
+        """Append plausible-but-unused constants after the one just interned.
+
+        A decoy is a fully encoded entry -- same tag, same encryption, same slot
+        arithmetic -- that no instruction reaches, so a recovered pool has to be
+        *executed* against the payload to tell which entries are real.  They are
+        scattered by construction rather than gathered into one tail, because a run
+        of entries that nothing indexes is the one shape that is trivial to filter
+        out: the tail is the giveaway, not the entries.
+
+        They are derived from values already in the pool for the same reason a
+        random string would fail: an analyst who cannot tell a decoy from a real
+        constant is the goal, and ``"xq7f"`` next to ``"GetPartsC"`` is tellable.
+        """
+        if self._decoy_budget <= 0:
+            return
+        # A gate that usually passes, then one or two entries: a small pool spends
+        # part of its budget and a large one exhausts it, which is what "scales with
+        # the real pool" has to mean when the pool's size is not known yet.
+        while self._decoy_budget > 0 and self.rng.chance(0.6):
+            decoy = self._decoy_value()
+            if decoy is _NO_DECOY:
+                return
+            key = self._key_for(decoy)
+            if key in self._index:
+                continue          # a duplicate of a real value: not a decoy at all
+            self._index[key] = len(self._values) + 1
+            self._values.append(decoy)
+            self._decoy_budget -= 1
+            self.decoys_planted += 1
+            if not self.rng.chance(0.75):
+                break               # do not clump: one here is often enough
+
+    def _decoy_value(self) -> Any:
+        if not self._values:
+            return _NO_DECOY
+        pick = self.rng.choice(self._values)
+        if isinstance(pick, bool) or pick is None:
+            return _NO_DECOY
+        if isinstance(pick, (int, float)):
+            # Off by a small amount rather than by a random one: a decoy that is
+            # 4.2e17 next to 3 is a decoy a reader can spot by magnitude alone.
+            delta = float(self.rng.randint(1, 9))
+            return pick + (delta if self.rng.bool() else -delta)
+        raw = bytes(pick)
+        if len(raw) < 3:
+            return _NO_DECOY
+        cut = self.rng.randint(1, max(1, len(raw) - 2))
+        keep = raw[:cut] if self.rng.bool() else raw[cut:]
+        suffix = DECOY_SUFFIXES[self.rng.randbelow(len(DECOY_SUFFIXES))]
+        return keep + suffix
 
     @staticmethod
     def _key_for(value: Any) -> Any:

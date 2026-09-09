@@ -423,3 +423,105 @@ def test_comment_stripping_does_not_eat_code():
     protected = execute(TOOLCHAIN, out, "c2.luau", timeout=30)
     assert original.returncode == protected.returncode, protected.stderr[:300]
     assert original.stdout == protected.stdout
+
+
+# ---------------------------------------------------------------------------
+# decoy pool entries and the build fingerprint
+#
+# Both are pool-level features, and both are only visible in the artifact through
+# the count of entries it carries -- which is exactly where a wrong slot number
+# would hide.  So the load-bearing test here is differential: a build with 32
+# decoys interleaved into the pool has to print the same thing as the source,
+# because every read site kept pointing at its own constant.
+# ---------------------------------------------------------------------------
+
+CONSTANTS_PROGRAM = '''local KEYS = {"alpha", "beta", "gamma", "delta", "epsilon", "zeta"}
+local WEIGHTS = {0.15, 4.75, 12.5, 0.05, 250.0, 1.0}
+
+local function describe(i)
+  local key = KEYS[i]
+  local weight = WEIGHTS[i]
+  local total = #key * weight
+  if weight > 4 then
+    total = total + weight * 2
+  end
+  return string.format("%s/%d=%.3f", key, #key, total), total
+end
+
+local grand = 0
+for i = 1, #KEYS do
+  local line, value = describe(i)
+  grand = grand + value
+  print(line)
+end
+print(string.format("grand %.4f", grand))
+for i = #KEYS, 1, -1 do
+  print(i .. ":" .. KEYS[i] .. "=" .. WEIGHTS[i])
+end
+'''
+
+
+def _decoy_config(**over):
+    config = Config.maximum()
+    config.min_virtualize_body_nodes = 1
+    # The size budget would trade the decoys away on a file this small, and the
+    # point of these builds is the decoys.
+    config.max_output_growth = 0
+    for key, value in over.items():
+        setattr(config, key, value)
+    return config
+
+
+def test_decoys_are_planted_and_reported():
+    out = build(CONSTANTS_PROGRAM, _decoy_config(decoy_constants=32),
+                name="decoys.luau", verify=False)
+    assert out.stats.pool_decoys > 0, out.stats.pool_decoys
+    assert "pool decoys" in out.report
+    assert str(out.stats.pool_decoys) in out.report
+
+
+def test_turning_the_switch_off_leaves_the_pool_clean():
+    out = build(CONSTANTS_PROGRAM, _decoy_config(decoys=False),
+                name="decoys.luau", verify=False)
+    assert out.stats.pool_decoys == 0
+    assert "none" in out.report.split("pool decoys")[1][:60]
+
+
+@pytest.mark.skipif(not TOOLCHAIN.can_execute, reason="luau runtime not available")
+def test_a_pool_full_of_decoys_prints_what_the_source_prints():
+    for count in (0, 8, 48):
+        config = _decoy_config(decoys=count > 0, decoy_constants=count)
+        out = build(CONSTANTS_PROGRAM, config, name="decoys.luau", verify=True)
+        want = execute(TOOLCHAIN, CONSTANTS_PROGRAM, "want.luau", timeout=30)
+        got = execute(TOOLCHAIN, out.source, "got.luau", timeout=30)
+        assert got.returncode == 0, (count, got.stderr[:400])
+        assert want.stdout == got.stdout, (count, want.stdout, got.stdout)
+
+
+def test_the_fingerprint_is_a_digest_of_the_decisions_not_of_the_file():
+    """Same config and seed, same fingerprint; a different format, a different one.
+
+    A hash of the emitted source would be a hash of everything, including the parts
+    the format did not touch, and would then change for reasons nobody can read.
+    """
+    def fingerprint(**over):
+        out = build(CONSTANTS_PROGRAM, _decoy_config(**over),
+                    name="decoys.luau", verify=False)
+        return out.stats.fingerprint
+
+    base = fingerprint(reproducible_seed=7)
+    assert re.fullmatch(r"[0-9a-f]{16}", base), base
+    assert fingerprint(reproducible_seed=7) == base, "not reproducible from the seed"
+    assert fingerprint(reproducible_seed=7, instruction_formats=0) != base
+    # A pinned family changes group 0's shape; `vm_variety` would too, but only
+    # once there are two prototypes to spread, and this program has one.
+    assert fingerprint(reproducible_seed=7, vm_family="stack") != base
+    assert fingerprint(reproducible_seed=7, opcode_randomization=False) != base
+    assert fingerprint(reproducible_seed=8) != base
+
+
+def test_the_fingerprint_can_be_declined_and_says_so():
+    off = build(CONSTANTS_PROGRAM, _decoy_config(fingerprint=False),
+                name="decoys.luau", verify=False)
+    assert off.stats.fingerprint == ""
+    assert "fingerprint" in off.report and "off" in off.report.split("fingerprint")[1][:60]
