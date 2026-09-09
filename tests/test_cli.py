@@ -374,3 +374,35 @@ def test_an_unimplemented_dispatcher_is_refused(capsys):
             ["protect", FIXTURE, "--dispatcher", "state_transition"])
     assert exc.value.code == 2
     assert "invalid choice" in capsys.readouterr().err
+
+
+def test_string_level_three_is_accepted_by_the_cli(tmp_path):
+    """`maximum` sets string_protection_level to 3, so the CLI must accept 3.
+
+    It accepted only 0..2, which meant `--profile maximum --string-level 3` was
+    rejected while `--profile maximum` alone produced exactly that value.  A
+    tool that cannot express its own default profile is contradicting itself.
+    """
+    for level in (0, 1, 2, 3):
+        target = tmp_path / ("out%d.luau" % level)
+        code, out, err = run_captured(
+            ["protect", FIXTURE, "--profile", "maximum",
+             "--string-level", str(level), "--seed", "7",
+             "--no-verify", "-o", str(target), "-q"])
+        assert code == EXIT_OK, f"--string-level {level}: {err}"
+        assert target.read_text().strip(), f"level {level} produced no output"
+
+
+def test_string_levels_two_and_three_are_the_same_today(tmp_path):
+    """Documented as identical, so pin it: if a third tier appears this fails,
+    and the help text and the API note have to be updated with it."""
+    bodies = []
+    for level in (2, 3):
+        target = tmp_path / ("lv%d.luau" % level)
+        code, out, err = run_captured(
+            ["protect", FIXTURE, "--profile", "maximum",
+             "--string-level", str(level), "--seed", "7",
+             "--no-verify", "-o", str(target), "-q"])
+        assert code == EXIT_OK, err
+        bodies.append(target.read_bytes())
+    assert bodies[0] == bodies[1], "levels 2 and 3 diverged; update the docs"

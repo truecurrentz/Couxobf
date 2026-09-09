@@ -201,8 +201,14 @@ def _add_protection_knobs(sp) -> None:
                     default=None,
                     help="shape of the opcode dispatch; mixed (the default) "
                          "picks one at random per build")
-    sp.add_argument("--string-level", type=int, choices=(0, 1, 2), default=None,
-                    help="0 none, 1 pooled, 2 fragmented+encrypted+ticketed")
+    # 0..3, not 0..2: Config.from_profile("maximum") sets 3, so a CLI that
+    # rejected 3 could not express its own maximum profile.  Levels 2 and 3 are
+    # currently identical -- lower_back activates the bank at ">= 2" and there
+    # is no third tier -- and the help says so rather than implying one.
+    sp.add_argument("--string-level", type=int, choices=(0, 1, 2, 3),
+                    default=None,
+                    help="0 none, 1 pooled, 2 or 3 fragmented+encrypted+"
+                         "ticketed (2 and 3 are currently identical)")
     sp.add_argument("--cache-policy", choices=("none", "bounded", "full"),
                     default=None, help="decoded-string retention (none is safest)")
     sp.add_argument("--no-opcode-randomization", action="store_true",
