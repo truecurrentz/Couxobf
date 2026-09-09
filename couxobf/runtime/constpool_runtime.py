@@ -45,10 +45,13 @@ class ConstantPoolRuntime:
 
     def emit(self, key: bytes, nonce: bytes, tag: bytes, ciphertext: bytes,
              aad: bytes, emit_crypto: bool = True,
-             guard_check: str = "") -> str:
+             guard_check: str = "",
+             ticket_mask: int = 0) -> str:
         n = self.n
+        ticket_mask &= 0xffffffff
         trip = (f"  if not {guard_check}() then error(\"invalid state\") end\n"
                 if guard_check else "")
+        deticket = (f"  i = bit32.bxor(i, {ticket_mask})\n" if ticket_mask else "")
         # The crypto module ends in `return {...}`, so wrapping it in a call
         # turns it into a value without needing a require.
         crypto = crypto_runtime(
@@ -60,6 +63,7 @@ class ConstantPoolRuntime:
             cache_block = (
                 f"local function {n['get']}(i)\n"
                 f"{trip}"
+                f"{deticket}"
                 f"  {n['load']}()\n"
                 f"  return {n['mat']}(i)\n"
                 f"end\n"
@@ -81,6 +85,7 @@ class ConstantPoolRuntime:
                 f"local {n['live']} = 0\n"
                 f"local function {n['get']}(i)\n"
                 f"{trip}"
+                f"{deticket}"
                 f"  {n['load']}()\n"
                 f"  if {n['seen']}[i] then\n"
                 f"    return {n['cache']}[i]\n"

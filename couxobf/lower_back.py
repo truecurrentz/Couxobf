@@ -294,7 +294,8 @@ class Reconstructor:
                  vm: Any = None, bank: Any = None,
                  bank_accessor: Optional[str] = None,
                  helpers: Optional[Dict[str, str]] = None,
-                 native_prefix: str = PREFIX) -> None:
+                 native_prefix: str = PREFIX,
+                 pool_ticket: Optional[Any] = None) -> None:
         """``pool`` is a :class:`~couxobf.constpool.ConstantPool`.
 
         When one is supplied, no literal reaches the output: every constant is
@@ -313,6 +314,10 @@ class Reconstructor:
         self.snapshots: Dict[Tuple[int, int], str] = {}
         self.pool = pool
         self.accessor = accessor
+        #: Slot numbers are not passed to the runtime directly.  The pool
+        #: accessor receives a per-build ticket and decodes it locally, so a dump
+        #: of call-site constants is not an index over the decrypted table.
+        self.pool_ticket = pool_ticket or (lambda slot: slot)
         self.vm = vm
         #: The shared helpers' names for this build.  Must match what
         #: ``helpers_src`` declared, or the interpreter calls functions that do
@@ -484,7 +489,7 @@ class Reconstructor:
     def _pool_ref(self, value: Any) -> A.Expr:
         """A runtime read of one pooled constant."""
         slot = self.pool.slot(value)
-        return A.Call(fn=_name(self.accessor), args=[_num(slot)])
+        return A.Call(fn=_name(self.accessor), args=[_num(self.pool_ticket(slot))])
 
     def _global_expr(self, proto: FuncIR, k: Kon) -> A.Expr:
         """The expression naming a global.
@@ -995,10 +1000,16 @@ def reconstruct_protected(module: IRModule,
         if names_out is not None:
             names_out["bank"] = dict(bank_names)
 
+    ticket_rng = rng.fork("pool-ticket") if hasattr(rng, "fork") else rng
+    pool_ticket_mask = (ticket_rng.u32() if hasattr(ticket_rng, "u32") else 0x5A17C0DE) & 0xffffffff
+    if pool_ticket_mask == 0:
+        pool_ticket_mask = 0x5A17C0DE
+    pool_ticket = lambda slot: (int(slot) ^ pool_ticket_mask) & 0xffffffff
     rec = Reconstructor(pool=pool, accessor=names["get"], vm=plan, bank=bank,
                         bank_accessor=(bank_names["get"] if bank_names else None),
                         helpers=helper_map,
-                        native_prefix=fresh_prefix(rng, prefixes))
+                        native_prefix=fresh_prefix(rng, prefixes),
+                        pool_ticket=pool_ticket)
     rec.vm_layout_rng = layout_rng if layout_rng is not None else vm_rng
     body = rec.reconstruct(module)
 
@@ -1022,7 +1033,7 @@ def reconstruct_protected(module: IRModule,
                     if group.describes(pid)}
             if mine:
                 _validate_payload(mine, group.opmap, group.fmt)
-        pooled = lambda value: "%s(%d)" % (names["get"], pool.slot(value))
+        pooled = lambda value: "%s(%d)" % (names["get"], pool_ticket(pool.slot(value)))
         vm_src = _wiring.prelude_source(plan, rec.vm_encoded, pooled, pooled,
                                         edges_expr=pooled,
                                         entry_guard=guard.entry_lines(),
@@ -1060,7 +1071,8 @@ def reconstruct_protected(module: IRModule,
         pool_src = runtime.emit(sealed.key, sealed.nonce, sealed.tag,
                                 sealed.ciphertext, sealed.aad,
                                 emit_crypto=not crypto_src,
-                                guard_check=runtime_guard_check)
+                                guard_check=runtime_guard_check,
+                                ticket_mask=pool_ticket_mask)
 
     bank_src = ""
     if need_bank:

@@ -339,6 +339,23 @@ def test_protected_output_contains_no_plaintext_constants():
         assert needle not in out, f"{needle!r} leaked into the protected output"
 
 
+def test_pool_call_sites_use_per_build_tickets_not_raw_slots():
+    src = 'local a = "one"\nlocal b = "two"\nprint(a, b, 123)\n'
+    seed = b"\x42" * 16
+    runtime_names = {}
+    out = lower_back.reconstruct_protected(
+        ir.Lowerer().lower(parser.parse(src, "tickets.luau")),
+        KeyMaterial.from_seed(seed),
+        make_domains(seed).get("constants"),
+        b"tickets",
+        names_out=runtime_names,
+    )
+    get = runtime_names["pool"]["get"]
+    assert "bit32.bxor(i," in out, "runtime should deticket pool requests"
+    assert f"{get}(1)" not in out
+    assert f"{get}(2)" not in out
+
+
 def test_global_names_remain_visible_and_why():
     """The counterweight to the test above, and a promise about what the pool
     does *not* do.
