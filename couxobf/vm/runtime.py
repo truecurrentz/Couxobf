@@ -467,13 +467,32 @@ class _Entry:
         return self.numbers[0]
 
     def condition(self, fmt: FormatSpec, var: str = "op") -> str:
+        def one(number: int) -> str:
+            seed = (getattr(fmt, "arm_seed", 0) ^ (number * 1103515245)
+                    ^ (self.variant * 2654435761)) & 0xffffffff
+            # Equality does not have to be written as a plain `op == N`.  These
+            # are bijective one-line checks over the opcode field's modulus, so
+            # they are real routing conditions, not dead predicates, and their
+            # shape changes with the build's format/arm seed.
+            mod = 1 << (8 * max(1, int(getattr(fmt, "op_bytes", 1))))
+            mode = seed % 3
+            if mode == 1:
+                add = 1 + ((seed >> 8) % (mod - 1))
+                return "((%s + %d) %% %d) == %d" % (
+                    var, add, mod, (number + add) % mod)
+            if mode == 2:
+                sub = 1 + ((seed >> 11) % (mod - 1))
+                return "((%s - %d) %% %d) == %d" % (
+                    var, sub, mod, (number - sub) % mod)
+            return f"{var} == {number}"
+
         if len(self.numbers) == 1:
-            return f"{var} == {self.numbers[0]}"
+            return one(self.numbers[0])
         # An aliased opcode tests as a disjunction rather than being emitted
         # twice: two arms with the same body would be boilerplate an automated
         # deobfuscator folds, and folding it would tell them where the alias set
         # is.
-        return "(" + " or ".join("%s == %d" % (var, x) for x in self.numbers) + ")"
+        return "(" + " or ".join(one(x) for x in self.numbers) + ")"
 
     def body(self, n: Dict[str, str], fam: Family, fmt: FormatSpec) -> List[str]:
         if self.pair is not None:

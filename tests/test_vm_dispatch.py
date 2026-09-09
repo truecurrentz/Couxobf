@@ -54,10 +54,11 @@ _CASES = [(seed, sparse, ratio, variant)
 def _condition_holds(cond: str, value: int, bk: int) -> bool:
     """Evaluate one emitted condition against an opcode number.
 
-    The emitted conditions are a closed grammar -- ``op == N``, ``op <= N``,
-    ``_bk == K``, and their negations, joined by ``or`` -- so evaluating them with
-    only ``op`` and ``_bk`` in scope is exact, and it is the *emitted text* being
-    evaluated rather than a re-derivation of it.
+    The emitted conditions are a closed grammar -- equality/range tests over
+    ``op``, optional affine ``+/-`` modulo disguises, ``_bk == K``, and their
+    negations, joined by ``or`` -- so evaluating them with only ``op`` and
+    ``_bk`` in scope is exact, and it is the *emitted text* being evaluated
+    rather than a re-derivation of it.
     """
     return bool(eval(cond, {"__builtins__": {}}, {"op": value, "_bk": bk}))
 
@@ -140,6 +141,15 @@ def test_no_number_is_claimed_by_two_arms(dispatcher, seed):
         assert len(owners) <= 1, (
             f"{dispatcher}: opcode {number} matches arms for {sorted(owners)}; "
             f"the first would win and the second would be dead code")
+
+
+def test_dispatch_conditions_are_not_all_plain_opcode_equality():
+    opmap = _opmap(4, 3, 0.6)
+    fmt = FormatSpec(op_bytes=2, arm_seed=0x12345)
+    text, trace, _bk = _emit(opmap, "nested_if", fmt)
+    assert trace
+    assert "%" in text, "arm_seed should disguise at least some equality tests"
+    assert any("+" in cond or "-" in cond for _nums, path in trace for cond in path)
 
 
 def test_the_guard_still_rejects_unassigned_numbers():
