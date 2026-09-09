@@ -12,7 +12,8 @@ carries no self-describing identifiers.
 
 from __future__ import annotations
 
-from typing import Dict
+import hashlib
+from typing import Dict, List, Tuple
 
 from .luau_crypto import crypto_runtime
 
@@ -25,6 +26,51 @@ def byte_literal(data: bytes) -> str:
     literal early or smuggle in an escape sequence.
     """
     return '"' + "".join("\\x%02x" % b for b in data) + '"'
+
+_MASK_MUL = 1103515
+_MASK_ADD = 12345
+_MASK_MOD = 1 << 31
+
+
+def _mask(seed: int, length: int) -> bytes:
+    out = bytearray()
+    x = seed % _MASK_MOD
+    for _ in range(length):
+        x = (x * _MASK_MUL + _MASK_ADD) % _MASK_MOD
+        out.append((x >> 16) & 0xFF)
+    return bytes(out)
+
+
+def _literal_parts(data: bytes) -> List[Tuple[int, bytes]]:
+    """Masked literal fragments for one runtime blob.
+
+    The encrypted pool already protects the payload contents.  This layer keeps
+    key/nonce/tag/ciphertext material from appearing as one contiguous quoted
+    literal in the emitted runtime; each build reconstructs them from small
+    masked pieces through real byte operations.
+    """
+    if not data:
+        return []
+    h = hashlib.sha256(b"couxobf-const-literal\0" + len(data).to_bytes(4, "big") + data).digest()
+    pos = 0
+    idx = 0
+    parts: List[Tuple[int, bytes]] = []
+    while pos < len(data):
+        size = 3 + h[idx % len(h)] % 10
+        size = min(size, len(data) - pos)
+        seed = int.from_bytes(hashlib.sha256(h + idx.to_bytes(2, "big")).digest()[:4], "big") & 0x7fffffff
+        piece = data[pos:pos + size]
+        masked = bytes(b ^ m for b, m in zip(piece, _mask(seed, size)))
+        parts.append((seed, masked))
+        pos += size
+        idx += 1
+    return parts
+
+
+def byte_expr(data: bytes, helper: str) -> str:
+    rows = ["{%d,%s}" % (seed, byte_literal(masked))
+            for seed, masked in _literal_parts(data)]
+    return "%s({%s})" % (helper, ",".join(rows))
 
 
 class ConstantPoolRuntime:
@@ -52,6 +98,22 @@ class ConstantPoolRuntime:
         trip = (f"  if not {guard_check}() then error(\"invalid state\") end\n"
                 if guard_check else "")
         deticket = (f"  i = bit32.bxor(i, {ticket_mask})\n" if ticket_mask else "")
+        literal_helper = f"""local function {n['lit']}(parts)
+  local out = table.create(#parts)
+  for i = 1, #parts do
+    local row = parts[i]
+    local seed = row[1]
+    local s = row[2]
+    local t = table.create(#s)
+    for j = 1, #s do
+      seed = (seed * {_MASK_MUL} + {_MASK_ADD}) % {_MASK_MOD}
+      t[j] = string.char(bit32.bxor(string.byte(s, j), bit32.band(bit32.rshift(seed, 16), 255)))
+    end
+    out[i] = table.concat(t)
+  end
+  return table.concat(out)
+end
+"""
         # The crypto module ends in `return {...}`, so wrapping it in a call
         # turns it into a value without needing a require.
         crypto = crypto_runtime(
@@ -104,10 +166,10 @@ class ConstantPoolRuntime:
         head = f"local {n['crypto']} = (function()\n{crypto}end)()\n" \
             if emit_crypto else ""
 
-        return f"""{head}local {n['key']} = {byte_literal(key)}
-local {n['nonce']} = {byte_literal(nonce)}
-local {n['tag']} = {byte_literal(tag)}
-local {n['ct']} = {byte_literal(ciphertext)}
+        return f"""{head}{literal_helper}local {n['key']} = {byte_expr(key, n['lit'])}
+local {n['nonce']} = {byte_expr(nonce, n['lit'])}
+local {n['tag']} = {byte_expr(tag, n['lit'])}
+local {n['ct']} = {byte_expr(ciphertext, n['lit'])}
 local {n['plain']} = nil
 local {n['off']} = nil
 local {n['loaded']} = false
@@ -116,7 +178,7 @@ local function {n['load']}()
     return
   end
   {n['loaded']} = true
-  local p = {n['crypto']}.{n['c_open']}({n['key']}, {n['nonce']}, {n['ct']}, {n['tag']}, {byte_literal(aad)})
+  local p = {n['crypto']}.{n['c_open']}({n['key']}, {n['nonce']}, {n['ct']}, {n['tag']}, {byte_expr(aad, n['lit'])})
   if p == nil then
     error("invalid state")
   end
@@ -223,6 +285,7 @@ def default_names(prefix: str = "_kQ") -> Dict[str, str]:
         "load": prefix + "8",
         "mat": prefix + "9",
         "dyn": prefix + "z",
+        "lit": prefix + "y",
         "get": prefix + "10",
         "cache": prefix + "11",
         "seen": prefix + "12",

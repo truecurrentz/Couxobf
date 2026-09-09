@@ -278,6 +278,20 @@ def test_luau_decoder_matches_python(policy):
     assert not bad, f"policy={policy}: {bad}"
 
 
+def test_runtime_literals_are_masked_fragments_not_whole_blobs():
+    pool = make_pool()
+    for v in TRICKY:
+        pool.slot(v)
+    sealed = pool.seal()
+    names = default_names()
+    rt = ConstantPoolRuntime(names)
+    src = rt.emit(sealed.key, sealed.nonce, sealed.tag, sealed.ciphertext, sealed.aad)
+    assert names["lit"] in src
+    literal = lambda raw: '"' + "".join("\\x%02x" % b for b in raw) + '"'
+    for blob in (sealed.key, sealed.nonce, sealed.tag, sealed.ciphertext, sealed.aad):
+        assert literal(blob) not in src
+
+
 def test_tampering_with_the_pool_is_detected():
     """The tag covers the ciphertext; flipping a bit must stop the runtime
     rather than hand back garbage constants."""
