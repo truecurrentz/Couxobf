@@ -757,7 +757,8 @@ def test_runtime_name_prefixes_differ_between_builds():
         # checking an empty set and passing on nothing.
         r = build(INVENTORY, Config(reproducible_seed=seed,
                                     min_virtualize_body_nodes=1,
-                                    string_protection_level=2), verify=False)
+                                    string_protection_level=2,
+                                    max_output_growth=40.0), verify=False)
         pool = r.runtime_names["pool"]["ct"]
         bank = r.runtime_names["bank"]["blob"]
         assert bank, "no string bank was built, so its prefix was never checked"

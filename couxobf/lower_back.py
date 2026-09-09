@@ -174,14 +174,40 @@ def _fusion_rules(level: Any):
     return FUSION_RULES
 
 
+def _helper_variant(h: Dict[str, str], role: str, modulo: int) -> int:
+    """Deterministic per-build helper layout selector."""
+    seed = role + "|" + "|".join(h.get(k, "") for k in sorted(h))
+    x = 2166136261
+    for ch in seed:
+        x = ((x ^ ord(ch)) * 16777619) & 0xffffffff
+    return x % modulo
+
+
 def helpers_src(h: Dict[str, str]) -> str:
     """The shared helper block, with this build's names."""
+    pack_variant = _helper_variant(h, "pack", 3)
+    unpack_variant = _helper_variant(h, "unpack", 2)
+    append_variant = _helper_variant(h, "append", 3)
+    if pack_variant == 0:
+        pack_body = "return table.pack(...)"
+    elif pack_variant == 1:
+        pack_body = "local t={...};t.n=select(\"#\",...);return t"
+    else:
+        pack_body = "local n=select(\"#\",...);local t={...};t.n=n;return t"
+    unpack_body = ("return table.unpack(t, i, t.n)" if unpack_variant == 0
+                   else "local a=i or 1;return table.unpack(t,a,t.n)")
+    if append_variant == 0:
+        append_body = "local n=#dst\n      for i = 1, t.n do\n        n += 1\n        dst[n] = t[i]\n      end"
+    elif append_variant == 1:
+        append_body = "local n=#dst;local i=1\n      while i <= t.n do\n        n += 1;dst[n]=t[i];i += 1\n      end"
+    else:
+        append_body = "local n=#dst\n      for i = 1, t.n do dst[n + i] = t[i] end"
     return f"""
     local function {h['pack']}(...)
-      return table.pack(...)
+      {pack_body}
     end
     local function {h['unpack']}(t, i)
-      return table.unpack(t, i, t.n)
+      {unpack_body}
     end
     local function {h['iter']}(v)
       -- Luau's generalized iteration.  The order matters: __iter wins over
@@ -233,11 +259,7 @@ def helpers_src(h: Dict[str, str]) -> str:
       error("attempt to iterate over a " .. ty .. " value")
     end
     local function {h['append']}(dst, t)
-      local n = #dst
-      for i = 1, t.n do
-        n += 1
-        dst[n] = t[i]
-      end
+      {append_body}
     end
     """
 
