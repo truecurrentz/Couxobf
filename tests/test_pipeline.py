@@ -12,6 +12,7 @@ that describes cost without inventing a security score.
 
 import glob
 import os
+import re
 import sys
 
 import pytest
@@ -267,3 +268,88 @@ def test_compact_profile_virtualizes_nothing():
     result = build("local function f(x) return x * 2 end\nprint(f(4))\n",
                    config, verify=False)
     assert result.stats.virtualized == 0
+
+
+# ---------------------------------------------------------------------------
+# identifier stripping
+# ---------------------------------------------------------------------------
+#
+# Config has an `identifier_polymorphism` knob and the package shipped a
+# scope-aware Renamer for it. Neither does anything: the reconstructor replaces
+# every local and parameter with an index into a per-prototype register table,
+# so there are no user identifiers left to rename. Measured across 20 corpus
+# files, running the Renamer changed the output in 2 of them and left 18
+# byte-identical -- and in the two it changed it introduced a bare identifier
+# where a register index had been. So the capability is delivered
+# unconditionally by the reconstruction scheme, and the knob has nothing left
+# to control. These tests pin the capability; the knob stays listed as pending
+# because setting it genuinely changes nothing.
+
+NAMED_SOURCE = '''local calculateGrandTotal = 1
+local function resolveCustomerDiscount(customerAccount, loyaltyTier)
+  local appliedDiscountRate = 0
+  if loyaltyTier == "gold" then
+    appliedDiscountRate = 0.15
+  end
+  return customerAccount * (1 - appliedDiscountRate)
+end
+local shippingCostEstimate = resolveCustomerDiscount(100, "gold")
+print(shippingCostEstimate, calculateGrandTotal)
+'''
+
+#: Names long and distinctive enough that a substring match cannot be a
+#: coincidence against a generated helper name.
+USER_NAMES = ("calculateGrandTotal", "resolveCustomerDiscount",
+              "customerAccount", "loyaltyTier", "appliedDiscountRate",
+              "shippingCostEstimate")
+
+
+def _identifiers_present(source: str, names) -> list:
+    """Whole-word matches only.
+
+    A plain substring search reports false positives from the generated
+    helpers, which is how a leak check ends up asserting nothing.
+    """
+    return [n for n in names
+            if re.search(r"(?<![\w_])" + re.escape(n) + r"(?![\w_])", source)]
+
+
+@pytest.mark.parametrize("level", ("none", "light", "heavy", "maximum"))
+def test_no_user_identifier_survives_the_build(level):
+    out = build(NAMED_SOURCE,
+                Config(reproducible_seed=11, virtualization_level=level,
+                       min_virtualize_body_nodes=1),
+                verify=False).source
+    leaked = _identifiers_present(out, USER_NAMES)
+    assert not leaked, f"{level}: user identifiers survived: {leaked}"
+
+
+def test_identifier_stripping_is_unconditional():
+    """The knob does not control it, so turning it off must not restore names."""
+    for flag in (True, False):
+        out = build(NAMED_SOURCE,
+                    Config(reproducible_seed=11, virtualization_level="none",
+                           identifier_polymorphism=flag),
+                    verify=False).source
+        assert not _identifiers_present(out, USER_NAMES), flag
+
+
+def test_globals_are_preserved():
+    """What the program can observe from outside must keep working.
+
+    ``print`` survives as a global lookup, but ``string`` and ``format`` do
+    not appear anywhere in the output: they are constants, so they go into the
+    encrypted pool like every other string.  That is why the assertion is on
+    behaviour rather than on the text -- checking for the literal would fail
+    for the right reason.
+    """
+    if not TOOLCHAIN.can_execute:
+        pytest.skip("luau runtime not available")
+    src = 'print(string.format("%d", 42))\nprint(#{"a", "b"})\n'
+    out = build(src, Config(reproducible_seed=11, virtualization_level="none"),
+                verify=False).source
+    assert re.search(r"(?<![\w_])print(?![\w_])", out), "print was renamed away"
+    original = execute(TOOLCHAIN, src, "g.luau", timeout=30)
+    protected = execute(TOOLCHAIN, out, "p.luau", timeout=30)
+    assert original.returncode == protected.returncode, protected.stderr[:300]
+    assert original.stdout == protected.stdout
