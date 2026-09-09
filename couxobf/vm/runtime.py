@@ -847,7 +847,7 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
     # three consumers (encoder, interpreter, build-time validator) then share one
     # convention instead of each assuming the header is eight bytes long.
     raw = _le_read("_bd(%s, %%d)" % code, entry_at, entry_w)
-    nparams_expr = _le_read("_bd(p.code, %d)", nparams_at,
+    nparams_expr = _le_read("_bd(_ec, %d)", nparams_at,
                              header.width("nparams"))
     entry_expr = "%s + 1" % raw
     if spec.header.entry_bias:
@@ -895,9 +895,11 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         # E arrives as an argument.  Resolving it here instead would give this
         # function's environment, not the virtualised function's, and a
         # setfenv'd build would silently read and write the real globals.
-        f"local function {n['exec']}(p, R, E)",
-        f"  local {n['code']} = p.code",
+        f"local function {n['exec']}(p, R, E, _ec)",
+        f"  local {n['code']} = _ec or p.code",
+        f"  if type({n['code']}) == \"function\" then {n['code']} = {n['code']}() end",
         "  local K = p.consts",
+        "  if type(K) == \"function\" then K = K() end",
     ]
     if spec.target_mode == "edges":
         # The edge table is its own pooled, authenticated blob, so a jump's
@@ -905,6 +907,7 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         # being inside something the pool's MAC covers -- which is what keeps
         # this distinct from putting targets in the plaintext descriptor.
         lines.append("  local %s = p.edges" % EDGE_LOCAL)
+        lines.append("  if type(%s) == \"function\" then %s = %s() end" % (EDGE_LOCAL, EDGE_LOCAL, EDGE_LOCAL))
     lines += ["  " + ln for ln in reader_lines(spec, code, EDGE_LOCAL)]
     lines += [
         # The entry point comes out of the payload header, which is inside the
@@ -939,6 +942,8 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         # is already running.  Before the frame is built, so a refused call never
         # touches the payload at all.
         *[f"  {line}" for line in entry_guard],
+        "  local _ec = p.code",
+        "  if type(_ec) == \"function\" then _ec = _ec() end",
         "  local R = {}",
         "  local args = _pack(...)",
         # same reason as the entry point: nparams is a header field, and which
@@ -946,7 +951,7 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         "  for i = 1, %s do" % nparams_expr,
         "    R[i] = args[i]",
         "  end",
-        f"  return {n['exec']}(p, R, E)",
+        f"  return {n['exec']}(p, R, E, _ec)",
         "end",
     ]
     return _rename_core_tokens("\n".join(lines) + "\n", names)

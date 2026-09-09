@@ -504,6 +504,17 @@ def test_protected_path_hides_the_bytecode():
         assert original.stdout == protected.stdout == "22\n"
 
 
+def test_vm_descriptors_materialize_code_and_constants_lazily():
+    """Encrypted VM blobs should not become plaintext descriptor rows at load."""
+    out, selected = protected_vm_reconstruct(
+        'local function f(a) return "v" .. a end\nprint(f("m"))\n',
+        "lazy-vm.luau")
+    assert selected, "nothing was virtualized; this test proves nothing"
+    assert "function()return" in out, out[:500]
+    assert re.search(r"consts\s*=\s*\w+\[\d+\]", out), out[:500]
+    assert "type(" in out, "interpreter must resolve lazy descriptors"
+
+
 def test_interning_after_seal_is_refused():
     """A slot handed out after sealing points at nothing in the blob.
 

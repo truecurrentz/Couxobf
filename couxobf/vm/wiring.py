@@ -518,13 +518,13 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
         # interpreter reads them from there.  Putting them here as well created
         # a second, plaintext, unauthenticated copy that an editor could change
         # without invalidating any tag.
-        payload_rows.append("  [%d] = %s," % (pid, code_expr(enc.code)))
-        const_rows.append("  [%d] = { %s }," % (pid, consts))
+        payload_rows.append("  [%d] = function() return %s end," % (pid, code_expr(enc.code)))
+        const_rows.append("  [%d] = function() return { %s } end," % (pid, consts))
         if enc.edges and edges_expr is not None:
             # Four bytes per edge, so the stream itself carries only ordinals
             # and the positions they mean live somewhere else entirely (#18).
             blob = _pack_edges(enc.edges)
-            edge_rows.append("  [%d] = %s," % (pid, edges_expr(blob)))
+            edge_rows.append("  [%d] = function() return %s end," % (pid, edges_expr(blob)))
     if not payload_rows:
         # No prototype made it in, so there is nothing to dispatch.  Emitting
         # the interpreter anyway would be dead weight an analyst could study
@@ -554,9 +554,9 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
         for pid in sorted(encoded):
             enc = encoded[pid]
             consts = ", ".join(const_expr(v) for v in enc.consts)
-            edges = (" edges = " + edges_expr(_pack_edges(enc.edges)) + ",") if (
+            edges = (" edges = function() return " + edges_expr(_pack_edges(enc.edges)) + " end,") if (
                 enc.edges and edges_expr is not None) else ""
-            joined.append("  [%d] = { code = %s, consts = { %s },%s },"
+            joined.append("  [%d] = { code = function() return %s end, consts = function() return { %s } end,%s },"
                           % (pid, code_expr(enc.code), consts, edges))
         parts.append("local %s = {\n%s\n}"
                      % (plan.rows_table, "\n".join(joined)))
