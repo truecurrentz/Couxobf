@@ -260,6 +260,25 @@ def test_the_entry_check_rides_on_every_vm_entry():
         assert re.search(r"if not %s\(\)\s*then" % re.escape(check), head), head
 
 
+def test_pool_and_string_accessors_recheck_before_plaintext_materializes():
+    """Dumpers often wait until after load; accessors must close that window."""
+    source = 'local function f() return "alpha" .. "beta" end\nprint(f())\n'
+    out = build(source, _cfg(2, string_protection_level=2),
+                name="guard-strings.luau", verify=False)
+    check = out.runtime_names["guard"]["locals"]["check"]
+    pool_get = out.runtime_names["pool"]["get"]
+    pool_head = re.search(r"local function %s\(i\)(.{0,120})"
+                          % re.escape(pool_get), out.source, re.S)
+    assert pool_head and re.search(r"if not %s\(\)\s*then"
+                                   % re.escape(check), pool_head.group(1))
+    if "bank" in out.runtime_names:
+        bank_get = out.runtime_names["bank"]["get"]
+        bank_head = re.search(r"local function %s\(ticket\)(.{0,120})"
+                              % re.escape(bank_get), out.source, re.S)
+        assert bank_head and re.search(r"if not %s\(\)\s*then"
+                                       % re.escape(check), bank_head.group(1))
+
+
 def test_no_entry_check_when_the_guard_only_observes():
     out = build(SOURCE, _cfg(1), name="guard.luau", verify=False)
     check = out.runtime_names["guard"]["locals"]["check"]

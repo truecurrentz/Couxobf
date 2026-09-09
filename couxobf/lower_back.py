@@ -1044,6 +1044,8 @@ def reconstruct_protected(module: IRModule,
                             "mac": names["c_mac"], "open": names["c_open"],
                             "seal": names["c_seal"]})))
 
+    runtime_guard_check = guard.n("check") if guard.refuses else ""
+
     pool_src = ""
     if need_pool:
         sealed = pool.seal()
@@ -1057,7 +1059,8 @@ def reconstruct_protected(module: IRModule,
                                       cache_bound=cache_bound)
         pool_src = runtime.emit(sealed.key, sealed.nonce, sealed.tag,
                                 sealed.ciphertext, sealed.aad,
-                                emit_crypto=not crypto_src)
+                                emit_crypto=not crypto_src,
+                                guard_check=runtime_guard_check)
 
     bank_src = ""
     if need_bank:
@@ -1082,7 +1085,8 @@ def reconstruct_protected(module: IRModule,
             bank.seal(),
             crypto_runtime({"xor": bn["c_xor"], "sha": bn["c_sha"],
                             "mac": bn["c_mac"], "open": bn["c_open"],
-                            "seal": bn["c_seal"]}) if not crypto_src else "")
+                            "seal": bn["c_seal"]}) if not crypto_src else "",
+            guard_check=runtime_guard_check)
 
     crypto_block = _parser.parse(crypto_src, "<crypto>") if crypto_src else None
     pool_block = _parser.parse(pool_src, "<constpool>") if pool_src else None
@@ -1154,6 +1158,14 @@ def reconstruct_protected(module: IRModule,
         deps["pool"].add("crypto")
     if "bank" in deps and "crypto" in deps:
         deps["bank"].add("crypto")
+    # When level-2 guard refusal is enabled, pool/string-bank accessors call the
+    # same checker as VM entries before materializing plaintext.  That makes the
+    # guard a real dependency, not merely a block that happened to be emitted
+    # earlier in today's layout.
+    if runtime_guard_check:
+        for guarded in ("pool", "bank"):
+            if guarded in deps and "guard" in deps:
+                deps[guarded].add("guard")
     if "vm" in deps:
         for need in ("pool", "helpers", "guard"):
             if need in deps:

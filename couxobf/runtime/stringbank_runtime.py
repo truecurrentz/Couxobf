@@ -88,8 +88,10 @@ class StringBankRuntime:
         """The name generated code calls to resolve a ticket."""
         return self.n["get"]
 
-    def emit(self, sealed, crypto_src: str = "") -> str:
+    def emit(self, sealed, crypto_src: str = "", guard_check: str = "") -> str:
         n = self.n
+        trip = (f"  if not {guard_check}() then error(\"invalid state\") end\n"
+                if guard_check else "")
         if self.emit_crypto:
             head = f"local {n['crypto']} = (function()\n{crypto_src}end)()\n"
         else:
@@ -101,6 +103,7 @@ class StringBankRuntime:
         if self.cache_policy == "none":
             cache_block = (
                 f"local function {n['get']}(ticket)\n"
+                f"{trip}"
                 f"  {n['load']}()\n"
                 f"  local cls = ticket % 3\n"
                 f"  if cls == 0 then\n"
@@ -128,6 +131,7 @@ class StringBankRuntime:
                 f"local {n['seen']} = {{}}\n"
                 f"local {n['live']} = 0\n"
                 f"local function {n['get']}(ticket)\n"
+                f"{trip}"
                 f"  {n['load']}()\n"
                 f"  if {n['seen']}[ticket] then\n"
                 f"    return {n['cache']}[ticket]\n"
