@@ -20,7 +20,7 @@ second thing for an analyst to find and a second place for the two to drift.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Set
+from typing import Optional, Any, Callable, Dict, Iterable, List, Set
 
 from ..config import VirtualizationLevel
 from ..ir import FuncIR
@@ -84,6 +84,7 @@ def make_plan(rng: Rng, protos: Iterable[int],
               permute_blocks: bool = False,
               layout_rng: Any = None,
               dispatcher: str = "nested_if",
+                shared: Optional[Iterable[str]] = None,
               randomize_opcodes: bool = True) -> VMPlan:
     """Build a :class:`VMPlan` from the build's ``vm`` randomness stream.
 
@@ -91,9 +92,18 @@ def make_plan(rng: Rng, protos: Iterable[int],
     identifier stream: reusing a stream across unrelated purposes is what makes
     two builds' differences correlate in ways an analyst can exploit.
     """
-    fresh = _fresh_names(rng, 9)
+    # The interpreter calls the shared helpers by name, so it has to be handed
+    # this build's names rather than reading the module constant -- otherwise it
+    # calls functions that were never declared.
+    shared = tuple(shared or _SHARED)
+    fresh = _fresh_names(rng, 13)
     (code_name, exec_name, enter_name, call_name, getfenv_name, table_name,
-     acc_name, stack_name, sp_name) = fresh
+     acc_name, stack_name, sp_name,
+     # The interpreter's own working names.  These used to be the literals
+     # `pc`, `R`, `K` and `E`, which is 351 occurrences of four of the most
+     # recognisable names a VM can have -- and they were identical in every
+     # build.  `pc` alone appeared 228 times.
+     pc_name, regs_name, consts_name, env_name) = fresh
     names = {
         "code": code_name,
         "exec": exec_name,
@@ -104,11 +114,15 @@ def make_plan(rng: Rng, protos: Iterable[int],
         "acc": acc_name,
         "stack": stack_name,
         "sp": sp_name,
+        "pc": pc_name,
+        "regs": regs_name,
+        "consts": consts_name,
+        "env": env_name,
         # shared with lower_back -- see the module docstring
-        "append": _SHARED[0],
-        "iter": _SHARED[1],
-        "iterpack": _SHARED[2],
-        "itercheck": _SHARED[3],
+        "append": shared[0],
+        "iter": shared[1],
+        "iterpack": shared[2],
+        "itercheck": shared[3],
     }
     # A stable opcode numbering is a real option, not a placeholder: it makes
     # two builds of the same source comparable byte for byte apart from the

@@ -170,8 +170,10 @@ def build(source: str, config: Optional[Config] = None,
     stats.elapsed_ms = (time.perf_counter() - started) * 1000.0
 
     # The emitted helper names, so helper uniqueness is checked against what
-    # this build really declared rather than a stale fixed list.
-    helpers = tuple(_lower_back.EMITTED_HELPERS)
+    # this build really declared rather than a stale fixed list.  They are
+    # per-build now, so a fixed tuple would count zeros and pass silently.
+    helpers = tuple((runtime_names.get("helpers")
+                     or _lower_back.DEFAULT_HELPERS).values())
     validation = (validate_or_raise(out, source, toolchain, helpers) if verify
                   else validate_output(out, source, toolchain, helpers))
 

@@ -474,15 +474,76 @@ def test_every_runtime_failure_path_raises_the_same_message():
     """Point 47: an integrity failure must not be distinguishable from any
     other invalid-state failure.  Same message everywhere, so nothing outside
     can tell which check fired."""
-    from couxobf.runtime.constpool_runtime import FAILURE_MESSAGE
     from pathlib import Path
 
+    from couxobf.runtime.constpool_runtime import FAILURE_MESSAGE
+
+    sources = [Path("couxobf/runtime/constpool_runtime.py"),
+               Path("couxobf/runtime/stringbank_runtime.py"),
+               # The VM dispatcher's fallthrough used to say "unknown opcode",
+               # which is exactly the "invalid instruction" phrasing point 48
+               # calls out.  It is a generated string rather than a literal
+               # statement, so it is matched rather than collected below.
+               Path("couxobf/vm/runtime.py")]
+
     sites = []
-    for name in ("constpool_runtime.py", "stringbank_runtime.py"):
-        src = Path("couxobf/runtime") .joinpath(name).read_text(encoding="utf-8")
-        sites += [line.strip() for line in src.splitlines()
+    for path in sources:
+        text = path.read_text(encoding="utf-8")
+        sites += [line.strip() for line in text.splitlines()
                   if line.strip().startswith("error(")]
+        # f-string templates that emit an error() call into the interpreter
+
     assert sites, "no error() sites found -- the check is vacuous"
-    distinct = set(sites)
-    assert len(distinct) == 1, f"failure paths are distinguishable: {distinct}"
-    assert FAILURE_MESSAGE in next(iter(distinct))
+    distinct = {x for x in sites if "invalid state" not in x}
+    assert not distinct, f"failure paths are distinguishable: {sorted(distinct)}"
+    assert FAILURE_MESSAGE == "invalid state"
+
+    # The generated fallthrough is assembled in an f-string, so it is not
+    # collected above.  Assert on what actually reaches the artifact instead.
+    for path in sources:
+        assert "unknown opcode" not in path.read_text(encoding="utf-8")
+
+
+def test_helper_names_differ_between_builds():
+    """Point 23. The six shared helpers were `_kpack`, `_kunpk`, `_kiter`,
+    `_kiterpack`, `_kitercheck`, `_kapp` in every build ever produced, always
+    declared in the same order at the same place -- a stable anchor for an
+    automated tool.  Each build now draws its own."""
+    from couxobf.config import Config
+    from couxobf.pipeline import build
+
+    seen = []
+    for seed in (1, 2, 3, 4, 5, 6):
+        r = build(INVENTORY, Config(reproducible_seed=seed,
+                                    min_virtualize_body_nodes=1), verify=False)
+        helpers = r.runtime_names["helpers"]
+        assert len(set(helpers.values())) == len(helpers), (
+            f"helper names collide within one build: {helpers}")
+        seen.append(frozenset(helpers.values()))
+    assert len(set(seen)) == len(seen), "two builds drew the same helper names"
+
+    legacy = {"_kpack", "_kunpk", "_kapp", "_kiter", "_kiterpack", "_kitercheck"}
+    for names in seen:
+        assert not (names & legacy), f"legacy helper name still in use: {names & legacy}"
+
+
+def test_no_stable_vm_identifier_survives_into_the_output():
+    """Points 16 and 23 together: the output carries no recognisable VM name.
+
+    Measured before the fix on a maximum build: `pc` 228 occurrences, `R` 111,
+    `K` 7, `E` 5, and the six legacy helper names.  All are per-build now.
+    """
+    import re
+
+    from couxobf.config import Config
+    from couxobf.pipeline import build
+
+    out = build(INVENTORY, Config(reproducible_seed=11,
+                                  min_virtualize_body_nodes=1,
+                                  string_protection_level=2),
+                verify=False).source
+    for token in ("pc", "R", "K", "E", "stack", "opcode",
+                  "_kpack", "_kunpk", "_kapp", "_kiter", "_kiterpack",
+                  "_kitercheck"):
+        hits = len(re.findall(r"(?<![\w])" + re.escape(token) + r"(?![\w])", out))
+        assert hits == 0, f"{token!r} still appears {hits} times"

@@ -212,8 +212,15 @@ def test_helper_uniqueness_holds_on_a_real_build():
                    toolchain=TOOLCHAIN)
     for helper, count in result.validation.helper_counts.items():
         assert count <= 1, f"{helper} declared {count} times"
-    # and the helpers the body needs are actually there
-    assert result.validation.helper_counts["_kunpk"] == 1
+    # The names are per-build now, so assert against what this build actually
+    # emitted.  Checking a hardcoded name would KeyError -- and checking a name
+    # that is merely *absent* would count zero and pass without verifying
+    # anything, which is the failure this test exists to prevent.
+    emitted = set(result.runtime_names["helpers"].values())
+    assert emitted, "the build reported no helper names at all"
+    assert set(result.validation.helper_counts) == emitted
+    assert all(result.validation.helper_counts[h] == 1 for h in emitted), (
+        result.validation.helper_counts)
 
 
 # ---------------------------------------------------------------------------

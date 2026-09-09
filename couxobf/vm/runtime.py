@@ -272,7 +272,7 @@ def _emit_chain(lines: List[str], indent: str, ops: List[str],
         for body_line in _handler(op, n, fam):
             lines.append(f"{indent}  {body_line}")
     lines.append(f"{indent}else")
-    lines.append(f'{indent}  error("unknown opcode " .. tostring(op))')
+    lines.append(f'{indent}  error("invalid state")')
     lines.append(f"{indent}end")
 
 
@@ -290,7 +290,7 @@ def _emit_tree(lines: List[str], indent: str, ops: List[str],
         for body_line in _handler(op, n, fam):
             lines.append(f"{indent}  {body_line}")
         lines.append(f"{indent}else")
-        lines.append(f'{indent}  error("unknown opcode " .. tostring(op))')
+        lines.append(f'{indent}  error("invalid state")')
         lines.append(f"{indent}end")
         return
     ordered = sorted(ops, key=lambda o: opmap.to_byte[o])
@@ -329,7 +329,7 @@ def _emit_bucket(lines: List[str], ops: List[str], opmap: "OpcodeMap",
         first = False
         _emit_chain(lines, "      ", groups[key], opmap, n, fam)
     lines.append("    else")
-    lines.append('      error("unknown opcode " .. tostring(op))')
+    lines.append('      error("invalid state")')
     lines.append("    end")
 
 
@@ -438,4 +438,31 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         f"  return {n['exec']}(p, R, E)",
         "end",
     ]
-    return "\n".join(lines) + "\n"
+    return _rename_core_tokens("\n".join(lines) + "\n", names)
+
+
+#: The interpreter's working names, as written in the templates above.
+_CORE_TOKENS = (("pc", "pc"), ("R", "regs"), ("K", "consts"), ("E", "env"))
+
+
+def _rename_core_tokens(text: str, names: Dict[str, str]) -> str:
+    """Swap the interpreter's ``pc``/``R``/``K``/``E`` for this build's names.
+
+    Done as a pass over the finished text rather than at each of the ~350 use
+    sites, because those sites embed the tokens inside expressions like
+    ``w('pc + 1')`` and editing them individually is how a build ends up
+    half-renamed and still correct-looking.
+
+    Safe because none of the four appears inside a string literal in the
+    generated source -- measured, not assumed.  A caller that does not supply a
+    replacement keeps the literal token, so older name dictionaries still work.
+    """
+    import re as _re
+
+    for token, key in _CORE_TOKENS:
+        replacement = names.get(key)
+        if not replacement:
+            continue
+        text = _re.sub(r"(?<![\w])" + _re.escape(token) + r"(?![\w])",
+                       replacement, text)
+    return text

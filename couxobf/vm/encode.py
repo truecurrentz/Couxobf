@@ -49,7 +49,13 @@ HEADER = struct.Struct("<BBHHH")
 #: runtime -- the entry point here, and each jump target as its handler reads it
 #: -- crosses that boundary and must gain one.  Getting this wrong does not
 #: crash at the boundary; it starts the interpreter one byte early, on the last
-#: byte of the header, and reports "unknown opcode 0".
+#: byte of the header and hits the dispatcher's fallthrough.  That fallthrough
+#: now raises the same neutral message as every other failure (see
+#: ``couxobf.runtime.constpool_runtime.FAILURE_MESSAGE``), so it no longer
+#: names the opcode -- which costs a little debuggability and buys the property
+#: that an out-of-range opcode is not distinguishable from any other invalid
+#: state.  A build that mis-sets this still fails loudly; it just does not say
+#: why.
 LUA_INDEX_BIAS = 1
 
 FLAG_VARARG = 1

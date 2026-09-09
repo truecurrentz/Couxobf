@@ -76,14 +76,49 @@ HELPER_ITER = "_kiter"
 HELPER_ITERPACK = "_kiterpack"
 HELPER_ITERCHECK = "_kitercheck"
 
-#: Every helper the reconstruction declares, in emission order.  Validation
-#: checks each is declared exactly once, and it has to be told these names:
-#: deriving them from a stale constant list is how a uniqueness check ends up
-#: passing while checking nothing.
-EMITTED_HELPERS: Tuple[str, ...] = (
-    HELPER_PACK, HELPER_UNPACK, HELPER_APPEND,
-    HELPER_ITER, HELPER_ITERPACK, HELPER_ITERCHECK,
-)
+#: The helper roles, in emission order.  The names themselves are per-build;
+#: these are only the legacy fixed values, kept as a fallback so callers that
+#: have not been given a build's names still work.
+DEFAULT_HELPERS: Dict[str, str] = {
+    "pack": HELPER_PACK,
+    "unpack": HELPER_UNPACK,
+    "append": HELPER_APPEND,
+    "iter": HELPER_ITER,
+    "iterpack": HELPER_ITERPACK,
+    "itercheck": HELPER_ITERCHECK,
+}
+
+#: Roles in the order the helpers are declared.
+HELPER_ROLES: Tuple[str, ...] = ("pack", "unpack", "iter", "iterpack",
+                                 "itercheck", "append")
+
+
+def helper_names(rng: Any, used: Optional[Set[str]] = None) -> Dict[str, str]:
+    """Per-build names for the six shared helpers.
+
+    These were the constants ``_kpack``, ``_kunpk``, ``_kiter``,
+    ``_kiterpack``, ``_kitercheck`` and ``_kapp`` -- identical in every build,
+    always declared in the same order at the same place in the prelude.  That
+    is a stable signature an automated tool can anchor on before it has
+    understood a single instruction.
+
+    ``used`` must be the set of prefixes already handed out this build, so a
+    helper name cannot collide with the constant pool's or the string bank's.
+    """
+    import string as _string
+
+    used = used if used is not None else set()
+    out: Dict[str, str] = {}
+    for role in HELPER_ROLES:
+        while True:
+            candidate = "_k" + "".join(
+                rng.choice(_string.ascii_letters) for _ in range(4))
+            if candidate in used:
+                continue
+            used.add(candidate)
+            out[role] = candidate
+            break
+    return out
 
 #: Prefixes the reconstruction reserves for its own generated identifiers.  A
 #: random prefix must not start with any of these, or it could shadow one of
@@ -117,70 +152,77 @@ def fresh_prefix(rng: Any, used: Optional[Set[str]] = None,
                 used.add(candidate)
             return candidate
 
-HELPERS_SRC = f"""
-local function {HELPER_PACK}(...)
-  return table.pack(...)
-end
-local function {HELPER_UNPACK}(t, i)
-  return table.unpack(t, i, t.n)
-end
-local function {HELPER_ITER}(v)
-  -- Luau's generalized iteration.  The order matters: __iter wins over
-  -- callability, and whatever __iter hands back is used *unchecked*, so an
-  -- uncallable result fails later with "attempt to call a X value" exactly as
-  -- it does under Luau.
-  local mt = getmetatable(v)
-  local m = mt and mt.__iter
-  if m then
-    return m(v)
-  end
-  if type(v) == "function" then
-    return v
-  end
-  if mt and mt.__call then
-    return v
-  end
-  if type(v) == "table" then
-    return next, v, nil
-  end
-  -- Match Luau's own wording: user code routinely inspects this message with
-  -- pcall, so a different string changes observable behaviour.
-  error("attempt to iterate over a " .. type(v) .. " value")
-end
-local function {HELPER_ITERPACK}(t)
-  -- Luau picks between the classic (iterator, state, control) triple and
-  -- generalized iteration by how many values the iterator expression actually
-  -- produced: exactly one means the value is the iterable itself.
-  if t.n == 1 then
-    return {HELPER_ITER}(t[1])
-  end
-  return t[1], t[2], t[3]
-end
-local function {HELPER_ITERCHECK}(f)
-  -- The classic (iterator, state, control) form still needs the iterator to be
-  -- callable, and Luau reports that with its own wording rather than the
-  -- generic "attempt to call" a later call would produce.
-  local ty = type(f)
-  if ty == "function" then
-    return f
-  end
-  -- "callable" includes a __call metamethod, and a table or userdata may be
-  -- callable through one that getmetatable does not expose directly, so those
-  -- are left to the call itself.  Only the plainly non-callable types are
-  -- reported here, with Luau's own wording.
-  if ty == "table" or ty == "userdata" or ty == "thread" then
-    return f
-  end
-  error("attempt to iterate over a " .. ty .. " value")
-end
-local function {HELPER_APPEND}(dst, t)
-  local n = #dst
-  for i = 1, t.n do
-    n += 1
-    dst[n] = t[i]
-  end
-end
-"""
+def helpers_src(h: Dict[str, str]) -> str:
+    """The shared helper block, with this build's names."""
+    return f"""
+    local function {h['pack']}(...)
+      return table.pack(...)
+    end
+    local function {h['unpack']}(t, i)
+      return table.unpack(t, i, t.n)
+    end
+    local function {h['iter']}(v)
+      -- Luau's generalized iteration.  The order matters: __iter wins over
+      -- callability, and whatever __iter hands back is used *unchecked*, so an
+      -- uncallable result fails later with "attempt to call a X value" exactly as
+      -- it does under Luau.
+      local mt = getmetatable(v)
+      local m = mt and mt.__iter
+      if m then
+        return m(v)
+      end
+      if type(v) == "function" then
+        return v
+      end
+      if mt and mt.__call then
+        return v
+      end
+      if type(v) == "table" then
+        return next, v, nil
+      end
+      -- Match Luau's own wording: user code routinely inspects this message with
+      -- pcall, so a different string changes observable behaviour.
+      error("attempt to iterate over a " .. type(v) .. " value")
+    end
+    local function {h['iterpack']}(t)
+      -- Luau picks between the classic (iterator, state, control) triple and
+      -- generalized iteration by how many values the iterator expression actually
+      -- produced: exactly one means the value is the iterable itself.
+      if t.n == 1 then
+        return {h['iter']}(t[1])
+      end
+      return t[1], t[2], t[3]
+    end
+    local function {h['itercheck']}(f)
+      -- The classic (iterator, state, control) form still needs the iterator to be
+      -- callable, and Luau reports that with its own wording rather than the
+      -- generic "attempt to call" a later call would produce.
+      local ty = type(f)
+      if ty == "function" then
+        return f
+      end
+      -- "callable" includes a __call metamethod, and a table or userdata may be
+      -- callable through one that getmetatable does not expose directly, so those
+      -- are left to the call itself.  Only the plainly non-callable types are
+      -- reported here, with Luau's own wording.
+      if ty == "table" or ty == "userdata" or ty == "thread" then
+        return f
+      end
+      error("attempt to iterate over a " .. ty .. " value")
+    end
+    local function {h['append']}(dst, t)
+      local n = #dst
+      for i = 1, t.n do
+        n += 1
+        dst[n] = t[i]
+      end
+    end
+    """
+
+
+#: Legacy name for callers that have not been updated.
+HELPERS_SRC = helpers_src(DEFAULT_HELPERS)
+
 
 
 class ReconstructionError(Exception):
@@ -228,7 +270,8 @@ def _const_expr(value: Any) -> A.Expr:
 class Reconstructor:
     def __init__(self, pool: Any = None, accessor: Optional[str] = None,
                  vm: Any = None, bank: Any = None,
-                 bank_accessor: Optional[str] = None) -> None:
+                 bank_accessor: Optional[str] = None,
+                 helpers: Optional[Dict[str, str]] = None) -> None:
         """``pool`` is a :class:`~couxobf.constpool.ConstantPool`.
 
         When one is supplied, no literal reaches the output: every constant is
@@ -248,6 +291,10 @@ class Reconstructor:
         self.pool = pool
         self.accessor = accessor
         self.vm = vm
+        #: The shared helpers' names for this build.  Must match what
+        #: ``helpers_src`` declared, or the interpreter calls functions that do
+        #: not exist -- which is a runtime error, not a build error.
+        self.helpers: Dict[str, str] = dict(helpers or DEFAULT_HELPERS)
         #: proto_id -> EncodedProto, filled in as function_expr runs
         self.vm_encoded: Dict[int, Any] = {}
         #: Optional :class:`~couxobf.strings.bank.StringBank`.  When present,
@@ -407,7 +454,7 @@ class Reconstructor:
         return A.Assign(targets=[self._reg(proto, dst.index)], values=[value])
 
     def _splice(self, proto: FuncIR, pack: int) -> A.Expr:
-        return A.Call(fn=_name(HELPER_UNPACK), args=[self._reg(proto, pack),
+        return A.Call(fn=_name(self.helpers["unpack"]), args=[self._reg(proto, pack),
                                                      _num(1)])
 
     # -- prototype -------------------------------------------------------
@@ -501,7 +548,7 @@ class Reconstructor:
             return out
         if op == OP.SETLISTMULTI:
             return [A.ExprStat(expr=A.Call(
-                fn=_name(HELPER_APPEND),
+                fn=_name(self.helpers["append"]),
                 args=[self._reg(proto, a[0].index), self._reg(proto, a[1])]))]
         if op in _ARITH:
             return [self._assign(proto, a[0], A.Bin(op=_ARITH[op], left=g(1),
@@ -578,7 +625,7 @@ class Reconstructor:
         if op == OP.VARARG:
             base, n = a[0], int(a[1])
             if n == MULTIRET:
-                return [self._assign(proto, base, A.Call(fn=_name(HELPER_PACK),
+                return [self._assign(proto, base, A.Call(fn=_name(self.helpers["pack"]),
                                                          args=[A.Vararg()]))]
             targets = [self._reg(proto, base.index + i) for i in range(max(n, 0))]
             if not targets:
@@ -618,7 +665,8 @@ class Reconstructor:
         if op == OP.ITERPREP:
             base = a[0]
             packed = int(a[1]) if len(a) > 1 else 0
-            helper = HELPER_ITERPACK if packed else HELPER_ITER
+            helper = (self.helpers["iterpack"] if packed
+                      else self.helpers["iter"])
             return [A.Assign(
                 targets=[self._reg(proto, base.index + i) for i in range(3)],
                 values=[A.Call(fn=_name(helper),
@@ -634,7 +682,7 @@ class Reconstructor:
                 reg = self._reg(proto, base.index)
                 stmts.append(A.Assign(
                     targets=[reg],
-                    values=[A.Call(fn=_name(HELPER_ITERCHECK), args=[reg])]))
+                    values=[A.Call(fn=_name(self.helpers["itercheck"]), args=[reg])]))
             stmts.append(self._set_pc(pc, a[1]))
             return stmts
         if op == OP.FORIN:
@@ -675,7 +723,7 @@ class Reconstructor:
             return [A.ExprStat(expr=call)]
         if nres == MULTIRET:
             return [self._assign(proto, base,
-                                 A.Call(fn=_name(HELPER_PACK), args=[call]))]
+                                 A.Call(fn=_name(self.helpers["pack"]), args=[call]))]
         return [A.Assign(targets=[self._reg(proto, base.index + i)
                                   for i in range(nres)], values=[call])]
 
@@ -731,11 +779,15 @@ def reconstruct_protected(module: IRModule,
 
     prefixes: Set[str] = set()
     names = names or default_names(fresh_prefix(rng, prefixes))
+    # Drawn from the same `used` set as the pool and bank prefixes, so a helper
+    # name cannot collide with either runtime's identifiers.
+    helper_map = helper_names(rng, prefixes)
     if names_out is not None:
         # Callers need the names that were actually chosen.  Guessing them from
         # default_names() stopped working the moment the prefix became per-build,
         # and a validator that cannot find the helpers silently checks nothing.
         names_out["pool"] = dict(names)
+        names_out["helpers"] = dict(helper_map)
     if optimize_first:
         # before the pool is built, so folded constants are interned once
         # rather than once per site they were duplicated at
@@ -761,7 +813,14 @@ def reconstruct_protected(module: IRModule,
                                  permute_blocks=block_permutation,
                                  layout_rng=layout_rng,
                                  dispatcher=dispatcher_family,
-                                 randomize_opcodes=opcode_randomization)
+                                 randomize_opcodes=opcode_randomization,
+                                 # wiring indexes this positionally as
+                                 # (append, iter, iterpack, itercheck); passing
+                                 # the dict would hand it the role *keys*.
+                                 shared=(helper_map["append"],
+                                         helper_map["iter"],
+                                         helper_map["iterpack"],
+                                         helper_map["itercheck"]))
 
     # Strings get their own bank at level 2 and above: fragmented, scattered
     # across shuffled pages, and addressed by a per-occurrence ticket rather
@@ -783,7 +842,8 @@ def reconstruct_protected(module: IRModule,
             names_out["bank"] = dict(bank_names)
 
     rec = Reconstructor(pool=pool, accessor=names["get"], vm=plan, bank=bank,
-                        bank_accessor=(bank_names["get"] if bank_names else None))
+                        bank_accessor=(bank_names["get"] if bank_names else None),
+                        helpers=helper_map)
     body = rec.reconstruct(module)
 
     # The VM's bytecode and constants are interned here, before the pool is
@@ -858,7 +918,7 @@ def reconstruct_protected(module: IRModule,
     bank_block = _parser.parse(bank_src, "<stringbank>") if bank_src else None
     # The helper functions have to be in scope too; a loop or a multi-value
     # call anywhere in the body refers to them.
-    helpers = _parser.parse(HELPERS_SRC, "<helpers>")
+    helpers = _parser.parse(helpers_src(helper_map), "<helpers>")
 
     # The VM prelude goes after both: the interpreter calls the helpers, and
     # the descriptor table reads the bytecode and the constants back out of the
