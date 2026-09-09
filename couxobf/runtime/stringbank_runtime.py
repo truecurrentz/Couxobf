@@ -88,10 +88,14 @@ class StringBankRuntime:
         """The name generated code calls to resolve a ticket."""
         return self.n["get"]
 
-    def emit(self, sealed, crypto_src: str = "", guard_check: str = "") -> str:
+    def emit(self, sealed, crypto_src: str = "", guard_check: str = "",
+             ticket_mask: int = 0) -> str:
         n = self.n
+        ticket_mask &= 0xffffffff
         trip = (f"  if not {guard_check}() then error(\"invalid state\") end\n"
                 if guard_check else "")
+        deticket = (f"  ticket = bit32.bxor(ticket, {ticket_mask})\n"
+                    if ticket_mask else "")
         if self.emit_crypto:
             head = f"local {n['crypto']} = (function()\n{crypto_src}end)()\n"
         else:
@@ -104,6 +108,7 @@ class StringBankRuntime:
             cache_block = (
                 f"local function {n['get']}(ticket)\n"
                 f"{trip}"
+                f"{deticket}"
                 f"  {n['load']}()\n"
                 f"  local cls = ticket % 3\n"
                 f"  if cls == 0 then\n"
@@ -132,6 +137,7 @@ class StringBankRuntime:
                 f"local {n['live']} = 0\n"
                 f"local function {n['get']}(ticket)\n"
                 f"{trip}"
+                f"{deticket}"
                 f"  {n['load']}()\n"
                 f"  if {n['seen']}[ticket] then\n"
                 f"    return {n['cache']}[ticket]\n"

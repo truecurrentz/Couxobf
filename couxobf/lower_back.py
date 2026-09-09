@@ -295,7 +295,8 @@ class Reconstructor:
                  bank_accessor: Optional[str] = None,
                  helpers: Optional[Dict[str, str]] = None,
                  native_prefix: str = PREFIX,
-                 pool_ticket: Optional[Any] = None) -> None:
+                 pool_ticket: Optional[Any] = None,
+                 bank_ticket: Optional[Any] = None) -> None:
         """``pool`` is a :class:`~couxobf.constpool.ConstantPool`.
 
         When one is supplied, no literal reaches the output: every constant is
@@ -338,6 +339,7 @@ class Reconstructor:
         #: call costs far more than it hides.
         self.bank = bank
         self.bank_accessor = bank_accessor
+        self.bank_ticket = bank_ticket or (lambda ticket: ticket)
         if (pool is None) != (accessor is None):
             raise ReconstructionError("pool and accessor must be given together")
 
@@ -483,7 +485,8 @@ class Reconstructor:
         value = proto.consts[k.index]
         if isinstance(value, (bytes, bytearray, str)):
             ticket = self.bank.ticket(value)
-            return A.Call(fn=_name(self.bank_accessor), args=[_num(ticket)])
+            return A.Call(fn=_name(self.bank_accessor),
+                          args=[_num(self.bank_ticket(ticket))])
         return self._pool_ref(value)
 
     def _pool_ref(self, value: Any) -> A.Expr:
@@ -1005,11 +1008,21 @@ def reconstruct_protected(module: IRModule,
     if pool_ticket_mask == 0:
         pool_ticket_mask = 0x5A17C0DE
     pool_ticket = lambda slot: (int(slot) ^ pool_ticket_mask) & 0xffffffff
+    bank_ticket_rng = ((string_rng if string_rng is not None else rng).fork("bank-ticket")
+                       if hasattr(string_rng if string_rng is not None else rng, "fork")
+                       else ticket_rng)
+    bank_ticket_mask = (bank_ticket_rng.u32() if hasattr(bank_ticket_rng, "u32") else 0x13579BDF) & 0xffffffff
+    if bank_ticket_mask == 0:
+        bank_ticket_mask = 0x13579BDF
+    bank_ticket = lambda ticket: (int(ticket) ^ bank_ticket_mask) & 0xffffffff
+    if names_out is not None:
+        names_out["bank_ticket_mask"] = bank_ticket_mask if bank is not None else 0
     rec = Reconstructor(pool=pool, accessor=names["get"], vm=plan, bank=bank,
                         bank_accessor=(bank_names["get"] if bank_names else None),
                         helpers=helper_map,
                         native_prefix=fresh_prefix(rng, prefixes),
-                        pool_ticket=pool_ticket)
+                        pool_ticket=pool_ticket,
+                        bank_ticket=bank_ticket)
     rec.vm_layout_rng = layout_rng if layout_rng is not None else vm_rng
     body = rec.reconstruct(module)
 
@@ -1098,7 +1111,8 @@ def reconstruct_protected(module: IRModule,
             crypto_runtime({"xor": bn["c_xor"], "sha": bn["c_sha"],
                             "mac": bn["c_mac"], "open": bn["c_open"],
                             "seal": bn["c_seal"]}) if not crypto_src else "",
-            guard_check=runtime_guard_check)
+            guard_check=runtime_guard_check,
+            ticket_mask=bank_ticket_mask)
 
     crypto_block = _parser.parse(crypto_src, "<crypto>") if crypto_src else None
     pool_block = _parser.parse(pool_src, "<constpool>") if pool_src else None

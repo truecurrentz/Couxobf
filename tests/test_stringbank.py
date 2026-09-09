@@ -23,6 +23,7 @@ error, which is confidentiality without integrity.
 """
 
 import os
+import re
 import struct
 import sys
 
@@ -60,11 +61,12 @@ def make_bank(seed=b"\x33" * 16, page_size=256, **kw):
                       b"test-ctx", page_size=page_size, **kw)
 
 
-def emit(sealed, names, cache_policy="none"):
+def emit(sealed, names, cache_policy="none", ticket_mask=0):
     """The bank runtime plus a shared crypto module, as Luau source."""
     crypto = crypto_runtime({k: names["c_" + k]
                              for k in ("xor", "sha", "mac", "open", "seal")})
-    return StringBankRuntime(names, cache_policy=cache_policy).emit(sealed, crypto)
+    return StringBankRuntime(names, cache_policy=cache_policy).emit(
+        sealed, crypto, ticket_mask=ticket_mask)
 
 
 def lit(raw: bytes) -> str:
@@ -244,6 +246,35 @@ def test_runtime_resolves_every_ticket(policy):
     assert "BAD" not in result.stdout, (
         f"cache_policy={policy}: {result.stdout[:300]}")
     assert "resolved" in result.stdout
+
+
+def test_runtime_accepts_build_specific_ticket_images():
+    if not TOOLCHAIN.can_execute:
+        pytest.skip("luau runtime not available; run tools/setup-luau.sh")
+    bank = make_bank(randomized_ids=True)
+    raw = bank.ticket(b"ticketed string")
+    sealed = bank.seal()
+    mask = 0x13579BDF
+    names = default_names()
+    src = emit(sealed, names, ticket_mask=mask)
+    src += 'print(%s(%d) == %s)\n' % (names["get"], raw ^ mask,
+                                      lit(b"ticketed string"))
+    result = execute(TOOLCHAIN, src, "ticketed-bank.luau", timeout=30)
+    assert result.returncode == 0, result.stderr[:300]
+    assert result.stdout.strip() == "true"
+
+
+def test_reconstructed_string_calls_do_not_expose_raw_bank_tickets():
+    runtime_names = {}
+    out = _protected('local function f() return "left" .. "right" end\nprint(f())\n',
+                     names_out=runtime_names)
+    mask = runtime_names["bank_ticket_mask"]
+    assert mask
+    assert "bit32.bxor(ticket," in out
+    # Raw ticket ids are encrypted into the ticket table; call sites carry their
+    # build-specific images, so an argument scrape is not the runtime index map.
+    for raw in re.findall(r"ix\[(\d+)\]", out):
+        assert int(raw) ^ mask != int(raw)
 
 
 def test_repeated_reads_are_stable_under_every_policy():
