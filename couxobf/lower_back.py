@@ -806,6 +806,7 @@ def reconstruct_protected(module: IRModule,
                           string_cache_policy: str = "none",
                           string_page_size: int = 512,
                           vm_variety: int = 1,
+                          isa_subset: bool = False,
                           fmt_prefs: Any = None,
                           families: Any = None,
                           dispatchers: Any = None,
@@ -893,6 +894,14 @@ def reconstruct_protected(module: IRModule,
                                  # the config's name for choosing that is
                                  # `metadata_fragmentation`.
                                  fragmented=bool(metadata_fragmentation),
+                                 # Per-group instruction sets: the narrowing is
+                                 # only answerable with the IR in hand, because
+                                 # "which opcodes does this function need" is a
+                                 # question about its instructions, not about any
+                                 # of the names the config has.
+                                 protos_by_id=({q.proto_id: q for q in module.protos}
+                                                if isa_subset else None),
+                                 isa_subset=bool(isa_subset),
                                  # wiring indexes this positionally as
                                  # (append, iter, iterpack, itercheck); passing
                                  # the dict would hand it the role *keys*.

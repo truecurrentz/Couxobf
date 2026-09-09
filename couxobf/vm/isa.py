@@ -199,15 +199,22 @@ class OpcodeMap:
             self.fused = {}
 
     @classmethod
-    def identity(cls) -> "OpcodeMap":
-        ops = sorted(SUPPORTED)
+    def identity(cls, ops: Optional[Sequence[str]] = None) -> "OpcodeMap":
+        """Dense numbering in name order, over all of the ISA or over a subset.
+
+        The subset form exists so a group that only ever runs three numeric
+        helpers has three handlers, with or without randomization -- the arm
+        count is a property of the code, not of this switch.
+        """
+        ops = sorted(SUPPORTED if ops is None else set(ops))
         return cls(to_byte={op: i + 1 for i, op in enumerate(ops)},
                    to_op={i + 1: op for i, op in enumerate(ops)})
 
     @classmethod
     def shuffled(cls, rng: Rng, *, alias_ratio: float = 0.0,
                  fused: Sequence[Tuple[str, str]] = (),
-                 sparse: int = 1) -> "OpcodeMap":
+                 sparse: int = 1,
+                 ops: Optional[Sequence[str]] = None) -> "OpcodeMap":
         """A permutation, optionally with alias numbers and super-ops.
 
         ``alias_ratio`` is the chance that an opcode gets a second (or third)
@@ -215,11 +222,19 @@ class OpcodeMap:
         opcode bytes the dispatcher has to consider*, which is the quantity the
         design asks to randomize -- a fixed 47 is a fingerprint even when the
         numbers themselves move.
+
+        ``ops`` restricts the map to the operations one group's prototypes use.
+        Anything outside it has no number and no handler, which is a *build
+        failure* rather than a wrong answer: ``byte()`` raises, and the
+        validator's walk refuses an unassigned number.  Callers therefore
+        over-approximate the requirement (see
+        :func:`couxobf.vm.encode.required_ops`) instead of under-approximating
+        it, and an over-approximation only costs a few dead arms.
         """
-        # sorted, not list(SUPPORTED): iterating a set of strings follows
-        # PYTHONHASHSEED, so an unsorted base would make "same seed, same
-        # output" false across processes.
-        ops = sorted(SUPPORTED)
+        # sorted, not a set of strings: iterating a set follows PYTHONHASHSEED,
+        # so an unsorted base would make "same seed, same output" false across
+        # processes.
+        ops = sorted(SUPPORTED if ops is None else set(ops))
         order = [ops[j] for j in rng.permutation(len(ops))]
         # A one-byte opcode field holds 1..255, and 0 is reserved because
         # `string.byte` returns nil past the end of the payload -- so the number
@@ -250,6 +265,10 @@ class OpcodeMap:
             return at
 
         for op in order:
+            # `order` is the drawn permutation of `ops`; a fused rule whose
+            # halves are not in the subset would name an unassigned opcode, so
+            # the halves are pulled in here rather than filtered out -- the
+            # encoder is allowed to emit the pair for exactly those two ops.
             number = claim(max(1, sparse))
             if number is None:  # pragma: no cover - 47 opcodes cannot fill 255
                 raise ValueError("no opcode numbers left for %s" % op)

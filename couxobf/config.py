@@ -169,6 +169,22 @@ class Config:
     #: Protect jump targets by biasing or by relative offsets rather than raw
     #: positions, so the numbers in the stream mean nothing without the format.
     pc_protection: bool = True
+    #: Disguise the opcode *number* in the payload: the dispatcher still branches
+    #: on the number its map assigned, but the stream carries a bijective image
+    #: of it (a rotation, an affine map, or a halves swap).  Costs no bytes -- it
+    #: is arithmetic on the fetch, not a wider field -- and it is what stops a
+    #: table of "byte 7 is ADD", recovered from one build and pointed at another.
+    #: Lives inside the instruction format, so it needs `operand_randomization`
+    #: on: with variety 0 `FormatSpec.draw` returns the historical format untouched
+    #: and there is no cipher field to draw.  `instruction_formats` then decides
+    #: how much the format -- and with it the choice of image -- is allowed to move.
+    opcode_cipher: bool = True
+    #: Give each VM group only the opcodes the prototypes on it actually use,
+    #: instead of the full instruction set with handlers nobody calls.  The
+    #: dispatcher shrinks per group, so the number of arms becomes a property of
+    #: the function; a build whose one VM runs three numeric helpers is not the
+    #: build that virtualized a table-heavy one.
+    vm_isa_subset: bool = True
     #: Keep control-flow edges out of the instruction stream: the payload
     #: carries an ordinal and the destinations live in their own blob.
     edge_indirection: bool = False
@@ -328,6 +344,8 @@ class Config:
             super_instructions=False,
             instruction_fusion=False,
             handler_splitting=False,
+            opcode_cipher=False,
+            vm_isa_subset=False,
             minify=True,
         )
 
@@ -419,6 +437,8 @@ class Config:
         "instruction_fusion",
         "super_instructions",
         "pc_protection",
+        "opcode_cipher",
+        "vm_isa_subset",
         "edge_indirection",
         "state_distribution",
         "dispatcher_splitting",

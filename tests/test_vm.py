@@ -836,6 +836,213 @@ def test_opcode_randomization_changes_the_numbering():
 
 
 # ---------------------------------------------------------------------------
+# opcode disguise (Config.opcode_cipher) and per-group instruction sets
+# ---------------------------------------------------------------------------
+#
+# Both exist for the same reason: a table recovered from one build -- "byte 7 is
+# ADD", "the third arm is LOADK", "every VM here carries 43 handlers" -- must not
+# be a table about the next build.  The disguise is arithmetic on the fetch, so it
+# costs no bytes; the subset shrinks the artifact instead of growing it.
+
+def _cipher_spec(cipher: str, op_bytes: int = 1) -> FormatSpec:
+    mod = (1 << (8 * op_bytes)) - 1
+    return FormatSpec(op_bytes=op_bytes, op_cipher=cipher, op_bias=37,
+                      op_mult=7, op_mult_inv=pow(7, -1, mod))
+
+
+@pytest.mark.parametrize("cipher", ("none", "add", "affine", "swap"))
+@pytest.mark.parametrize("op_bytes", (1, 2))
+def test_the_cipher_is_a_bijection_over_the_number_space(cipher, op_bytes):
+    """Every number survives, none lands on 0, and 0 is never produced.
+
+    The field is one byte (or two) and the map is 1..modulus, because
+    ``string.byte`` returns nil past the end of the payload -- a stored 0 would
+    read as a valid short instruction.  So the image has to fix 0 and permute
+    the rest, which is why these are rotations and multiplications modulo
+    ``modulus`` rather than an XOR of the field.
+    """
+    fmt = _cipher_spec(cipher, op_bytes)
+    mod = fmt.op_modulus
+    stored = [fmt.encode_op(n) for n in range(1, mod + 1)]
+    assert len(set(stored)) == mod, "not injective"
+    assert all(1 <= v <= mod for v in stored), "image leaves 1..mod"
+    assert all(fmt.decode_op(fmt.encode_op(n)) == n for n in range(1, mod + 1))
+    if cipher != "none":
+        # The number space excludes 0 by construction, so a cipher that could
+        # produce it would be a bug: the reader would treat a payload overrun as
+        # a short instruction rather than as the end of the stream.
+        with pytest.raises(ValueError):
+            fmt.encode_op(0)
+        with pytest.raises(ValueError):
+            fmt.encode_op(mod + 1)
+
+
+@pytest.mark.skipif(not TOOLCHAIN.can_execute, reason="luau runtime unavailable")
+@pytest.mark.parametrize("cipher", ("none", "add", "affine", "swap"))
+@pytest.mark.parametrize("op_bytes", (1, 2))
+def test_the_emitted_reader_decodes_what_the_encoder_wrote(cipher, op_bytes):
+    """Two implementations of a decoder have to be compared by running them.
+
+    `decode_op` in Python and the `_ro` that gets inlined into the interpreter are
+    the same rule written twice, in two languages, and a format bug of that shape
+    -- one side updated, the other not -- is the failure mode that has already
+    bitten this project twice.  So this feeds real bytes through the real emitted
+    reader and compares against what the encoder meant.
+    """
+    import struct
+    fmt = _cipher_spec(cipher, op_bytes)
+    numbers = list(range(1, min(fmt.op_modulus, 255) + 1))
+    payload = b"".join(struct.pack("<H" if op_bytes == 2 else "<B",
+                                   fmt.encode_op(n)) for n in numbers)
+    lines = ["local _bd = string.byte", "local t = {}"]
+    for i, byte in enumerate(payload, 1):
+        lines.append("t[%d] = string.char(%d)" % (i, byte))
+    lines.append("local code = table.concat(t)")
+    from couxobf.vm.format import reader_source
+    lines += reader_source(fmt, "code")
+    lines.append("for a = 1, %d, %d do print(_ro(a)) end" % (len(payload), op_bytes))
+    result = execute(TOOLCHAIN, "\n".join(lines), "cipher.luau", timeout=60)
+    assert result.returncode == 0, result.stderr[:400]
+    got = [int(float(word)) for word in result.stdout.split()]
+    assert got == numbers, "%s: emitted reader disagrees" % cipher
+
+
+def test_a_ciphered_payload_is_indecipherable_without_the_format():
+    """Read the stream with a format that lacks the cipher and it stops being valid.
+
+    This is the whole point of disguising the number, expressed as something a
+    test can check: a payload lifted into a tool that assumes opcode bytes are
+    dispatch numbers is *rejected*, not misread.  It also pins the other half --
+    the validator reads the payload through the same FormatSpec the interpreter
+    was generated from, so a disguised stream cannot quietly validate against
+    undisguised expectations and bless a corruption.
+    """
+    from couxobf.integrity.payload import validate_proto
+    from couxobf.integrity import IntegrityError
+
+    src = "local function f(a, b) return a + b end\nprint(f(2, 3))\n"
+    module = ir.Lowerer().lower(parser.parse(src, "cipher.luau"))
+    proto = next(q for q in _all_protos(module) if q.proto_id == 1)
+    plan = _plan(protos=(1,), isa_subset=False)
+    group = plan.groups[0]
+    fmt = group.fmt
+    assert fmt.op_cipher != "none", "the fixed seed has to draw a cipher"
+
+    enc = encode.encode_proto(proto, group.opmap, fmt=fmt)
+    # Right format: the walk reaches every instruction boundary the encoder laid.
+    validate_proto(1, enc.code, enc.consts, group.opmap,
+                   expected_starts=enc.starts, fmt=fmt)
+    # Same bytes, a reader that assumes raw numbers: not a valid program.
+    with pytest.raises(IntegrityError):
+        validate_proto(1, enc.code, enc.consts, group.opmap,
+                       expected_starts=enc.starts,
+                       fmt=FormatSpec(op_bytes=fmt.op_bytes))
+    # And a *different* key is just as wrong as no key: the same disguise with
+    # another bias does not decode this stream either.
+    with pytest.raises(IntegrityError):
+        validate_proto(1, enc.code, enc.consts, group.opmap,
+                       expected_starts=enc.starts,
+                       fmt=dataclasses.replace(fmt, op_bias=fmt.op_bias + 11))
+
+
+def test_the_instruction_set_follows_the_prototype():
+    """Subset on: the group carries what its functions use, and nothing else.
+
+    The `print` in this program lives in the main chunk, which is never
+    virtualized, so ``GETGLOBAL`` belongs to no group of this build -- while the
+    full ISA map, which is what subset-off produces, has it.  A group's handler
+    count is therefore a property of the code inside it, which is the point of the
+    option; the same reasoning is what makes the count differ between two builds
+    of two different programs.
+    """
+    src = "local function f(a, b) return a + b end\nprint(f(2, 3))\n"
+    module = ir.Lowerer().lower(parser.parse(src, "subset.luau"))
+    by_id = {q.proto_id: q for q in _all_protos(module)}
+    needed = encode.required_ops(by_id[1])
+    assert needed and "GETGLOBAL" not in needed
+
+    full = _plan(protos=(1,), isa_subset=False)
+    narrow = _plan(protos=(1,), isa_subset=True, protos_by_id=by_id)
+    assert full.groups[0].opmap.size() > narrow.groups[0].opmap.size()
+    assert set(needed) <= set(narrow.groups[0].opmap.to_byte)
+    assert "GETGLOBAL" not in narrow.groups[0].opmap.to_byte
+    assert "GETGLOBAL" in full.groups[0].opmap.to_byte
+    with pytest.raises(KeyError, match="not in this build"):
+        narrow.groups[0].opmap.byte("GETGLOBAL")
+
+
+def test_required_ops_over_approximates_rather_than_guesses():
+    """A missing opcode breaks the build; an extra one costs a dead arm.
+
+    Block permutation can insert a ``JMP`` the IR does not contain, and a fusion
+    rule may or may not fire for a given block, so both are included whatever the
+    prototype looks like.  That is why narrowing is safe at all: the subset is a
+    superset of what the encoder can emit, never an estimate of it.
+    """
+    from couxobf.vm.format import FusionRule
+
+    src = "local function f(a) return a + 1 end\nprint(f(2))\n"
+    module = ir.Lowerer().lower(parser.parse(src, "over.luau"))
+    proto = next(q for q in _all_protos(module) if q.proto_id == 1)
+    plain = encode.required_ops(proto)
+    with_jumps = encode.required_ops(proto, permuted_blocks=True)
+    assert ir.OP.JMP not in plain
+    assert ir.OP.JMP in with_jumps
+    assert encode.required_ops(proto, FormatSpec(fused=())) == plain
+    both = encode.required_ops(proto, FormatSpec(fused=(FusionRule("LOADK", "ADD"),)))
+    assert {"LOADK", "ADD"} <= both
+    # A prototype whose instructions cannot all be named gets no answer at all,
+    # which the caller reads as "do not narrow" -- the fail-safe direction, since
+    # the alternative is a group with a handler missing.
+    m2 = ir.Lowerer().lower(parser.parse(
+        "local function g(...)<NEWLINE>  local n = select(2, ...)\n  return n\nend\n"
+        "print(g(1, 2))\n".replace("<NEWLINE>", " "), "var.luau"))
+    unknown = [q for q in _all_protos(m2)
+               if encode.required_ops(q) is None]
+    assert unknown, "expected a prototype required_ops cannot answer for"
+
+
+def test_permuted_arms_test_the_same_numbers_in_a_different_order():
+    """Free reordering, applied -- and it stays a function of (map, format).
+
+    The chain matches on disjoint numbers, so which arm is tried first changes
+    nothing about what the interpreter accepts.  What it changes is that arm
+    positions carry meaning, which is a small thing to an analyst reading two
+    builds side by side and a large thing for a tool that assumes it.
+    """
+    from couxobf.vm.runtime import dispatch_entries
+
+    opmap = _opmap()
+    first = dispatch_entries(opmap, FormatSpec(arm_seed=1234567))
+    same = dispatch_entries(opmap, FormatSpec(arm_seed=1234567))
+    other = dispatch_entries(opmap, FormatSpec(arm_seed=7654321))
+    plain = dispatch_entries(opmap, FormatSpec())
+    assert [e.numbers for e in first] == [e.numbers for e in same]
+    assert {e.op for e in first} == {e.op for e in plain}
+    assert [e.numbers for e in first] != [e.numbers for e in plain]
+    assert [e.numbers for e in first] != [e.numbers for e in other]
+    # every number the map hands out is still reachable exactly once
+    flat = [n for e in first for n in e.numbers]
+    assert sorted(flat) == sorted(n for e in plain for n in e.numbers)
+
+
+def test_the_fetch_goes_through_the_reader():
+    """No raw `byte(code, pc)` at the dispatch site, in any format.
+
+    The selector is the one field a matcher can find without understanding
+    anything else, so it is read through the generated reader like every operand
+    -- which is also the only place the disguise can be undone consistently.
+    """
+    for op_bytes in (1, 2):
+        for cipher in ("none", "add", "affine", "swap"):
+            source = runtime.interpreter_source(
+                _opmap(), NAMES, "register", "nested_if",
+                _cipher_spec(cipher, op_bytes))
+            assert "_ro(pc)" in source, cipher
+            assert "local op = _bd(" not in source, cipher
+
+
+# ---------------------------------------------------------------------------
 # handler hygiene: a body may only touch names its own reads declare
 # ---------------------------------------------------------------------------
 #

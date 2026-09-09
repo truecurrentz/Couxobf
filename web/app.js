@@ -44,6 +44,11 @@ const SPEC = [
       ["dispatcher_family", "Dispatcher", "select",
        "How the interpreter picks the next handler. `mixed` draws one per group, " +
        "which is what makes the dispatcher part of the per-build shape."],
+      ["vm_isa_subset", "Per-VM instruction set", "bool",
+       "Each interpreter carries only the opcodes the functions on it need, so the " +
+       "handler count follows the code instead of being the whole ISA in every " +
+       "build. It also shrinks the artifact; a VM running three numeric helpers " +
+       "does not need forty arms."],
       ["state_distribution", "Spread VM state", "bool",
        "Rotate the extra groups through the other families instead of repeating one " +
        "discipline for the whole build."],
@@ -71,6 +76,11 @@ const SPEC = [
        "ordinal and the destinations live in their own blob."],
       ["opcode_randomization", "Opcode randomization", "bool",
        "Number opcodes per build rather than following Luau's order."],
+      ["opcode_cipher", "Opcode cipher", "bool",
+       "The payload carries a disguised image of the opcode number -- a rotation, " +
+       "an affine map, or a halves swap -- while the interpreter branches on the " +
+       "number its own map assigned. Costs no bytes, and it is what makes a table " +
+       "of \"byte 7 means ADD\" from one build say nothing about another."],
       ["opcode_aliases", "Opcode aliases", "select",
        "How many numbers can reach one instruction: 0 one number per opcode, 1 " +
        "some opcodes get a second alias, 2 widens both the alias set and the " +
@@ -638,11 +648,15 @@ function renderVms(groups) {
   const box = $("vmBox");
   if (!groups || !groups.length) { box.hidden = true; return; }
   const head = "<tr><td>vm</td><td>family / dispatch</td></tr>";
-  const rows = groups.map((g) => `<tr><td><code>vm ${g.group}</code></td>` +
+  const rows = groups.map((g) => {
+    const opCipher = g.op_cipher === "none" ? "none (raw numbers)" : g.op_cipher;
+    return `<tr><td><code>vm ${g.group}</code></td>` +
     `<td>${g.family} · ${g.dispatcher} · ${g.prototypes} ` +
     `${g.prototypes === 1 ? "prototype" : "prototypes"} · ${g.opcodes} opcodes · ` +
     `${g.op_bytes}B op + ${g.reg_bytes}B reg + ${g.wide_bytes}B wide · ` +
-    `targets ${g.target_mode}${g.fused ? ` · ${g.fused} fused` : ""}</td></tr>`).join("");
+    `targets ${g.target_mode} · opcode cipher ${g.opCipher}` +
+    `${g.fused ? ` · ${g.fused} fused` : ""}</td></tr>`;
+  }).join("");
   $("vmBody").innerHTML = head + rows;
   box.hidden = false;
 }

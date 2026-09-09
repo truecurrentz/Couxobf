@@ -499,6 +499,46 @@ def _instruction_size(ins: Instr, fmt: Optional[FormatSpec] = None) -> int:
     return operand_size(op, fmt)
 
 
+def required_ops(proto: FuncIR, fmt: Optional[FormatSpec] = None, *,
+                 permuted_blocks: bool = False) -> Optional[Set[str]]:
+    """The VM opcodes one prototype needs, or None if it cannot be answered here.
+
+    This is the input to per-group instruction sets: a group that only runs three
+    numeric helpers should not carry 43 arms.  It is deliberately a *superset* of
+    what the encoder will emit, because the safe direction to be wrong in is
+    "one arm too many" -- an op missing from the map is a build failure, an extra
+    one is a few dead bytes.
+
+    So anything the encoder may add on its own is included without trying to
+    predict it: both halves of every fusion rule the format understands (the
+    choice to fuse a pair is the encoder's, made per block with the build's
+    randomness), and a ``JMP`` whenever block layout can be permuted, because
+    :func:`_layout` inserts explicit jumps where a fall-through stopped being the
+    right edge.  Return values the opcode mapping cannot name -- an IR instruction
+    that is not in the VM's set, or one whose ``vm_opcode`` depends on more than
+    the IR -- also collapse to None, which the caller reads as "no subset".
+    """
+    spec = fmt if fmt is not None else LEGACY_SPEC
+    ops: Set[str] = set()
+    for block in proto.blocks:
+        for ins in block.instrs:
+            if ins.op not in SUPPORTED:
+                return None
+            try:
+                expected = IR_ARITY.get(ins.op)
+                if expected is not None and len(ins.args) != expected:
+                    return None
+                ops.add(vm_opcode(ins.op, ins.args))
+            except (KeyError, IndexError, TypeError):
+                return None
+    if permuted_blocks:
+        ops.add(OP.JMP)
+    for rule in spec.fused:
+        ops.add(rule.first)
+        ops.add(rule.second)
+    return ops
+
+
 def encode_proto(proto: FuncIR, opmap: OpcodeMap,
                  order: Optional[Sequence[int]] = None,
                  fmt: Optional[FormatSpec] = None,
@@ -663,6 +703,12 @@ def _encode_unit(unit: Any, opmap: OpcodeMap, fmt: FormatSpec, target,
     else:
         number = _pick_number(opmap, vm_opcode(unit.op, unit.args), rng,
                               alias_chance)
+    # The stream carries the cipher's image of the number, never the number the
+    # dispatcher compares against.  One write site, one read site (`_ro` in the
+    # generated reader, `opcode_at` in the validator), both derived from the same
+    # FormatSpec -- so this cannot disagree with the interpreter the way two
+    # hand-written halves of a format always eventually do.
+    number = fmt.encode_op(number)
     for i in range(fmt.op_bytes):
         body[i] = (number >> (8 * i)) & 0xFF
     if fmt.pad:

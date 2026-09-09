@@ -383,6 +383,7 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         vm_protos=selected,
         vm_family=config.vm_family,
         block_permutation=config.block_permutation,
+        isa_subset=bool(config.vm_isa_subset),
         layout_rng=domains.get("cfg"),
         dispatcher_family=config.dispatcher_family,
         opcode_randomization=config.opcode_randomization,
@@ -550,7 +551,7 @@ def cost_report(result: BuildResult) -> str:
         fmt = group.get("format") or {}
         lines.append(
             "  vm %d              : %-10s %-14s %2d protos, %2d opcodes, "
-            "%dB op + %dB reg + %dB wide, targets %s%s"
+            "%dB op + %dB reg + %dB wide, targets %s, opcode cipher %s%s"
             % (group.get("group", 0),
                group.get("family", "?"),
                group.get("dispatcher", "?"),
@@ -559,6 +560,7 @@ def cost_report(result: BuildResult) -> str:
                fmt.get("op_bytes", 1), fmt.get("reg_bytes", 1),
                fmt.get("wide_bytes", 2),
                fmt.get("target_mode", "abs"),
+               fmt.get("op_cipher", "none"),
                ", %d fused" % len(fmt.get("fused") or [])
                if fmt.get("fused") else ""))
     guard = s.guard
@@ -607,9 +609,8 @@ def cost_report(result: BuildResult) -> str:
     lines.append("1. Locate the interpreter.  Its local names come from the")
     lines.append("   build's identifier stream, so they differ per build.")
     if s.virtualized:
-        lines.append(f"2. Recover the opcode numbering.  {_opcode_count()} opcodes")
-        lines.append("   are permuted per build; the numbers are only meaningful")
-        lines.append("   inside this artifact.")
+        for line in _opcode_lines(s):
+            lines.append(line)
         lines.append("3. Decode the bytecode.  It is encrypted in the constant")
         lines.append("   pool, so the pool has to be decrypted first -- which")
         lines.append("   means recovering a key that is present in the file.")
@@ -665,3 +666,35 @@ def _opcode_count() -> int:
     """How many opcodes the VM permutes, for the report."""
     from .vm.isa import SUPPORTED
     return len(SUPPORTED)
+
+
+def _opcode_lines(s: "BuildStats") -> List[str]:
+    """Step 2 of the analyst's list, from what this build actually emitted.
+
+    It used to print ``len(SUPPORTED)`` -- "43 opcodes are permuted per build" --
+    which was true when every build carried one flat map.  With per-group
+    instruction sets the honest sentence names the interpreters, how many arms
+    each has, and whether the payload's numbers are disguised at all; a report
+    that described the tool's ISA instead of the artifact would be overstating
+    the work in one direction and understating it in two others.
+    """
+    groups = list(getattr(s, "vm_groups", None) or [])
+    arms = [int(g.get("opcodes") or 0) for g in groups] or [_opcode_count()]
+    ciphers = {str((g.get("format") or {}).get("op_cipher", "none"))
+               for g in groups}
+    disguised = ciphers - {"none"}
+    count = ("%d arms" % arms[0] if len(arms) == 1
+             else "%s or %d arms" % (", ".join(str(a) for a in arms[:-1]), arms[-1]))
+    lines = ["2. Recover the opcode numbering.  %d interpreter%s with %s,"
+             % (len(arms), "s" if len(arms) > 1 else "", count)]
+    lines.append("   permuted per build and meaningful only inside this")
+    lines.append("   artifact.")
+    if disguised:
+        lines.append("   The payload carries a disguised image of each number")
+        lines.append("   (%s), so a byte in the stream is not a selector:"
+                     % ", ".join(sorted(disguised)))
+        lines.append("   it has to be read through this build's reader first.")
+    else:
+        lines.append("   The opcode numbers appear in the payload as written --")
+        lines.append("   `opcode_cipher` is off, so nothing undoes them.")
+    return lines

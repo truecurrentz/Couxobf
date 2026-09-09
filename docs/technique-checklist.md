@@ -3,9 +3,12 @@
 All 80 points, each checked against what this build actually does. Every claim
 below was measured on the artifact this tree produces or read out of the code —
 not inferred from intent. Measured 2026-09-09 on Python 3.11 with the pinned Luau
-toolchain in `.luau-toolchain/`, against the tree at commit `a9f4ef8` plus the
-per-group reporting and the pool-binding gate added since (the latter only changes
-artifacts that draw a VM plan and virtualize nothing into it). Where a
+toolchain in `.luau-toolchain/`, against the tree at `a9f4ef8` plus the per-group
+reporting, the pool-binding gate, and the per-build-diversity round since it --
+`opcode_cipher`, `vm_isa_subset`, seed-permuted dispatch arms, and
+`tools/reuse-audit.py`, which is where the cross-build numbers in the measurement
+rows come from. Sizes, opcode counts and hashes in this document move when the
+emitter moves, so they were re-run for this revision rather than copied. Where a
 measurement contradicted an earlier assumption, the measurement is what is
 written here; where a capability turned out not to exist, the row says so and
 `Config` reports the field as pending rather than letting it look implemented.
@@ -19,9 +22,13 @@ written here; where a capability turned out not to exist, the row says so and
 | 🔶 | Partially implemented — the gap is stated |
 | ⬜ | Not implemented |
 
-**Tally: 44 done · 18 partial · 18 not built.** Of the 44 done, 27 are ✅ and
-17 are ⭐ (implemented and improved beyond the point as written). All 80 points
-are scored exactly once.
+**Tally: 45 done · 20 partial · 15 not built.** Of the 45 done, 26 are ✅ and
+19 are ⭐ (implemented and improved beyond the point as written). All 80 points
+are scored exactly once. The round that produced the two new VM options moved four
+rows: #71 from ✅ to ⭐ (the handler count is now derived from the code rather than
+only randomized), #68 from ⬜ to ⭐ (there is an extractor whose findings become
+tests), and #65 and #66 from ⬜ to 🔶 (a real cross-build measurement exists; a
+recovery-time study and a CFG-reconstruction number do not).
 
 Two standing caveats that apply to the whole document. Client-side
 obfuscation raises the cost of reversing; it does not make reversing
@@ -45,20 +52,20 @@ is unbreakable.
 | # | Technique | Status | Evidence |
 | --- | --- | --- | --- |
 | 3 | Separate bytecode from the dispatcher | ✅ | The payload is a sealed, MAC'd blob; the interpreter is emitted separately with this build's opcode numbers inlined. Nothing in the interpreter reveals the wire format. |
-| 5 | Randomize opcode semantics every build | ⭐ | `OpcodeMap.shuffled` per build from the `opcodes` stream. Measured: 60 seeds → 60 distinct bytecodes, 0 integrity failures. Improved: the permutation comes from a domain-separated stream, not a shared one. |
+| 5 | Randomize opcode semantics every build | ⭐ | `OpcodeMap.shuffled` per build from the `opcodes` stream. Measured: 60 seeds → 60 distinct bytecodes, 0 integrity failures. Improved: the permutation comes from a domain-separated stream, not a shared one, **and the payload no longer carries the permutation's output directly** -- `opcode_cipher` draws `none`/`add`/`affine`/`swap` per group, so the bytes in the stream are a bijective image of the number the dispatcher branches on and the two are separated by a decoder. At `maximum`: 19 affine, 12 add, 9 swap and no `none` across 40 draws; at `compact`: `none` 40/40 and unpermuted arms, because both cost zero bytes and a build that advertises readability should not pay them. |
 | 8 | Multiple dispatcher styles | ⭐ | `nested_if`, `decision_tree`, `bucket`, plus `mixed` which draws per build. Measured interpreter sizes on one opcode map: 9680 / 18819 / 10294 bytes. Improved: bucket geometry is per-build too (`buckets = 4 + seed%5`, odd multiplier), so two bucket dispatchers are not structurally identical. |
 | 76 | Randomize dispatch strategy per function | ✅ | `mixed` resolves through `_dispatcher_name` against the build's `dispatch` stream, and `dispatcher_splitting` gives each group its own shape. `_dispatcher_rotation` starts the pool at the pinned shape, so `--dispatcher bucket` is observable in a single-group build - it was not before, and `tests/test_cli.py` pins that now. Measured: `nested_if`, `decision_tree` and `bucket` in one artifact. |
 | 78 | Several VM families | ✅ | `register`, `accumulator`, `stack`, `hybrid`. Measured output sizes with `--min-nodes 1`: 18705 / 19155 / 22678 / 21016 bytes. |
 | 79 | Select family per build/function using the build RNG | 🔶 | `_family_rotation` honors the pin for group 0 and spreads the rest behind it, so `vm_family` and `state_distribution` are both observable instead of one silently cancelling the other. It is still a rotation, not a draw: two builds with the same config agree about which group gets which family. |
 | 75 | Randomize register-vs-stack decisions | 🔶 | Which family a prototype runs on is decided per group by round-robin over the sorted prototype ids, and the family pool is a rotation starting at the pinned one - so the spread is even and the user's choice survives. It is deterministic: a draw from the build RNG per group is the remaining half of the point. |
-| 2 | Multiple VM instruction encodings per build | ⭐ | Three axes vary per VM *group*, not per build: `vm_variety` emits 1-4 interpreters and `_make_groups` gives each its own family, dispatcher, opcode map and instruction format. Measured over 6 seeds at variety=2 (12 groups): 9 distinct opcode counts (91-124), 12 distinct field layouts, all four target modes (`abs`/`biased`/`rel`/`edges`). The report prints a line per group (`vm 0 : register nested_if 1 protos, 109 opcodes, 1B op + 2B reg + 2B wide, targets abs, 5 fused`), so what is described is what the artifact contains, not what was requested. |
+| 2 | Multiple VM instruction encodings per build | ⭐ | Five axes vary per VM *group*, not per build: `vm_variety` emits 1-4 interpreters and `_make_groups` gives each its own family, dispatcher, opcode map and instruction format; `vm_isa_subset` narrows each map to the operations that group's protos were lowered to; `opcode_cipher` decides whether the stream carries the dispatcher's number or an image of it; and `arm_seed` reorders the arms inside the interpreter. Measured over 6 seeds at variety=2 (12 groups): 12 distinct opcode counts, 14-67, against 10 distinct counts 98-118 with the subset off -- the count stopped being a property of the ISA and became one of the code. 12 distinct field layouts, all four target modes (`abs`/`biased`/`rel`/`edges`). The report prints a line per group (`vm 1 : register decision_tree 1 protos, 31 opcodes, 1B op + 1B reg + 2B wide, targets rel, opcode cipher add, 10 fused`), so what is described is what the artifact contains, not what was requested. |
 | 70 | No permanent VM ABI | ⭐ | The header is part of the format, not a constant of the tool: `HeaderLayout` renumbers and reorders its fields per group, `op_bytes`/`reg_bytes`/`wide_bytes` change the unit size, and `pad` adds bytes a reader has to know about. `size`/`body_size`/`max_wide` are derived from the same descriptor. Improved: there is no second ABI description to keep in sync - `LEGACY_SPEC` exists so the historical shape stays testable. |
-| 71 | Randomize opcode count | ✅ | The handler count is a build-time variable: aliases give one opcode several numbers, `sparse` spaces the numbering so gaps appear, and fused pairs add super-op numbers the map may or may not fit. Measured over 12 groups from 6 seeds: 9 distinct counts, 91 to 124, printed per group. The ISA's 47 operations are fixed; the number of arms the dispatcher branches on - the thing a matcher counts - is not. |
-| 72 | Randomize instruction width | ✅ | `allow_op_widen`/`allow_wide_widen`/`allow_pad` are drawn per group: across 12 groups the layouts include `op` 1 and 2 bytes, `wide` 2 and 3, `pad` 0-2, `wides_first` both ways - 12 distinct layouts in 6 seeds. A wider instruction is wider in the encoder, the validator and the generated reader by the same arithmetic. |
+| 71 | Randomize opcode count | ⭐ | The handler count is a build-time variable: aliases give one opcode several numbers, `sparse` spaces the numbering so gaps appear, and fused pairs add super-op numbers the map may or may not fit. Measured over 12 groups from 6 seeds: 9 distinct counts, 91 to 124, printed per group. The ISA's 47 operations are fixed; the number of arms the dispatcher branches on - the thing a matcher counts - is not. Improved this build: the count is also *derived*, not just randomized -- `vm_isa_subset` runs `encode.required_ops(proto, fmt)` over the group's own protos and unions their operations, plus both halves of every fused pair the numbering fits, plus `JMP` when block permutation needs a filler. Same 12 groups, subset on: 12 distinct counts, 14 to 67. It is fail-safe in one direction only, deliberately: a proto containing an operation the lowerer could not name makes `required_ops` return `None` and the group falls back to the full ISA, so a classification bug costs bytes and never correctness. |
+| 72 | Randomize instruction width | ✅ | `allow_op_widen`/`allow_wide_widen`/`allow_pad` are drawn per group: across 12 groups the layouts include `op` 1 and 2 bytes, `wide` 2 and 3, `pad` 0-2, `wides_first` both ways - 12 distinct layouts in 6 seeds. A wider instruction is wider in the encoder, the validator and the generated reader by the same arithmetic. Improved: the same draw now also picks `op_swap_bits` and the affine cipher for the opcode field, which are format decisions rather than numbering decisions -- a 2-byte affine image of a value under 43 never has a zero high byte, so the field stops being identifiable by its padding as well as by its permutation. |
 | 73 | Randomize operand width | ✅ | `reg_bytes` is drawn per group (measured 1 and 2) and masked by `reg_mask`, with `wides_first` putting the wide operand on either side of it. `pack`'s raw 0-based index goes through `_rp` and the biased fields through `_biased`, so the two conventions cannot be mixed by accident. |
 | 74 | Randomize operand ordering | ⭐ | Field offsets belong to the format (`fields`/`offsets`), `wides_first` flips the order, `pad` puts bytes between operands, and per-field masks mean the same operand shows up as different bytes. Improved beyond the wording: the reader is generated from the same descriptor, so "operand order is randomized" and "it still decodes" are one property rather than two that have to be kept aligned by hand. |
 | 6 | Split into micro-ops, then randomly fuse | ✅ | `instruction_fusion` + `super_instructions` are wired: `_fusion_plan` pairs only `FUSABLE` opcode pairs the group's numbering can fit, `EncodedProto.fused` carries the halves, and `_fused_handler` emits one arm for both. The per-group report line counts them (`4 fused`, `5 fused`, or nothing when the map could not fit a pair). Both flags have to be on, and an `identity()` opcode map allocates no fused numbers on purpose. |
-| 4 | Encrypt/encode operands independently | ✅ | Each field of an instruction is encoded through its own width and mask (`FormatSpec.fields/offsets/width/mask/store`), so the register field of one group is 1 byte and of another 2, `wides_first` moves the wide operand before or after the registers, and `pad` inserts filler between them. The interpreter's reader is generated from the same descriptor (`reader_source`), which is what keeps a per-field mask from becoming a mismatch. |
+| 4 | Encrypt/encode operands independently | ✅ | Each field of an instruction is encoded through its own width and mask (`FormatSpec.fields/offsets/width/mask/store`), so the register field of one group is 1 byte and of another 2, `wides_first` moves the wide operand before or after the registers, and `pad` inserts filler between them. The interpreter's reader is generated from the same descriptor (`reader_source`), which is what keeps a per-field mask from becoming a mismatch. The descriptor covers the selector field too -- `op_bytes`, `op_mask` and the drawn `opcode_cipher` are read through `fields()`/`encode_op` exactly as the register fields are, so an artifact where the operands are masked and the opcode is raw does not exist. (Scored against technique #5, where the cipher is the point, rather than promoted here.) |
 | 7 | Relative/indirect instruction addressing | ⭐ | `target_mode` chooses per group between `abs`, `biased`, `rel` and `edges`, and `_target_jump(fmt, travel)` computes the advance from the format: relative targets are deltas measured from the pc the emitted arm leaves behind, which for a non-advancing arm (`JMP`, `RETURN0`) is one operand earlier - an asymmetry that was a real bug, found by running artifacts rather than by reading the encoder. Improved beyond the point: `edges` is a fourth mode, and the geometry is pinned by `test_a_jump_leaves_pc_where_its_own_mode_measures_from`. |
 | 9 | Periodically mutate VM state representation | 🔶 | VM state differs per group (`state_distribution` rotates the families behind the pinned one), so one artifact can hold a register, a stack and an accumulator interpreter at once. "Periodically" is not what happens: nothing mutates the state representation while it runs, and the rotation is deterministic given the config rather than drawn from the RNG. |
 | 10 | Avoid a single central VM state table | ✅ | There is no artifact-wide state table: each group's interpreter declares its own register file, stack and `sp` locals (names drawn per build), and the metadata each frame is handed is assembled from three separate tables (#17) rather than read out of one object. |
@@ -77,7 +84,7 @@ is unbreakable.
 | 44 | none / bounded plaintext caching | ⭐ | Three policies. Improved: `bounded_cache_size` is now reachable from the UI and was previously a knob with no control. |
 | 26 | Randomize table layouts and index mappings | ✅ | Three mechanisms move the layout now: the split descriptor tables (#17), the edge blob (#18) and per-group field widths and masks (#4), on top of the keyed pool and permuted string pages that were already there. The index mapping is per build because the opcode map and the field offsets are. |
 | 27 | Several equivalent arithmetic encodings for numbers | ⬜ | `numeric_protection_level` is declared and inert - it is in the pending list rather than claimed. Numbers are stored as `>d` doubles deliberately: see #11 and the note in `couxobf/constpool.py` that any transform expressed in floating-point arithmetic risks changing the value it protects. A scheme exact for in-range integers and direct for everything else was rejected rather than half-shipped, because "sometimes disguised" is a property a reader cannot rely on. |
-| 28 | Don't encode everything | 🔶 | Constants are interned selectively and most code is left untouched, but which values are protected is not itself randomized. |
+| 28 | Don't encode everything | 🔶 | Constants are interned selectively and most code is left untouched, but which values are protected is not itself randomized. Improved this build in the other direction, which is the one the point is really about: the *interpreter* does not encode everything either -- `vm_isa_subset` gives a VM only the operations its own protos need, so a handler set that published 43 numbers carries 31, and the artifact gets smaller as it gets less analyzable (90,523 -> 67,411 B at the pinned example command). |
 | 29 | Randomize which values receive protection | ⬜ | The selection is deterministic given the source. |
 | 49 | Don't put all integrity constants together | ⬜ | Key, nonce and tag are emitted adjacent in the pool runtime. |
 
@@ -86,7 +93,7 @@ is unbreakable.
 | # | Technique | Status | Evidence |
 | --- | --- | --- | --- |
 | 16 | Break obvious names (`R0`, `R1`, `stack`, `pc`, `opcode`) | ✅ | **Fixed.** `pc`, `R`, `K`, `E`, `stack`, `opcode` and the six helper names now all count **0** in the output, down from 228 / 111 / 7 / 5 / 0 / 1 plus six fixed helper names. Each build draws its own from the `vm` stream. |
-| 39 | Build-specific structural fingerprint | ✅ | `wiring.structural_fingerprint(plan)` digests each group's family, dispatcher, opcode count and instruction format. `lower_back` appends it to the constant pool's AAD before sealing, so a pool lifted into a build with different decisions fails authentication, and the report prints the 8-byte digest. Measured: 6 seeds -> 6 distinct digests, and the same seed and config reproduce it. No marker string is emitted: the point is our tooling recognizing the format, and a digest of decisions does that without anything in the file saying so. |
+| 39 | Build-specific structural fingerprint | ✅ | `wiring.structural_fingerprint(plan)` digests each group's family, dispatcher, opcode count and instruction format -- and, since the count became a function of the code (`vm_isa_subset`) rather than of the ISA, that digest changes for free when a build narrows a VM. `lower_back` appends it to the constant pool's AAD before sealing, so a pool lifted into a build with different decisions fails authentication, and the report prints the 8-byte digest. Measured: 6 seeds -> 6 distinct digests, and the same seed and config reproduce it. No marker string is emitted: the point is our tooling recognizing the format, and a digest of decisions does that without anything in the file saying so. |
 | 69 | Continuously change the generated format | ⭐ | **Improved this build.** The pool and bank prefixes were the constants `_kQ` and `_kS`, identical in every build ever produced — `_kQ` alone appears 115 times in a typical output. Each build now draws its own: 12 builds produced 24 prefixes, all distinct, none stable. |
 | 25 | Avoid repeated decoder boilerplate | ✅ | Measured on a maximum build: 30 long string literals, 30 distinct, 0 repeated. |
 | 23 | Randomize helper placement | 🔶 | **Names and blocks yes, one contiguous preamble no.** The six bit/table helpers used to be `_kpack`/`_kunpk`/`_kiter`/`_kiterpack`/`_kitercheck`/`_kapp` in every build; each build now draws its own names, and the runtime is no longer a single preamble — measured in a maximum build of `maze.luau`, the guard locals land at lines 9-12, the bit-op destructure at 39 and the pool blobs at 239+. What the point still asks for and does not get: the six helpers are one statement, and which of the four runtime blocks goes where is fixed by the emitter, not drawn. |
@@ -119,7 +126,7 @@ is unbreakable.
 
 | # | Technique | Status | Evidence | Test count |
 | --- | --- | --- | --- | --- |
-| 21 | Preserve native Luau semantics | ✅ | Full lexer → parser → sema → IR pipeline; 1933 passing tests, 99 skipped (the skips are builds with no Luau toolchain on `PATH`). | — |
+| 21 | Preserve native Luau semantics | ✅ | Full lexer → parser → sema → IR pipeline; 1963 passing tests, 99 skipped with the toolchain on `PATH`. The skips are the upstream conformance files this tree documents as excluded -- each needs the vector type, native-code support or the debug library, or asserts on source line numbers a source-to-source compiler cannot preserve -- not a missing runtime: without `.luau-toolchain/bin` on `PATH` the execution-backed tests skip on top of those. | — |
 | 51 | Test closures heavily | 🔶 | Present, not heavy. | 8 |
 | 52 | Test upvalues heavily | 🔶 | Same 8. | (shared) |
 | 53 | Test multiple returns | 🔶 | `RETURNMULTI` semantics are covered, including the splice. | 7 |
@@ -138,11 +145,11 @@ is unbreakable.
 | 61 | Benchmark every protection individually | 🔶 | The cost report gives per-technique sizes and counts (67 lines for a maximum build). Runtime overhead is measured for some — VM dispatch is ~10× on 400k instructions — but not for each technique. |
 | 63 | Don't blindly maximize output size | ✅ | The ceiling is the enforcement, and the ladder's order is the judgement: decoys and padding go first, interpreters and dispatch shapes last. The honest limit, measured: `hello.luau` is 24 bytes, so no trimming reaches 24x - the crypto runtime, the pool decoder and one interpreter are an ~11 KB floor. After giving up all nine groups it sits at 464x, and the report lists what was lost. A ceiling that cannot be met still costs the passes and still tells you; it does not invent a ratio it did not achieve. |
 | 62 | Reject transformations with disproportionate overhead | ⭐ | `max_output_growth` is enforced by rebuilding: `_within_budget` walks a ladder of optional-pass groups, cheapest-per-byte first, and stops as soon as the ratio fits - then reports every group it gave up, so a trimmed build does not read as a build that was configured less. Measured on `maze.luau`: 27.0x with the ceiling off, 19.4x under a 24x ceiling with three passes dropped. Improved beyond the point: the give-up is *named*, which is the difference between a bound and a surprise. |
-| 64 | Mutation testing against our own deobfuscator | ⬜ | No deobfuscator exists to mutate against. |
-| 65 | Automated deobfuscation benchmark | ⬜ | — |
-| 66 | Measure recoverability of identifiers, strings, constants, CFGs, opcodes | ⬜ | The report measures sizes and counts, not recoverability. |
-| 67 | Multiple independent deobfuscators attacking each build | ⬜ | — |
-| 68 | Regression tests when a tool recovers something | ⬜ | The practice exists — every defect found by measurement became a test — but there is no analysis tool yet to drive it. |
+| 64 | Mutation testing against our own deobfuscator | ⬜ | No deobfuscator exists to mutate against. The nearest thing is a test suite that *behaves* like one -- `tests/test_integrity.py` flips bits in the sealed payload and expects the runtime to refuse -- but that mutates the artifact, not the analysis. |
+| 65 | Automated deobfuscation benchmark | 🔶 | `tools/reuse-audit.py` runs a real static extractor over every build of a program -- it sweeps each payload through the emitted reader, learns a "stored value means operation" table by majority vote, and scores that table against the truth of every *other* build. That is the cross-build half of the benchmark, which is the quantity the review asked for; the recovery-time half, and an extractor that reads the interpreter's source instead of its data, are not built. Pinned by `tests/test_reuse.py`, with a `stable` control that must score 100% so a metric which quietly measured nothing fails the suite. |
+| 66 | Measure recoverability of identifiers, strings, constants, CFGs, opcodes | 🔶 | Measured, four of five: identifiers (substring oracle over 40 corpus files and 4 examples, with the keyword and builtin matches accounted for rather than waved away), strings (0 of 9 source literals recoverable in the pinned build), constants (0 of 9, plus 24 planted decoys that a dumper cannot tell from live entries), opcodes (1% of payload values transfer between builds). Not measured: CFG reconstruction -- there is no tool that tries it, so there is no number for it. |
+| 67 | Multiple independent deobfuscators attacking each build | ⬜ | Two readers of the format exist (`vm/runtime.py` for the emitted interpreter, `integrity/payload.py` for the validator) and the suite requires them to agree, but they are two implementations of one design, not two attacks: a bug that makes both wrong is invisible. One of them is even load-bearing for the product, which is the opposite of independence. A second, adversarial extractor -- built to fail -- is the real answer, and it is the reason `tools/reuse-audit.py` refuses to call its 1% a bound. |
+| 68 | Regression tests when a tool recovers something | ⭐ | **Improved beyond the point as written.** The practice always existed -- every defect found by measurement became a test -- and now there is a tool to drive it: what `reuse-audit` finds is asserted in `tests/test_reuse.py`, and the pipeline test that pins the cipher into the reader (`tests/test_pipeline.py: test_the_opcode_cipher_is_in_the_reader_not_only_in_the_config`) exists because the audit's own first draft found a knob that lived only in the config. A finding that is not written down as a failing test is a finding that gets forgotten. |
 
 ## 9. Randomness and pipeline discipline
 
@@ -150,7 +157,7 @@ is unbreakable.
 | --- | --- | --- | --- |
 | 30 | Separate randomness domain per transformation stage | ⭐ | **17 domains**, not the 12 previously recorded: `identifiers`, `names-final`, `cfg`, `predicates`, `constants`, `strings`, `vm`, `opcodes`, `operands`, `registers`, `handlers`, `dispatch`, `chunks`, `integrity`, `decoys`, `emission`, `pc`. Improved: five of these (`operands`, `registers`, `predicates`, `chunks`, `names-final`) are reserved for techniques that do not exist yet, so adding them will not require reusing a stream. |
 | 31 | Never reuse release seeds | ✅ | A fresh 128-bit `secrets.token_bytes(16)` per request; a pinned seed is hashed through SHA-256 rather than packed, so seeds differing by one bit diverge completely. |
-| 32 | Seed influences structure, not just constants | ⭐ | Measured: four seeds on `maze.luau` gave 27537 / 27452 / 27586 / 30575 bytes, four distinct sha256, and different dispatcher shapes (`nested_if`/`bucket`/`bucket`/`nested_if`). Improved this build: names are structural too. |
+| 32 | Seed influences structure, not just constants | ⭐ | Measured: four seeds on `maze.luau` at `maximum` gave 65095 / 67218 / 71136 / 73434 bytes and four distinct fingerprints, and the two interpreters in each of those builds differ from the next build's in family pair, opcode count (53/37, 56/37, 65/41, 50/57), cipher (`add`/`affine`, `add`/`add`, `swap`/`swap`, `swap`/`swap`), field widths, jump-target mode (`rel`, `abs`, `biased`, `edges` all appear) and fused-pair count. Improved this build: names are structural too, and so is which *instructions exist*. |
 | 36 | Normalize first, then transform the AST | ✅ | No regex-based source transformation anywhere in the pipeline. |
 | 37 | Reparse after major transformations | ✅ | `validate_output` reparses the emitted source and counts AST nodes before anything else. |
 | 38 | Final lexical renaming last | ✅ | Renaming happens at emission through `NameGenerator`, after all structural work. |
@@ -190,8 +197,8 @@ What each build can currently change, against the eleven axes requested.
 
 | Axis | Per-build? |
 | --- | --- |
-| Opcode numbering | ✅ — permuted, sparsely spaced, aliased; `43` to `124` numbers depending on the draw (#71) |
-| Instruction format | ✅ — `op`/`reg`/`wide` widths, `pad`, `wides_first` drawn per group: 12 distinct layouts in 6 seeds (#72, #74) |
+| Opcode numbering | ✅ — permuted, sparsely spaced, aliased, narrowed to the group's own operations, and stored as an image of itself rather than the number (`opcode_cipher`): `14` to `67` dispatch numbers per VM at `maximum` (#71, #5) |
+| Instruction format | ✅ — `op`/`reg`/`wide` widths, `pad`, `wides_first`, target mode and arm order drawn per group: 12 distinct layouts in 6 seeds (#72, #74, #79) |
 | Register layout | ✅ — `reg_bytes` and `reg_mask` per group, biased fields through `_biased`, raw through `_rp` (#73) |
 | Operand encoding | ✅ — per-field width, mask and offset from one descriptor the reader shares (#4) |
 | Dispatcher structure | ✅ — `nested_if`/`decision_tree`/`bucket`, per group under `dispatcher_splitting` (#76) |
@@ -258,7 +265,7 @@ accepts comments.
 
 ### Every option reachable from the site
 
-34 live fields are reachable from `web/` → `api/obfuscate.py` → `Config`, and the
+36 live fields are reachable from `web/` → `api/obfuscate.py` → `Config`, and the
 list is not hand-maintained: `describe()` emits the option table (label, help,
 type, choices, range, gate), `web/app.js` renders that and nothing else, and
 `tests/test_web.py` asserts the rendered form covers exactly the live fields.
@@ -288,18 +295,20 @@ BUILD      examples/maze.luau
 PROFILE    maximum | virtualization maximum | min_nodes 1 | vm_family stack
            dispatcher mixed | string level 3 | cache none | pool decoys 24
 SEED       00000000000000000000000000c0ffee
-RESULT     3484 B -> 80915 B  (23.2x, ceiling 24x, no pass trimmed to fit)
+RESULT     3484 B -> 67411 B  (19.3x, ceiling 24x, no pass trimmed to fit)
            8 prototypes, 3 virtualized
-           sha256 305845e5674439c5bc71c8f2...
+           sha256 f48c0e9a02a43f192456f065...
            executes byte-identically to the original under the Luau runtime
            0 `#` comments, 0 `--` comments, 0 diagnostic phrases
            guard: env level 1, dump level 1, policy fail, 5 surfaces re-checked
                   at each VM entry
-           fingerprint ce71126c7135ae55 -- the pool is authenticated against it
-           vm 0 : stack     nested_if      2 protos,  95 opcodes,
-                            2B op + 1B reg + 2B wide, targets abs,   2 fused
-           vm 1 : register  decision_tree  1 protos, 101 opcodes,
-                            2B op + 1B reg + 2B wide, targets rel,   5 fused
+           fingerprint 25e155d53cd98cba -- the pool is authenticated against it
+           vm 0 : stack     nested_if      2 protos,  67 opcodes,
+                            2B op + 1B reg + 2B wide, targets abs,
+                            opcode cipher affine, 16 fused
+           vm 1 : register  decision_tree  1 protos,  31 opcodes,
+                            1B op + 1B reg + 2B wide, targets rel,
+                            opcode cipher add, 10 fused
 ```
 
 Scoring that build against the checklist:
@@ -311,25 +320,32 @@ Scoring that build against the checklist:
 | Are source identifiers present? | 13 substrings match, all accounted for: Luau keywords (`local`, `function`, `return`, `while`, `elseif`, `false`), builtins (`string`, `table`, `print`, `ipairs`, `setmetatable`, `concat`), and `state` — which is only the `error("invalid state")` sites, not the source's `state` local (that was renamed). A naive substring check reports this as a leak; it is not one. | ✅ #38 |
 | Any diagnostic vocabulary? | 0 hits across 10 phrases | ✅ #48 |
 | Any repeated decoder boilerplate? | 82 distinct long literals in the output, 0 repeats | ✅ #25 |
-| Does the seed change the shape? | Yes — 6 seeds give 6 distinct fingerprints and 12 VM groups with 9 distinct opcode counts and 12 distinct field layouts | ✅ #32 |
+| Does the seed change the shape? | Yes — 6 seeds at `vm_variety=2` give 6 distinct sizes (58,147–69,417 B), 6 distinct fingerprints, 12 distinct opcode counts (14–67) and 12 distinct field layouts | ✅ #32 |
 | Is the helper block a stable signature? | **Names no** — per build. **Placement partly** — guard locals, the bit destructure and the pool blobs land in different regions; the six helpers are still one statement | 🔶 #23 |
 | Any recognisable VM identifier left? | **No** — `pc`, `R`, `stack`, `opcode` count 0, and the lone `K` and `E` matches are bytes inside escaped ciphertext, not identifiers | ✅ #16 |
-| Would a devirtualizer for this build generalize? | **No** — this artifact carries two interpreters with different families, dispatchers, opcode counts, register widths and jump-target modes, so a recovery tool has to handle each separately. Handler *bodies* are still plain Luau, so step 4 of the report stays the real cost. | ✅ #2, #72 |
-| Is output growth bounded? | **Yes** — 23.2x under a 24x ceiling, and if it had not fit the report would name the passes it gave up | ✅ #62, #63 |
+| Would a devirtualizer for this build generalize? | **No** — two interpreters with different families, dispatchers, opcode *counts*, register widths, jump-target modes and opcode ciphers, so a recovery tool handles each separately; a table learned from this build's payload matches another build's payload 1% of the time. Handler *bodies* are still plain Luau, so step 4 of the report stays the real cost. | ✅ #2, #72 |
+| Is output growth bounded? | **Yes** — 19.3x under a 24x ceiling, and if it had not fit the report would name the passes it gave up. The same command with `vm_isa_subset` off builds 90,523 B against this 67,411 B — 25.5% bigger for *less* per-build variation, because narrowing a VM removes handlers rather than adding obfuscation | ✅ #62, #63 |
 | Can the pool be lifted into another build? | **No** — the AAD carries the format digest, so a foreign pool fails authentication on first read | ✅ #39 |
 | Are there constants in the pool the program never reads? | **Yes** — 24 planted, encoded identically, scattered by value derivation rather than appended | ✅ #14 (constants only) |
 
 Ten passes, one partial. What is left, in the order it should be done:
 
-1. **#41** — chunked pool and per-chunk keys. `chunking_level`, `chunk_size` and
-   `lazy_decode` are declared and reported pending, and the runtime half (chunk
-   table, per-chunk offsets, a lifetime policy) is where the work is.
+1. **#41, and the per-group pools it enables** — one pool per VM group, each keyed
+   and AAD-bound to that group's format, then chunking with per-chunk keys inside
+   it. `chunking_level`, `chunk_size` and `lazy_decode` are declared and reported
+   pending, and the runtime half (chunk table, per-chunk offsets, a lifetime
+   policy) is where the work is. This is the item that answers the sharpest
+   criticism in the review: there is currently one accessor for all constant data
+   in an artifact, and recovers-then-walks-it tooling needs it only once.
 2. **#24, #23** — several implementations per helper, then the freedom to put
    them anywhere in the artifact.
 3. **#19, #34, #35, #40** — native-path variants: the native half of a hybrid
    build is more legible than the virtual half.
-4. **#64-#68** — a deobfuscator of our own, so the cost figures above stop being
-   assertions. `tools/` has no such harness yet.
+4. **#64, #67** — a second, adversarial extractor, so the cross-build numbers
+   above are not measured by a tool that shares our reader design. The
+   recoverability side (#65, #66) and the test that keeps it honest (#68) now
+   have a real harness in `tools/reuse-audit.py`; CFG reconstruction and a
+   matcher that reads emitted Lua rather than payload bytes do not.
 5. **#27** — arithmetic encodings for numbers, which is also the row where a
    half-implementation would be worse than none (see #11).
 
@@ -337,7 +353,10 @@ Ten passes, one partial. What is left, in the order it should be done:
 
 ```bash
 # the whole checklist's testable half
-python3 -m pytest tests/ -q          # 1933 passed, 99 skipped
+# the whole checklist's testable half; the PATH prefix is what un-skips every
+# test that has to run Luau rather than only emit it
+PATH="$PWD/.luau-toolchain/bin:$PATH" python3 -m pytest tests/ -q
+                                     # 1963 passed, 99 skipped
 
 # a single build, scored
 python3 -m couxobf protect examples/maze.luau --profile maximum \
@@ -346,6 +365,9 @@ python3 -m couxobf protect examples/maze.luau --profile maximum \
 
 # the report, including the per-group VM table and which fields were not applied
 python3 -m couxobf report examples/maze.luau --profile maximum
+
+# how much of one build's recovered opcode table transfers to the next
+python3 tools/reuse-audit.py examples/maze.luau --seeds 3
 ```
 
 The `pending` list in the API response and the "requested but not applied"
@@ -354,6 +376,8 @@ document: 20 fields are declared in `Config` for a maximum build and are named a
 not applied rather than being silently accepted. The endpoint will refuse an
 option nothing reads, which is the same rule enforced from the other side. The
 result panel shows the outcome rather than the request: a table with one row per
-interpreter the build actually emitted (`vm 0 · register · nested_if · 1 prototype ·
-110 opcodes · 1B op + 2B reg + 2B wide · targets abs · 7 fused`), taken from the
-plan and cross-checked against the report text by `tests/test_web.py`.
+interpreter the build actually emitted (`vm 1 · register · decision_tree · 1
+prototype · 31 opcodes · 1B op + 1B reg + 2B wide · targets rel · opcode cipher
+add · 10 fused`), taken from the plan and cross-checked against the report text by
+`tests/test_web.py` -- including the cipher, whose row reads `none (raw numbers)`
+when a build leaves the numbers alone.

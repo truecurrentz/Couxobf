@@ -189,9 +189,21 @@ class _FormatReader:
         return offs[("w", name)]
 
     def opcode_at(self, code: bytes, at: int) -> int:
+        """The dispatcher number of the instruction at ``at``.
+
+        The stream holds the format's cipher image of that number, so the raw
+        bytes go through `decode_op` -- the same :class:`FormatSpec` method the
+        generated reader inlines.  Reading the raw value instead is the exact
+        mistake this class exists to be able to make invisibly: the walk would
+        report "opcode byte 241 is not assigned" for a perfectly good payload,
+        which is at least a loud failure; the silent version is a validator that
+        compares against disguised numbers and accepts a corrupted stream.
+        """
         if self.fmt.op_bytes == 1:
-            return code[at]
-        return code[at] + code[at + 1] * 256
+            raw = code[at]
+        else:
+            raw = code[at] + code[at + 1] * 256
+        return self.fmt.decode_op(raw)
 
     def body_at(self, op: str, code: bytes, at: int, key) -> int:
         """The raw integer in one operand field, before masks are undone."""

@@ -449,6 +449,22 @@ class _Entry:
             return _fused_handler(self.pair, n, fam, fmt)
         return _handler(self.op, n, fam, fmt)
 
+def _arm_key(entry: "_Entry", seed: int) -> int:
+    """A permutation of the arms, mixed enough to be one.
+
+    The first version sorted on ``(number * K + seed)``, which is wrong twice
+    over: adding a small seed to a hash of consecutive integers barely changes
+    the order at all, and when it does, the result is a rotation of one fixed
+    sequence -- recognizable structure, which is the opposite of the point.  So
+    the seed goes in before the multiply and the value gets an avalanche pass
+    after it: two builds whose maps agree and whose seeds differ emit different
+    chains, and neither order is a shifted copy of the other.
+    """
+    h = (((entry.numbers[0] if entry.numbers else 0) + seed) * 2654435761) & 0xFFFFFFFF
+    h ^= h >> 15
+    h = (h * 2246822519) & 0xFFFFFFFF
+    h ^= h >> 13
+    return h
 
 def dispatch_entries(opmap: OpcodeMap, fmt: Optional[FormatSpec] = None
                      ) -> List[_Entry]:
@@ -464,6 +480,15 @@ def dispatch_entries(opmap: OpcodeMap, fmt: Optional[FormatSpec] = None
     for number, pair in sorted((opmap.fused or {}).items()):
         entries.append(_Entry(FUSED_PREFIX + "%s,%s" % pair, (number,),
                               pair=FusionRule(pair[0], pair[1])))
+    # `arm_seed` permutes the order the arms are tested in.  It is a hash of the
+    # numbers, not a shuffle with a random generator: the emitted chain stays a
+    # pure function of (map, format), so two builds whose maps agree emit chains
+    # that agree -- which is what keeps the dispatch tests checking the generator
+    # instead of checking a second implementation of it.
+    seed = getattr(fmt, "arm_seed", 0) if fmt is not None else 0
+    if seed:
+        entries = sorted(entries, key=lambda e: (_arm_key(e, seed), e.numbers[0]))
+
     return entries
 
 
@@ -778,8 +803,12 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         f"  local pc = {entry_expr}",
     ] + ["  " + decl for decl in fam.state] + [
         "  while true do",
-        (f"    local op = _bd({code}, pc)" if spec.op_bytes == 1 else
-         f"    local op = _bd({code}, pc) + _bd({code}, pc + 1) * 256"),
+        # The selector comes from the generated reader, not from a `byte(code, pc)`
+        # written here: the stream carries the format's image of the number, so
+        # the decode has to happen somewhere shared with every other field read
+        # (`_ro`, alongside `_rr`/`_rk`/`_rp`) rather than in the one place that
+        # also happens to be the anchor a matcher looks for first.
+        "    local op = _ro(pc)",
         f"    pc = pc + {spec.op_bytes}",
     ]
 

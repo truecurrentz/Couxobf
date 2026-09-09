@@ -111,6 +111,8 @@ FIELD_REQUIRES: Dict[str, Dict[str, Any]] = {
     "instruction_fusion": {"field": "virtualization_level", "op": "!=", "value": "none"},
     "pc_protection": {"field": "virtualization_level", "op": "!=", "value": "none"},
     "edge_indirection": {"field": "virtualization_level", "op": "!=", "value": "none"},
+    "opcode_cipher": {"field": "virtualization_level", "op": "!=", "value": "none"},
+    "vm_isa_subset": {"field": "virtualization_level", "op": "!=", "value": "none"},
     "max_vm_functions": {"field": "virtualization_level", "op": "!=", "value": "none"},
     "min_virtualize_body_nodes": {"field": "virtualization_level", "op": "!=", "value": "none"},
     "guard_policy": {"any_of": ["env_guard", "dump_guard"]},
@@ -444,6 +446,8 @@ def _vm_groups(stats):
             "reg_bytes": fmt.get("reg_bytes", 1),
             "wide_bytes": fmt.get("wide_bytes", 2),
             "target_mode": fmt.get("target_mode", "abs"),
+            "op_cipher": fmt.get("op_cipher", "none"),
+            "arm_seed": bool(fmt.get("arm_seed")),
             "fused": len(fmt.get("fused") or []),
         })
     return rows

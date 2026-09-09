@@ -246,6 +246,25 @@ class FormatSpec:
     target_mode: str = "abs"
     #: Per-group bias added to every stored jump target (``biased`` mode).
     target_bias: int = 0
+    #: How the opcode number is disguised in the payload.  The dispatcher still
+    #: compares against the number the map assigned; the *stream* carries a
+    #: bijective image of it, so the byte at an instruction's start is not the
+    #: selector an analyst can tabulate.  Modes: ``none`` (the historical
+    #: format), ``add`` (rotate through the number space), ``affine`` (rotate
+    #: after multiplying by a unit) and ``swap`` (exchange the field's halves).
+    #: Costs no bytes: it is arithmetic on the fetch, not a wider field.
+    op_cipher: str = "none"
+    #: The additive half of ``add``/``affine``, and the multiplier of ``affine``.
+    #: ``op_mult_inv`` is its inverse mod :attr:`op_modulus`, computed once at
+    #: draw time so the interpreter never has to invert anything.
+    op_bias: int = 0
+    op_mult: int = 1
+    op_mult_inv: int = 1
+    #: Non-zero permutes the handler arms by a hash of their numbers.  Every arm
+    #: matches on a disjoint set of numbers, so the order they are tested in is
+    #: free -- and leaving it fixed made "the arm at position 3 is LOADK" a fact
+    #: about the tool rather than about the build.
+    arm_seed: int = 0
     header: HeaderLayout = DEFAULT_HEADER
     #: Fused pairs this format understands, as ``FusionRule``s.  #6.
     fused: Tuple[FusionRule, ...] = ()
@@ -402,9 +421,78 @@ class FormatSpec:
         """
         return " + 1"
 
+    # -- opcode number disguise -------------------------------------------
+    @property
+    def op_modulus(self) -> int:
+        """The size of the number space the opcode field can carry.
+
+        One less than the field's range, deliberately: opcode numbers run 1..255
+        because ``string.byte`` returns nil past the end of the payload and a 0
+        would read as a valid short instruction, so the cipher rotates within
+        ``1..modulus`` and fixes 0 rather than permuting the whole field.
+        """
+        return (1 << (8 * self.op_bytes)) - 1
+
+    @property
+    def op_swap_bits(self) -> int:
+        """How wide each half of a ``swap``ed opcode field is."""
+        return 4 if self.op_bytes == 1 else 8
+
+    @property
+    def op_disguised(self) -> bool:
+        return self.op_cipher != "none"
+
+    def swap_op(self, value: int) -> int:
+        base = 1 << self.op_swap_bits
+        return (value % base) * base + (value // base)
+
+    def encode_op(self, number: int) -> int:
+        """The value to write into the stream for dispatcher number ``number``."""
+        mod = self.op_modulus
+        if self.op_cipher == "none":
+            return number
+        if not 1 <= number <= mod:                        # pragma: no cover
+            raise ValueError("opcode number %r is outside 1..%d" % (number, mod))
+        if self.op_cipher == "swap":
+            return self.swap_op(number)
+        if self.op_cipher == "add":
+            # Each mode reads only the parameters that mean something for it, so
+            # a hand-built FormatSpec cannot be self-contradictory the way a
+            # shared formula with a leftover multiplier would be.
+            return (number - 1 + self.op_bias) % mod + 1
+        return ((number - 1) * self.op_mult + self.op_bias) % mod + 1
+
+    def decode_op(self, stored: int) -> int:
+        """The dispatcher number a stored value corresponds to.  Exact inverse."""
+        if self.op_cipher == "none":
+            return stored
+        mod = self.op_modulus
+        if self.op_cipher == "swap":
+            return self.swap_op(stored)
+        if self.op_cipher == "add":
+            return (stored - 1 - self.op_bias) % mod + 1
+        return ((stored - 1 - self.op_bias) * self.op_mult_inv) % mod + 1
+
+    def op_decode_expr(self, value: str) -> str:
+        """Luau for :meth:`decode_op`, over an expression, for the generated reader."""
+        if self.op_cipher == "none":
+            return value
+        if self.op_cipher == "swap":
+            # `(v - v % B) / B` rather than `v // B`: the emitted runtime has used
+            # no floor division anywhere else, and `/` is exact here because the
+            # value is under B*B -- 65536 at most, in doubles, with no rounding.
+            base = 1 << self.op_swap_bits
+            return "(v %% %d) * %d + (v - v %% %d) / %d" % (
+                base, base, base, base)
+        if self.op_cipher == "add":
+            return "((%s - 1 - %d) %% %d) + 1" % (value, self.op_bias, self.op_modulus)
+        return "(((%s - 1 - %d) * %d) %% %d) + 1" % (
+            value, self.op_bias, self.op_mult_inv, self.op_modulus)
+
     def summary(self) -> Dict[str, Any]:
         return {
             "group": self.group,
+            "op_cipher": self.op_cipher,
             "op_bytes": self.op_bytes,
             "reg_bytes": self.reg_bytes,
             "wide_bytes": self.wide_bytes,
@@ -422,6 +510,7 @@ class FormatSpec:
             },
             "fused": [r.name for r in self.fused],
             "reorder": self.reorder,
+            "arm_seed": self.arm_seed,
         }
 
 
@@ -444,6 +533,20 @@ def reader_source(fmt: FormatSpec, code_var: str,
     the two conventions to be confused.
     """
     lines: List[str] = []
+    # The opcode fetch.  A named reader rather than a `string.byte(code, pc)`
+    # written out at the dispatch site: the transform below has to be applied
+    # wherever the selector is read, and an anchor of the form
+    # "fetch byte -> compare against literals" is exactly what a matcher keys on.
+    if fmt.op_bytes == 1:
+        fetch = "_bd(%s, a)" % code_var
+    else:  # pragma: no cover - draw() emits 1 and 2
+        fetch = "_bd(%s, a) + _bd(%s, a + 1) * 256" % (code_var, code_var)
+    if fmt.op_cipher == "swap":
+        lines.append("local function _ro(a) local v = %s return %s end"
+                     % (fetch, fmt.op_decode_expr("v")))
+    else:
+        lines.append("local function _ro(a) return %s end"
+                     % fmt.op_decode_expr(fetch))
     if fmt.reg_bytes == 1:
         lines.append(f"local function _r8(a) return _bd({code_var}, a) end")
     else:
@@ -562,6 +665,12 @@ class FormatPrefs:
     allow_edges: bool = False
     allow_renumbered_header: bool = True
     allow_instruction_reorder: bool = True
+    #: Disguise the opcode number in the stream.  Free in bytes, so it is spent
+    #: whenever the format is randomized at all rather than by probability.
+    allow_op_cipher: bool = True
+    #: Permute the handler arms.  Free, like the cipher, and gated on the same
+    #: "is this format being randomized at all" switch.
+    allow_arm_permutation: bool = True
     #: Probability a given knob is spent, per unit of `variety`.  The defaults are
     #: the measured middle ground: enough divergence that two builds are not the
     #: same shape, not so much that the artifact grows for its own sake.
@@ -586,6 +695,8 @@ class FormatPrefs:
         pc = bool(config.pc_protection)
         return cls(
             variety=variety,
+            allow_op_cipher=bool(config.opcode_cipher),
+            allow_arm_permutation=bool(config.opcode_randomization),
             allow_op_widen=variety >= 1,
             allow_reg_widen=variety >= 1 and bool(config.register_randomization),
             allow_wide_widen=variety >= 1,
@@ -645,6 +756,40 @@ def draw(rng: Optional[Rng], prefs: Optional[FormatPrefs] = None, *,
     if len(modes) > 1 and on(True, 0.7):
         mode = rng.choice([m for m in modes if m != "abs"] or ["abs"])
     bias = rng.randint(1, wide_mod - 1) if mode == "biased" else 0
+    # The opcode disguise, and the arm order below.  Neither is subject to
+    # `weight`, and that is the whole point of them: both cost no bytes -- the
+    # cipher is arithmetic on a fetch the interpreter already performs, and the
+    # arm order is a permutation of tests that were already there -- so scaling
+    # them by a knob that exists to trade bytes for diversity would only ever
+    # decline something for free.  The single condition is that the build is
+    # randomizing its format at all, which is what `variety` above means.
+    cipher = "none"
+    op_bias = op_mult = op_mult_inv = 0
+    if prefs.allow_op_cipher:
+        cipher = rng.choice(("add", "affine", "swap"))
+        mod = (1 << (8 * op_bytes)) - 1
+        if cipher != "swap":
+            op_bias = rng.randint(1, mod - 1)
+        if cipher == "affine":
+            # A multiplier has to be a unit mod `mod`, or the map is not a
+            # bijection and two opcodes could share a stored byte.
+            from math import gcd
+            limit = mod - 1
+            for _try in range(64):
+                candidate = rng.randint(2, limit)
+                if gcd(candidate, mod) == 1:
+                    op_mult = candidate
+                    break
+            else:                                   # pragma: no cover - rare
+                cipher = "add"
+            if cipher == "affine":
+                op_mult_inv = pow(op_mult, -1, mod)
+        if cipher == "add":
+            op_mult = op_mult_inv = 1
+    # Handler arm order.  The chain matches on disjoint numbers, so which arm is
+    # tested first is free, and sorting by number is what let "the third arm is
+    # LOADK" be a fact about the tool.
+    arm_seed = (rng.randint(1, 0x7FFFFFFF) if prefs.allow_arm_permutation else 0)
     chosen: Tuple[FusionRule, ...] = ()
     if fusion_rules:
         # A random subset, not the whole menu.  Which pairs a build fuses is
@@ -656,6 +801,11 @@ def draw(rng: Optional[Rng], prefs: Optional[FormatPrefs] = None, *,
             chosen = tuple(rng.sample(list(fusion_rules), wanted))
     return FormatSpec(
         op_bytes=op_bytes,
+        op_cipher=cipher,
+        op_bias=op_bias,
+        op_mult=op_mult or 1,
+        op_mult_inv=op_mult_inv or 1,
+        arm_seed=arm_seed,
         reg_bytes=reg_bytes,
         wide_bytes=wide_bytes,
         pad=pad,

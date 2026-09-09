@@ -215,12 +215,20 @@ def make_plan(rng: Rng, protos: Iterable[int],
               names: Optional[Dict[str, str]] = None,
               families: Optional[Sequence[str]] = None,
               dispatchers: Optional[Sequence[str]] = None,
-              fragmented: bool = True) -> VMPlan:
+              fragmented: bool = True,
+              protos_by_id: Optional[Dict[int, Any]] = None,
+              isa_subset: bool = False) -> VMPlan:
     """Build a :class:`VMPlan` from the build's ``vm`` randomness stream.
 
     ``rng`` should be the domain-separated stream for VM generation, not the
     identifier stream: reusing a stream across unrelated purposes is what makes
     two builds' differences correlate in ways an analyst can exploit.
+
+    ``protos_by_id`` and ``isa_subset`` together give each group the opcodes its
+    own prototypes need: ``isa_subset`` asks for the narrowing, and the IR objects
+    are what makes it answerable here, where the membership of each group is
+    known and the format of each group has just been drawn.  Without the objects
+    the request is quietly ignored, because "subset of what" has no answer.
 
     ``variety`` is how many interpreters to emit.  One is the historical
     behaviour; two or more split the virtualized prototypes across VMs whose
@@ -271,7 +279,9 @@ def make_plan(rng: Rng, protos: Iterable[int],
                           dispatcher=dispatcher, families=families,
                           dispatchers=dispatchers, randomize_opcodes=randomize_opcodes,
                           fusion=fusion, alias_ratio=alias_ratio,
-                          alias_chance=alias_chance, prefs=fmt_prefs)
+                          alias_chance=alias_chance, prefs=fmt_prefs,
+                          protos_by_id=protos_by_id, isa_subset=isa_subset,
+                          permute_blocks=permute_blocks)
     # A stable opcode numbering is a real option, not a placeholder: it makes
     # two builds of the same source comparable byte for byte apart from the
     # names, which is what you want when you are checking that a change did
@@ -299,7 +309,10 @@ def _make_groups(rng: Rng, proto_ids: List[int], names: Dict[str, str], *,
                  dispatchers: Optional[Sequence[str]],
                  randomize_opcodes: bool, fusion: Sequence[FusionRule],
                  alias_ratio: float, alias_chance: float,
-                 prefs: Optional[FormatPrefs] = None) -> List[VMGroup]:
+                 prefs: Optional[FormatPrefs] = None,
+                 protos_by_id: Optional[Dict[int, Any]] = None,
+                 isa_subset: bool = False,
+                 permute_blocks: bool = False) -> List[VMGroup]:
     """Partition the selection into VMs, one per group.
 
     Assignment is round-robin over the sorted prototype ids rather than random.
@@ -325,6 +338,15 @@ def _make_groups(rng: Rng, proto_ids: List[int], names: Dict[str, str], *,
         dispatcher_pool = list(dispatchers or runtime.DISPATCHERS)
         rng.shuffle(dispatcher_pool)
 
+    # Membership is decided here, before the formats, because a per-group
+    # instruction set has to know who is in the group.  The assignment below is
+    # the round-robin this function has always used; `members` is the same
+    # partition, computed once so the opcode subset and the plan cannot
+    # disagree about which prototype runs where.
+    members: List[List[int]] = [[] for _ in range(count)]
+    for i, pid in enumerate(proto_ids):
+        members[i % count].append(pid)
+
     groups: List[VMGroup] = []
     for index in range(count):
         fam = family_pool[index % len(family_pool)]
@@ -335,9 +357,40 @@ def _make_groups(rng: Rng, proto_ids: List[int], names: Dict[str, str], *,
         # `sparse` spaces the numbering out, so opcode numbers are not a dense
         # 1..N run in every build -- an analyst who assumes density reads the
         # wrong set of arms.
-        opmap = (OpcodeMap.identity() if not randomize_opcodes else
+        # Which operations this group needs.  Over-approximated on purpose (see
+        # `encode.required_ops`): a missing opcode is a build failure, an extra
+        # one is a handler nobody reaches.
+        subset: Optional[Set[str]] = None
+        if isa_subset and protos_by_id:
+            needed: Set[str] = set()
+            for pid in members[index]:
+                proto = protos_by_id.get(pid)
+                if proto is None:
+                    needed = None        # type: ignore[assignment]
+                    break
+                got = encode.required_ops(proto, fmt,
+                                          permuted_blocks=permute_blocks)
+                if got is None:
+                    needed = None        # type: ignore[assignment]
+                    break
+                needed |= got
+            subset = needed or None
+        if subset is not None and fused:
+            # A pair the encoder may emit has to have both halves and a number.
+            subset |= {o for pair in fused for o in pair}
+        opmap = (OpcodeMap.identity(ops=subset) if not randomize_opcodes else
                  OpcodeMap.shuffled(rng, alias_ratio=alias_ratio, fused=fused,
-                                    sparse=1 if count == 1 else 1 + index))
+                                    sparse=1 if count == 1 else 1 + index,
+                                    ops=subset))
+        if subset is not None and len(opmap.to_byte) < len(subset):
+            # The number space ran out mid-subset (only possible with an
+            # aggressive `sparse` on a large group).  Fall back to the full ISA:
+            # a group with a handler missing is a broken build, and a group with
+            # a few unused arms is merely less diverse.
+            opmap = (OpcodeMap.identity() if not randomize_opcodes else
+                     OpcodeMap.shuffled(rng, alias_ratio=alias_ratio,
+                                        fused=fused, sparse=1))
+            subset = None
         own = dict(names)
         if count > 1:
             # Each group's own entry point name, so a build with two VMs does
@@ -356,8 +409,8 @@ def _make_groups(rng: Rng, proto_ids: List[int], names: Dict[str, str], *,
                                            if (r.first, r.second) in fitted))
         groups.append(VMGroup(index=index, fmt=fmt, opmap=opmap, family=fam,
                               dispatcher=disp, names=own))
-    for i, pid in enumerate(proto_ids):
-        groups[i % len(groups)].protos.add(pid)
+    for index, group in enumerate(groups):
+        group.protos.update(members[index])
     return groups
 
 

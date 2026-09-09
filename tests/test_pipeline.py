@@ -498,6 +498,75 @@ def test_a_pool_full_of_decoys_prints_what_the_source_prints():
         assert want.stdout == got.stdout, (count, want.stdout, got.stdout)
 
 
+CIPHER_PROGRAM = """local function score(a, b)
+  local t = a * b + 2
+  if t > 9 then t = t - 9 end
+  for i = 1, 3 do t = t + i * a end
+  return t
+end
+print(score(3, 4), score(1, 1), score(0, 7))
+"""
+
+
+def _live_config(**over):
+    config = Config.hardened()
+    config.min_virtualize_body_nodes = 1
+    # The budget trades passes away on a program this size, and the point of
+    # these builds is the pass being measured.
+    config.max_output_growth = 0
+    for key, value in over.items():
+        setattr(config, key, value)
+    return config
+
+
+def test_the_opcode_cipher_is_in_the_reader_not_only_in_the_config():
+    """On: the generated fetch undoes something.  Off: it reads a byte.
+
+    "The flag reached the build" cannot mean "the output differs", because every
+    draw downstream of a disabled knob moves too -- that test would pass on a
+    field nothing reads.  So the assertion is about the one line the field owns:
+    the opcode reader.  Both builds are executed by `verify=True`, which is the
+    half that matters most: a disguise the encoder applies and the interpreter
+    forgets is a wrong program, not an insecure one.
+    """
+    bare = re.compile(r"function _ro\(a\)\s*return\s+_bd\(\w+,\s*a\)\s*end")
+
+    off = build(CIPHER_PROGRAM, _live_config(opcode_cipher=False,
+                                             reproducible_seed=4),
+                name="cipher.luau", verify=True)
+    on = build(CIPHER_PROGRAM, _live_config(opcode_cipher=True,
+                                            reproducible_seed=4),
+               name="cipher.luau", verify=True)
+    assert off.stats.virtualized >= 1 and on.stats.virtualized >= 1
+    assert bare.search(off.source), "the reader should be a plain byte fetch"
+    assert not bare.search(on.source), "the cipher did not reach the interpreter"
+    assert all(g["format"]["op_cipher"] == "none" for g in off.stats.vm_groups)
+    assert all(g["format"]["op_cipher"] != "none" for g in on.stats.vm_groups)
+    assert "opcode cipher none" in off.report
+    assert "opcode cipher none" not in on.report
+    # and both agree with the source they protect
+    assert off.stats.output_bytes > len(CIPHER_PROGRAM)
+
+
+def test_the_isa_subset_makes_smaller_vms_not_just_different_ones():
+    """Narrowing the instruction set is measured in arms and in bytes.
+
+    A group that runs three arithmetic functions should not carry a handler for
+    `GETGLOBAL`, and the artifact should be *cheaper* for it -- this is the one
+    diversity knob in the tool that reduces output size, which is what makes it
+    worth having under a size ceiling at all.
+    """
+    narrow = build(CIPHER_PROGRAM, _live_config(vm_isa_subset=True, reproducible_seed=9),
+                   name="isa.luau", verify=True)
+    whole = build(CIPHER_PROGRAM, _live_config(vm_isa_subset=False, reproducible_seed=9),
+                  name="isa.luau", verify=True)
+    assert narrow.stats.virtualized == whole.stats.virtualized >= 1
+    assert len(narrow.source) < len(whole.source)
+    top = lambda out: max(g["opcodes"] for g in out.stats.vm_groups)
+    assert top(narrow) < top(whole)
+    assert "opcodes" in narrow.report
+
+
 def test_the_report_lists_every_vm_group_the_artifact_carries():
     """One line per interpreter, read out of the plan rather than off the config.
 
@@ -626,3 +695,57 @@ def test_metadata_fragmentation_decides_whether_one_table_holds_everything():
     # Both have to be the same program, and both run: the interpreter is handed one
     # record either way, so the only thing that changed is where the pieces live.
     assert "code=" in split and "code=" in whole
+
+
+#: The corners the two VM-diversity knobs can be pushed into when they are
+#: combined with the knobs they sit next to.
+_VM_CORNERS = {
+    "cipher with formats pinned": dict(opcode_cipher=True, operand_randomization=False),
+    "cipher with numbering fixed": dict(opcode_cipher=True, opcode_randomization=False),
+    "subset with numbering fixed": dict(vm_isa_subset=True, opcode_randomization=False),
+    "subset with aliases off": dict(vm_isa_subset=True, opcode_aliases=0),
+    "subset with formats pinned": dict(vm_isa_subset=True, instruction_formats=0),
+    "both off": dict(opcode_cipher=False, vm_isa_subset=False),
+    "both on with one vm": dict(vm_variety=1),
+}
+
+
+def test_the_vm_diversity_knobs_are_correct_in_their_corners():
+    """Each pairing of the new knobs with an old one has to build and run.
+
+    A cipher drawn against a format that was never randomized, or a narrowed
+    instruction set built from a map with no aliases to lose, are the pairings
+    where an encoder and a reader can drift apart without anything static
+    noticing: both sides read the same descriptor, so a descriptor nobody
+    contradicts is invisible until the program prints the wrong number.  Running
+    the artifact under the pinned runtime is the only check that catches it, which
+    is why this test pays for seven builds instead of asserting on text.  The
+    corners are also where an inert knob hides, so the narrowed-vs-full handler
+    counts are compared to make sure the subset *did* something in each one.
+    """
+    if not TOOLCHAIN.can_execute:
+        pytest.skip("luau runtime not available; run tools/setup-luau.sh")
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(repo, "examples", "inventory.luau"),
+              encoding="utf-8") as fh:
+        source = fh.read()
+    original = execute(TOOLCHAIN, source, "inventory.luau", timeout=30)
+    narrowed, full = [], []
+    for name, over in sorted(_VM_CORNERS.items()):
+        config = Config.maximum()
+        config.min_virtualize_body_nodes = 1
+        config.max_output_growth = 0
+        config.reproducible_seed = 1
+        for key, value in over.items():
+            setattr(config, key, value)
+        result = build(source, config, name="inventory.luau", verify=True)
+        protected = execute(TOOLCHAIN, result.source, "built.luau", timeout=60)
+        assert protected.stdout == original.stdout, f"{name}: output changed"
+        assert protected.returncode == original.returncode, (            f"{name}: rc {original.returncode} != {protected.returncode}"            f"\n{protected.stderr[:300]}")
+        arms = [g["opcodes"] for g in result.stats.vm_groups]
+        assert arms and all(a > 0 for a in arms), f"{name}: no VM to check"
+        (full if over.get("vm_isa_subset") is False or not config.vm_isa_subset
+         else narrowed).append(max(arms))
+    assert narrowed and full, "the corner table lost one of its two halves"
+    assert max(narrowed) < max(full), (
+        f"the subset stopped narrowing: {narrowed} against {full}")
