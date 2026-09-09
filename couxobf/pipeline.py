@@ -75,6 +75,23 @@ def _family_rotation(vm_family) -> tuple:
     return tuple(ordered)
 
 
+def _dispatcher_rotation(dispatcher_family) -> tuple:
+    """Every dispatcher shape this build can spread across, pinned one first.
+
+    The mirror of :func:`_family_rotation`, for the same reason: ``--dispatcher
+    bucket`` has to be observable.  Handing ``DISPATCHERS`` over directly let
+    ``_make_groups`` shuffle the pool and index it, so a build with a single group
+    drew a shape at random and the flag changed nothing an analyst could see.
+    ``mixed`` is the value that means "I do not care", so it is the only one that
+    leaves group 0 unpinned.
+    """
+    wanted = str(getattr(dispatcher_family, "value", dispatcher_family))
+    pool = list(_vm_runtime.DISPATCHERS)
+    if wanted not in pool or wanted in ("", "mixed", "none"):
+        return tuple(pool)
+    return tuple([wanted] + [d for d in pool if d != wanted])
+
+
 def _format_variety(config) -> int:
     """How much the instruction format is allowed to move. 0 means never."""
     if not config.operand_randomization:
@@ -362,7 +379,7 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         # knob is not allowed to be.
         families=(_family_rotation(config.vm_family)
                   if config.state_distribution else None),
-        dispatchers=(tuple(_vm_runtime.DISPATCHERS)
+        dispatchers=(_dispatcher_rotation(config.dispatcher_family)
                      if config.dispatcher_splitting else None),
         fusion_level=(1 if config.instruction_fusion
                       and config.super_instructions else 0),
