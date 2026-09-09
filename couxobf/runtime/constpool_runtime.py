@@ -122,11 +122,29 @@ local function {n['load']}()
       q += 8
     elseif t == 3 then
       q += 4 + string.unpack(">I4", p, q)
+    elseif t == 4 then
+      q += 12
+    elseif t == 5 then
+      local c = string.unpack(">I2", p, q)
+      q += 2
+      for _ = 1, c do
+        local len = string.unpack(">I2", p, q + 4)
+        q += 6 + len
+      end
     elseif t == 1 then
       q += 1
     end
   end
   {n['off']} = o
+end
+local function {n['dyn']}(s, seed)
+  local x = seed % 2147483648
+  local out = table.create(#s)
+  for j = 1, #s do
+    x = (x * 1103515 + 12345) % 2147483648
+    out[j] = string.char(bit32.bxor(string.byte(s, j), bit32.band(bit32.rshift(x, 16), 255)))
+  end
+  return table.concat(out)
 end
 local function {n['mat']}(i)
   local p = {n['plain']}
@@ -138,9 +156,25 @@ local function {n['mat']}(i)
     return string.byte(p, q + 1) ~= 0
   elseif t == 2 then
     return string.unpack(">d", p, q + 1)
-  else
+  elseif t == 3 then
     local len = string.unpack(">I4", p, q + 1)
     return string.sub(p, q + 5, q + 4 + len)
+  elseif t == 4 then
+    local seed = string.unpack(">I4", p, q + 1)
+    return string.unpack(">d", {n['dyn']}(string.sub(p, q + 5, q + 12), seed), 1)
+  else
+    local parts = {{}}
+    local m = 0
+    local count = string.unpack(">I2", p, q + 1)
+    q += 3
+    for _ = 1, count do
+      local seed, len = string.unpack(">I4I2", p, q)
+      q += 6
+      m += 1
+      parts[m] = {n['dyn']}(string.sub(p, q, q + len - 1), seed)
+      q += len
+    end
+    return table.concat(parts)
   end
 end
 {cache_block}"""
@@ -178,6 +212,7 @@ def default_names(prefix: str = "_kQ") -> Dict[str, str]:
         "loaded": prefix + "7",
         "load": prefix + "8",
         "mat": prefix + "9",
+        "dyn": prefix + "z",
         "get": prefix + "10",
         "cache": prefix + "11",
         "seen": prefix + "12",

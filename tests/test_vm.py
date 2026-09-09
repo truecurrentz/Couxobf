@@ -818,7 +818,7 @@ def test_an_unimplemented_dispatcher_is_refused():
     """Silently falling back would report a protection it did not apply."""
     with pytest.raises(ValueError, match="not implemented"):
         wiring.make_plan(rngmod.make_domains(b"\x03" * 16).get("vm"), {1},
-                         dispatcher="state_transition")
+                         dispatcher="segmented")
 
 
 def test_opcode_randomization_changes_the_numbering():

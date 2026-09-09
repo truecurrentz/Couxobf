@@ -60,14 +60,26 @@ def _config_from_args(args) -> Config:
         config.dispatcher_family = args.dispatcher
     if getattr(args, "string_level", None) is not None:
         config.string_protection_level = args.string_level
+    if getattr(args, "constant_level", None) is not None:
+        config.constant_protection_level = args.constant_level
+    if getattr(args, "numeric_level", None) is not None:
+        config.numeric_protection_level = args.numeric_level
     if getattr(args, "cache_policy", None) is not None:
         config.cache_policy = args.cache_policy
     if getattr(args, "no_opcode_randomization", False):
         config.opcode_randomization = False
+    if getattr(args, "no_opaque_predicates", False):
+        config.opaque_predicates = False
     if getattr(args, "no_block_permutation", False):
         config.block_permutation = False
     if getattr(args, "max_vm_functions", None) is not None:
         config.max_vm_functions = args.max_vm_functions
+    if getattr(args, "max_output_growth", None) is not None:
+        config.max_output_growth = args.max_output_growth
+    if getattr(args, "env_guard", None) is not None:
+        config.env_guard = args.env_guard
+    if getattr(args, "dump_guard", None) is not None:
+        config.dump_guard = args.dump_guard
     if args.minify:
         config.minify = True
     if args.no_strip_types:
@@ -156,7 +168,9 @@ def cmd_verify(args, out=sys.stdout, err=sys.stderr) -> int:
     toolchain = find_toolchain(args.toolchain)
     report = validate_output(source, "", toolchain)
     print(f"reparse   : {'ok' if report.reparsed else 'FAILED'}", file=out)
-    print(f"compile   : {'ok' if report.compiled else 'FAILED'}", file=out)
+    toolchain_note = 'ok' if report.compiled else (
+        'skipped (no Luau compiler)' if not toolchain.can_compile else 'FAILED')
+    print(f"compile   : {toolchain_note}", file=out)
     print(f"ast nodes : {report.ast_nodes}", file=out)
     duplicated = {k: v for k, v in report.helper_counts.items() if v > 1}
     print(f"helpers   : {'ok' if not duplicated else f'duplicated: {duplicated}'}",
@@ -209,15 +223,29 @@ def _add_protection_knobs(sp) -> None:
                     default=None,
                     help="0 none, 1 pooled, 2 or 3 fragmented+encrypted+"
                          "ticketed (2 and 3 are currently identical)")
+    sp.add_argument("--constant-level", type=int, choices=(0, 1, 2, 3),
+                    default=None,
+                    help="constant-pool dynamic encoding level")
+    sp.add_argument("--numeric-level", type=int, choices=(0, 1, 2),
+                    default=None,
+                    help="numeric constant masking level inside the encrypted pool")
     sp.add_argument("--cache-policy", choices=("none", "bounded", "full"),
                     default=None, help="decoded-string retention (none is safest)")
     sp.add_argument("--no-opcode-randomization", action="store_true",
                     help="use a stable opcode numbering (weaker, but makes two "
                          "builds comparable)")
+    sp.add_argument("--no-opaque-predicates", action="store_true",
+                    help="disable VM-state opaque validity predicates")
     sp.add_argument("--no-block-permutation", action="store_true",
                     help="lay VM blocks out in IR order")
     sp.add_argument("--max-vm-functions", type=int, default=None,
                     help="cap on how many prototypes go into the VM")
+    sp.add_argument("--max-output-growth", type=float, default=None,
+                    help="size budget ratio; 0 disables trimming")
+    sp.add_argument("--env-guard", type=int, choices=(0, 1, 2), default=None,
+                    help="environment logging guard level")
+    sp.add_argument("--dump-guard", type=int, choices=(0, 1, 2), default=None,
+                    help="dump surface guard level")
 
 
 def build_parser() -> argparse.ArgumentParser:

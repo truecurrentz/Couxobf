@@ -378,7 +378,7 @@ def test_an_unimplemented_dispatcher_is_refused(capsys):
     """
     with pytest.raises(SystemExit) as exc:
         build_parser().parse_args(
-            ["protect", FIXTURE, "--dispatcher", "state_transition"])
+            ["protect", FIXTURE, "--dispatcher", "segmented"])
     assert exc.value.code == 2
     assert "invalid choice" in capsys.readouterr().err
 

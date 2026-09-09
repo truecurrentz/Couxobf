@@ -100,7 +100,14 @@ class StringBankRuntime:
             cache_block = (
                 f"local function {n['get']}(ticket)\n"
                 f"  {n['load']}()\n"
-                f"  return {n['resolve']}(ticket)\n"
+                f"  local cls = ticket % 3\n"
+                f"  if cls == 0 then\n"
+                f"    return {n['resolve']}(ticket)\n"
+                f"  elseif cls == 1 then\n"
+                f"    local indirect = ticket\n"
+                f"    return {n['resolve']}(indirect)\n"
+                f"  end\n"
+                f"  return (function(t) return {n['resolve']}(t) end)(ticket)\n"
                 f"end\n"
             )
         else:
@@ -123,7 +130,16 @@ class StringBankRuntime:
                 f"  if {n['seen']}[ticket] then\n"
                 f"    return {n['cache']}[ticket]\n"
                 f"  end\n"
-                f"  local v = {n['resolve']}(ticket)\n"
+                f"  local cls = ticket % 3\n"
+                f"  local v\n"
+                f"  if cls == 0 then\n"
+                f"    v = {n['resolve']}(ticket)\n"
+                f"  elseif cls == 1 then\n"
+                f"    local indirect = ticket\n"
+                f"    v = {n['resolve']}(indirect)\n"
+                f"  else\n"
+                f"    v = (function(t) return {n['resolve']}(t) end)(ticket)\n"
+                f"  end\n"
                 f"  {n['cache']}[ticket] = v\n"
                 f"  {n['seen']}[ticket] = true\n"
                 f"{guard}"
@@ -182,7 +198,12 @@ local function {n['load']}()
   local q = 13 + pages * 4
   local ix = {{}}
   for i = 1, tickets do
-    ix[i] = q
+    local ticket = i
+    if {'true' if getattr(sealed, 'indirect_ids', False) else 'false'} then
+      ticket = string.unpack(">I4", p, q)
+      q += 4
+    end
+    ix[ticket] = q
     q += 2 + string.unpack(">I2", p, q) * 10
   end
   {n['index']} = ix

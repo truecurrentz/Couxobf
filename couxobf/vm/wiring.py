@@ -493,7 +493,8 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
                    code_expr: Callable[[bytes], str],
                    edges_expr: Optional[Callable[[bytes], str]] = None,
                    entry_guard: Sequence[str] = (),
-                   fragmented: Optional[bool] = None) -> str:
+                   fragmented: Optional[bool] = None,
+                   opaque_predicates: bool = True) -> str:
     """The interpreters plus the descriptor tables, as Luau source.
 
     One interpreter per VM group, then three tables keyed by prototype id: the
@@ -513,7 +514,8 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
         parts.append(runtime.interpreter_source(group.opmap, group.names,
                                                 group.family, group.dispatcher,
                                                 group.fmt,
-                                                entry_guard=entry_guard))
+                                                entry_guard=entry_guard,
+                                                opaque_predicates=opaque_predicates))
     payload_rows = []
     const_rows = []
     edge_rows = []

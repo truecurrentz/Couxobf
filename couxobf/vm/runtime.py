@@ -435,14 +435,14 @@ class _Entry:
     def key(self) -> int:
         return self.numbers[0]
 
-    def condition(self, fmt: FormatSpec) -> str:
+    def condition(self, fmt: FormatSpec, var: str = "op") -> str:
         if len(self.numbers) == 1:
-            return f"op == {self.numbers[0]}"
+            return f"{var} == {self.numbers[0]}"
         # An aliased opcode tests as a disjunction rather than being emitted
         # twice: two arms with the same body would be boilerplate an automated
         # deobfuscator folds, and folding it would tell them where the alias set
         # is.
-        return "(" + " or ".join("op == %d" % x for x in self.numbers) + ")"
+        return "(" + " or ".join("%s == %d" % (var, x) for x in self.numbers) + ")"
 
     def body(self, n: Dict[str, str], fam: Family, fmt: FormatSpec) -> List[str]:
         if self.pair is not None:
@@ -653,10 +653,44 @@ def _emit_bucket(lines: List[str], entries: Sequence[_Entry],
     lines.append("    end")
 
 
+def _emit_state_transition(lines: List[str], entries: Sequence[_Entry],
+                           n: Dict[str, str], fam: Family, fmt: FormatSpec,
+                           trace: Optional[List[Tuple[Tuple[int, ...], Tuple[str, ...]]]] = None
+                           ) -> None:
+    """An inner dispatcher per instruction, driven by a transient state.
+
+    The outer VM still advances one bytecode instruction at a time.  This shape
+    deliberately separates opcode decoding from handler execution one step more:
+    the decoded opcode becomes a short-lived state, and a second dispatcher
+    consumes that state.  It is heavier than the direct chain and is therefore a
+    polymorphic option, not the only interpreter shape.
+    """
+    seed = dispatch_seed(entries)
+    state_name = "_ds%d" % (seed % 997)
+    lines.append(f"    local {state_name} = op")
+    lines.append("    while true do")
+    first = True
+    for entry in entries:
+        cond = entry.condition(fmt, state_name)
+        lines.append(f"      {'if' if first else 'elseif'} {cond} then")
+        first = False
+        if trace is not None:
+            trace.append((tuple(entry.numbers), (entry.condition(fmt),)))
+        body_lines = entry.body(n, fam, fmt)
+        for body_line in body_lines:
+            lines.append(f"        {body_line}")
+        if not any(line.lstrip().startswith("return") for line in body_lines):
+            lines.append("        break")
+    lines.append("      else")
+    lines.append('        error("invalid state")')
+    lines.append("      end")
+    lines.append("    end")
+
+
 #: Dispatch shapes this can emit.  NESTED_IF is the flat chain every build used
-#: to have; the other two are genuinely different control structures, not the
-#: same chain with different spacing.
-DISPATCHERS = ("nested_if", "decision_tree", "bucket")
+#: to have; the others are genuinely different control structures, not the same
+#: chain with different spacing.
+DISPATCHERS = ("nested_if", "decision_tree", "bucket", "state_transition")
 
 
 def dispatch_seed(entries: Sequence[_Entry]) -> int:
@@ -683,6 +717,8 @@ def _emit_dispatch(lines: List[str], entries: Sequence[_Entry],
         buckets = 4 + seed % 5                       # 4..8 buckets
         multiplier = 1 + 2 * ((seed // 5) % 17)      # odd, 1..33
         _emit_bucket(lines, entries, n, fam, fmt, buckets, multiplier, trace)
+    elif dispatcher == "state_transition":
+        _emit_state_transition(lines, entries, n, fam, fmt, trace)
     elif dispatcher == "nested_if":
         _emit_chain(lines, "    ", entries, n, fam, fmt, (), trace)
     else:
@@ -715,7 +751,8 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
                        fmt: Optional[FormatSpec] = None,
                        trace: Optional[List[Tuple[Tuple[int, ...],
                                                   Tuple[str, ...]]]] = None,
-                       entry_guard: Sequence[str] = ()
+                       entry_guard: Sequence[str] = (),
+                       opaque_predicates: bool = True
                        ) -> str:
     """The interpreter, with this build's opcode numbers *and layout* inlined.
 
@@ -748,6 +785,14 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         # cannot push the stored value out of the slot it lives in.
         entry_expr = "(%s - %d) %% %d + 1" % (raw, spec.header.entry_bias,
                                               1 << (8 * entry_w))
+    opaque_line = ([
+        # A short opaque branch whose truth depends on the bytecode and the
+        # decoded opcode for this execution, not on a repetitive algebraic
+        # identity.  It doubles as a cheap tamper tripwire: a bad pc/op image
+        # reaches the same neutral error as every other invalid VM state.
+        f"    if not ((op == op) and (pc >= 1) and (#{n['code']} >= pc)) then error(\"invalid state\") end",
+    ] if opaque_predicates else [])
+
     lines: List[str] = [
         "local _bd = string.byte",
         "local _unpack = table.unpack",
@@ -809,6 +854,7 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         # (`_ro`, alongside `_rr`/`_rk`/`_rp`) rather than in the one place that
         # also happens to be the anchor a matcher looks for first.
         "    local op = _ro(pc)",
+        *opaque_line,
         f"    pc = pc + {spec.op_bytes}",
     ]
 

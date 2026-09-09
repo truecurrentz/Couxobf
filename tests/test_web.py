@@ -47,7 +47,7 @@ def test_a_build_succeeds_and_reports_what_it_did():
     status, body = handle({"source": SOURCE, "options": {"profile": "maximum",
                                                          "min_virtualize_body_nodes": 1}})
     assert status == 200, body
-    assert body["output"].startswith("local ")
+    assert body["output"].startswith("return(function")
     assert body["input_bytes"] == len(SOURCE)
     assert body["output_bytes"] == len(body["output"])
     assert body["prototypes"] >= 2
@@ -58,7 +58,7 @@ def test_a_build_succeeds_and_reports_what_it_did():
 
 @pytest.mark.skipif(not TOOLCHAIN.can_execute, reason="luau runtime unavailable")
 @pytest.mark.parametrize("family", ("register", "accumulator", "stack", "hybrid"))
-@pytest.mark.parametrize("dispatcher", ("nested_if", "bucket", "decision_tree"))
+@pytest.mark.parametrize("dispatcher", ("nested_if", "bucket", "decision_tree", "state_transition"))
 def test_every_web_option_combination_produces_runnable_luau(family, dispatcher):
     """The UI exposes these as dropdowns, so every pairing has to work.
 
@@ -135,7 +135,7 @@ def test_an_unknown_option_is_rejected_rather_than_ignored():
 
 @pytest.mark.parametrize("options,message", [
     ({"vm_family": "quantum"}, "expected one of"),
-    ({"dispatcher_family": "state_transition"}, "expected one of"),
+    ({"dispatcher_family": "segmented"}, "expected one of"),
     ({"cache_policy": "forever"}, "expected one of"),
     ({"string_protection_level": 9}, "expected an integer in 0..3"),
     ({"string_protection_level": -1}, "expected an integer in 0..3"),

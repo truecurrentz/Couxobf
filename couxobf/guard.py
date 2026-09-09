@@ -61,7 +61,7 @@ from . import ast_nodes as A
 #: outlive a ``setfenv`` that changed them, and the artifact would then be running
 #: a different program than the source described.
 CAPTURED: Tuple[str, ...] = (
-    "string", "table", "math", "os", "coroutine", "getfenv", "setmetatable",
+    "_G", "bit32", "string", "table", "math", "os", "coroutine", "getfenv", "setmetatable",
     "getmetatable", "rawget", "rawset", "rawequal", "next", "type", "tonumber",
     "tostring", "select", "pcall", "xpcall", "error", "assert", "ipairs",
     "pairs", "unpack", "gcinfo", "debug", "print", "warn",
@@ -289,7 +289,7 @@ class Guard:
         is a global read on every call -- exactly the thing the capture exists to
         remove, and a logger would see the guard more often than the program.
         """
-        out = ["getfenv", "getmetatable", "rawget", "error"]
+        out = ["_G", "getfenv", "getmetatable", "rawget", "error"]
         if self.neutralises:
             out += ["pcall", "rawset"]
         for table, _name, _call in SURFACES:
@@ -327,8 +327,8 @@ class Guard:
             # `getfenv` and no `_G` must still have *something* to look a metatable
             # up on, or the guard's own first line is a nil index and the artifact
             # dies for want of a defence.
-            "local %s = (%s) and (%s)(1) or _G or {}"
-            % (env, self.cap("getfenv"), self.cap("getfenv")),
+            "local %s = (%s) and (%s)(1) or %s or {}"
+            % (env, self.cap("getfenv"), self.cap("getfenv"), self.cap("_G")),
             # `getmetatable` itself is not guaranteed to exist -- a sandbox can
             # strip it -- so it is called through a presence test rather than
             # assumed.  A guard that errors on the runtime it is defending is the

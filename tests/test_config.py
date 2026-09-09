@@ -78,10 +78,9 @@ def test_the_defaults_request_features_that_are_not_built():
     pending = dict(Config().pending_fields())
     for name in ("max_vm_depth", "mixed_execution", "handler_splitting",
                  "call_frame_obfuscation", "encoded_pc", "epoch_masks",
-                 "constant_protection_level", "table_key_protection",
-                 "integrity_level", "self_test", "identifier_polymorphism",
-                 "fingerprint_reduction", "opaque_predicates", "branch_inversion",
-                 "chunking_level", "lazy_decode", "numeric_protection_level",
+                 "table_key_protection", "integrity_level", "self_test",
+                 "identifier_polymorphism", "fingerprint_reduction",
+                 "branch_inversion", "chunking_level", "lazy_decode",
                  "junk_level", "roblox_mode"):
         assert name in pending, name
     assert len(pending) <= 20, sorted(pending)
@@ -93,10 +92,10 @@ def test_turning_a_feature_off_removes_it_from_the_pending_list():
     turned_off = {n for n, _ in Config(
         opaque_predicates=False, decoys=False, numeric_protection_level=0,
         integrity_level=IntegrityLevel.NONE).pending_fields()}
-    # `decoys` is deliberately not in here any more: it became a real option, so
-    # turning it off changes the build rather than changing the pending list.
-    assert baseline - turned_off == {
-        "opaque_predicates", "numeric_protection_level", "integrity_level"}
+    # `decoys`, `opaque_predicates` and numeric constants are deliberately not in
+    # here any more: they became real options, so turning them off changes the
+    # build rather than changing the pending list.
+    assert baseline - turned_off == {"integrity_level"}
 
 
 def test_debug_build_is_not_reported_when_off():
@@ -118,8 +117,7 @@ def test_report_lists_the_unapplied_capabilities():
     assert "requested but not applied" in report
     expected = len(Config(reproducible_seed=1).pending_fields())
     assert f"{expected} declared capabilities are not implemented" in report
-    for probe in ("opaque_predicates", "branch_inversion",
-                  "fingerprint_reduction"):
+    for probe in ("branch_inversion", "fingerprint_reduction"):
         assert probe in report, f"{probe} missing from the report"
 
 

@@ -187,7 +187,7 @@ class Config:
     vm_isa_subset: bool = True
     #: Keep control-flow edges out of the instruction stream: the payload
     #: carries an ordinal and the destinations live in their own blob.
-    edge_indirection: bool = False
+    edge_indirection: bool = True
     #: Spread VM state across the families (accumulator/stack/register) rather
     #: than one discipline for the whole build.
     state_distribution: bool = True
@@ -197,7 +197,6 @@ class Config:
     control_flow_level: int = 2
     opaque_predicates: bool = True
     branch_inversion: bool = True
-    edge_indirection: bool = True
     block_permutation: bool = True
     encoded_pc: bool = True
     epoch_masks: bool = True
@@ -381,7 +380,10 @@ class Config:
             instruction_formats=2,
             opcode_aliases=2,
             edge_indirection=True,
+            env_guard=2,
+            dump_guard=2,
             decoy_constants=24,
+            max_output_growth=0,
         )
 
     PROFILES = ("compact", "balanced", "hardened", "maximum")
@@ -444,11 +446,14 @@ class Config:
         "dispatcher_splitting",
         "metadata_fragmentation",
         "string_protection_level",
+        "constant_protection_level",
+        "numeric_protection_level",
         "cache_policy",
         "bounded_cache_size",
         "decoys",
         "decoy_constants",
         "control_flow_level",
+        "opaque_predicates",
         "env_guard",
         "dump_guard",
         "guard_policy",
@@ -512,6 +517,6 @@ class Config:
             problems.append("integrity checking is enabled but nothing is protected")
         if self.junk_level > 0 and self.minify:
             problems.append("junk_level > 0 is partly undone by minify")
-        if self.max_output_growth < 1.0:
-            problems.append("max_output_growth must be >= 1.0")
+        if self.max_output_growth != 0 and self.max_output_growth < 1.0:
+            problems.append("max_output_growth must be 0 (disabled) or >= 1.0")
         return problems

@@ -108,6 +108,7 @@ class SealedBank:
     page_size: int
     page_count: int
     ticket_count: int
+    indirect_ids: bool = False
 
 
 #: LCG constants for the reversible mask.
@@ -146,7 +147,8 @@ class StringBank:
 
     def __init__(self, keys: Any, rng: Rng, context: bytes,
                  page_size: int = DEFAULT_PAGE_SIZE,
-                 per_occurrence: bool = True) -> None:
+                 per_occurrence: bool = True,
+                 randomized_ids: bool = False) -> None:
         if page_size < 64:
             raise StringBankError("page size must be at least 64 bytes")
         if page_size % 64 != 0:
@@ -159,7 +161,9 @@ class StringBank:
         self.context = context
         self.page_size = page_size
         self.per_occurrence = per_occurrence
-        self._tickets: List[List[_Fragment]] = []
+        self.randomized_ids = bool(randomized_ids)
+        self._tickets: List[Tuple[int, List[_Fragment]]] = []
+        self._used_ids = set()
         self._flat = bytearray()
         self._sealed: Optional[SealedBank] = None
         #: When occurrences share fragments, one value maps to one fragment
@@ -189,8 +193,15 @@ class StringBank:
                 self._shared[raw] = frags
         else:
             frags = self._shared[raw]
-        self._tickets.append(frags)
-        return len(self._tickets)  # 1-based, so 0 is never a valid ticket
+        if self.randomized_ids:
+            ticket = self.rng.randbelow(0x7FFFFFFE) + 1
+            while ticket in self._used_ids:
+                ticket = self.rng.randbelow(0x7FFFFFFE) + 1
+        else:
+            ticket = len(self._tickets) + 1  # 1-based, so 0 is never valid
+        self._used_ids.add(ticket)
+        self._tickets.append((ticket, frags))
+        return ticket
 
     @staticmethod
     def _as_bytes(value) -> bytes:
@@ -296,6 +307,7 @@ class StringBank:
             page_size=page,
             page_count=page_count,
             ticket_count=len(self._tickets),
+            indirect_ids=self.randomized_ids,
         )
         return self._sealed
 
@@ -305,7 +317,9 @@ class StringBank:
                            self.page_size)
         for slot in perm:
             out += struct.pack(">I", slot)
-        for frags in self._tickets:
+        for ticket_id, frags in self._tickets:
+            if self.randomized_ids:
+                out += struct.pack(">I", ticket_id)
             out += struct.pack(">H", len(frags))
             for f in frags:
                 out += struct.pack(">IHI", f.offset, f.length, f.mask_seed)
@@ -332,13 +346,28 @@ class StringBank:
         for _ in range(page_count):
             perm.append(struct.unpack_from(">I", plain, pos)[0])
             pos += 4
-        if not 1 <= ticket <= tickets:
-            raise StringBankError(f"ticket {ticket} out of range")
-        for _ in range(ticket - 1):
+        found = None
+        if self.randomized_ids:
+            for _ in range(tickets):
+                ticket_id = struct.unpack_from(">I", plain, pos)[0]
+                pos += 4
+                count = struct.unpack_from(">H", plain, pos)[0]
+                if ticket_id == ticket:
+                    pos += 2
+                    found = (pos, count)
+                    break
+                pos += 2 + count * 10
+            if found is None:
+                raise StringBankError(f"ticket {ticket} out of range")
+            pos, count = found
+        else:
+            if not 1 <= ticket <= tickets:
+                raise StringBankError(f"ticket {ticket} out of range")
+            for _ in range(ticket - 1):
+                count = struct.unpack_from(">H", plain, pos)[0]
+                pos += 2 + count * 10
             count = struct.unpack_from(">H", plain, pos)[0]
-            pos += 2 + count * 10
-        count = struct.unpack_from(">H", plain, pos)[0]
-        pos += 2
+            pos += 2
 
         key = self.keys.region_key("string-bank", self._region)
         out = bytearray()

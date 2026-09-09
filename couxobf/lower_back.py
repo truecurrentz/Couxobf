@@ -788,6 +788,8 @@ def reconstruct_protected(module: IRModule,
                           cache_policy: str = "full",
                           cache_bound: int = 64,
                           pool_decoys: int = 0,
+                          constant_level: int = 0,
+                          numeric_level: int = 0,
                           fingerprint: bool = True,
                           metadata_fragmentation: bool = True,
                           names: Optional[Dict[str, str]] = None,
@@ -798,6 +800,7 @@ def reconstruct_protected(module: IRModule,
                           vm_protos: Any = None,
                           vm_family: Any = "register",
                           block_permutation: bool = False,
+                          opaque_predicates: bool = True,
                           layout_rng: Any = None,
                           dispatcher_family: Any = "mixed",
                           opcode_randomization: bool = True,
@@ -861,7 +864,9 @@ def reconstruct_protected(module: IRModule,
         _optimize.optimize_module(module)
     pool = ConstantPool(keys, rng, context,
                         cache_policy=cache_policy, cache_bound=cache_bound,
-                        decoys=pool_decoys)
+                        decoys=pool_decoys,
+                        constant_level=constant_level,
+                        numeric_level=numeric_level)
 
     # Selected after optimization, so prototypes the optimizer shrank below the
     # size floor are not virtualized on the strength of code that no longer
@@ -952,7 +957,8 @@ def reconstruct_protected(module: IRModule,
         from .strings.bank import StringBank
         from .runtime.stringbank_runtime import default_names as bank_default_names
         bank = StringBank(keys, string_rng if string_rng is not None else rng,
-                          context, page_size=string_page_size)
+                          context, page_size=string_page_size,
+                          randomized_ids=True)
         # Its own prefix, drawn from the string stream: sharing the constant
         # pool's prefix would make the two runtimes recognisable as a pair.
         bank_names = bank_default_names(
@@ -990,7 +996,8 @@ def reconstruct_protected(module: IRModule,
         pooled = lambda value: "%s(%d)" % (names["get"], pool.slot(value))
         vm_src = _wiring.prelude_source(plan, rec.vm_encoded, pooled, pooled,
                                         edges_expr=pooled,
-                                        entry_guard=guard.entry_lines())
+                                        entry_guard=guard.entry_lines(),
+                                        opaque_predicates=bool(opaque_predicates))
 
     # A program with no constants at all needs no pool: emitting the runtime
     # for an empty blob would just be a decoder that never runs.
@@ -1092,11 +1099,36 @@ def reconstruct_protected(module: IRModule,
 
     prefix: List[A.Stmt] = []
     if guard_block is not None:
-        # First, because its locals are what the blocks below now read.
-        prefix += list(guard_block.body)
+        # The guard no longer emits ``local alias = global`` captures here.  The
+        # emitted chunk is wrapped below in a parameterized IIFE whose parameters
+        # are exactly these aliases, and whose arguments are the real globals in a
+        # build-random order.  That leaves the protected scaffold reading locals
+        # after entry while avoiding the stable local-alias prelude that used to
+        # identify every build.
+        prefix += [s for s in guard_block.body
+                   if not (isinstance(s, A.Local)
+                           and len(s.names) == 1
+                           and s.names[0].name in set(captured.values()))]
     for block in (crypto_block, pool_block, bank_block):
         if block is not None:
             prefix += list(block.body)
     vm_stmts = list(vm_block.body) if vm_block is not None else []
     out = A.Block(body=prefix + list(helpers.body) + vm_stmts + list(body.body))
-    return _printer.emit(out, minify=minify)
+    emitted = _printer.emit(out, minify=minify)
+    if captured:
+        order = list(captured.items())
+        # Randomize parameter ordering per build.  The mapping itself is already
+        # per-build by name, but position matters for the wrapper shape: two
+        # artifacts with the same library set no longer present the same capture
+        # sequence to a reader.
+        try:
+            rng.shuffle(order)
+        except AttributeError:
+            import random as _random
+            _random.shuffle(order)
+        params = ", ".join(alias for _global, alias in order)
+        args = ", ".join(global_name for global_name, _alias in order)
+        sep = "" if minify else "\n"
+        emitted = "return(function(%s)%s%s%send)(%s)\n" % (
+            params, sep, emitted, sep, args)
+    return emitted

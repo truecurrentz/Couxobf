@@ -94,6 +94,9 @@ const SPEC = [
        "implemented: FORLOOP, CALL and SETLIST address base+1..+3."],
       ["control_flow_level", "Control flow", "select",
        "How far blocks are rearranged, from reordering up to flattening."],
+      ["opaque_predicates", "Opaque predicates", "bool",
+       "Add short validity predicates whose truth depends on the current decoded " +
+       "VM state, not repeated arithmetic identities a simplifier can delete."],
       ["block_permutation", "Permute blocks", "bool",
        "Emit basic blocks in an order that is not the source order."],
     ],
@@ -105,8 +108,14 @@ const SPEC = [
           "value -- precision, signed zero and NaN included -- but not their shape.",
     fields: [
       ["string_protection_level", "Strings", "select",
-       "0 off, 1 encoded, 2 fragmented and ticketed through the string bank. 3 is " +
-       "currently the same as 2; there is no third tier yet."],
+       "0 off, 1 encoded, 2/3 fragmented, ChaCha20 encrypted, HMAC-SHA256 checked, " +
+       "lazy, ticketed and indirectly referenced through randomized string IDs."],
+      ["constant_protection_level", "Constant pool", "select",
+       "Controls inner dynamic encodings inside the encrypted constant pool. At 2+ " +
+       "string constants in the pool are fragmented and reconstructed dynamically."],
+      ["numeric_protection_level", "Numbers", "select",
+       "Masks IEEE-754 double bytes inside the encrypted pool so number materializing " +
+       "is generated dynamically while preserving exact Luau float semantics."],
       ["cache_policy", "Decoded-string cache", "select",
        "How much plaintext sits in the heap: `none` re-materialises on every read, " +
        "`full` keeps everything, `bounded` keeps a rolling window."],
@@ -440,9 +449,9 @@ function buildForm() {
 }
 
 function unknownFields() {
-  const accepted = new Set([...Object.keys(surface), ...Object.keys(SYNTH)]);
+  const visible = new Set(FIELD_NAMES);
   return Object.keys(surface)
-    .filter((n) => n !== "reproducible_seed" && !accepted.has(n));
+    .filter((n) => n !== "reproducible_seed" && !visible.has(n));
 }
 
 function buildRow(name, label, kind, help) {
@@ -578,6 +587,9 @@ function syncGates() {
 }
 
 function applyProfile(name) {
+  document.querySelectorAll("#presetBar button[data-profile]").forEach((btn) => {
+    btn.setAttribute("aria-pressed", String(btn.dataset.profile === name));
+  });
   const values = profileValues[name];
   if (!values) return;
   for (const [field, value] of Object.entries(values)) {
@@ -654,7 +666,8 @@ function renderVms(groups) {
     `<td>${g.family} · ${g.dispatcher} · ${g.prototypes} ` +
     `${g.prototypes === 1 ? "prototype" : "prototypes"} · ${g.opcodes} opcodes · ` +
     `${g.op_bytes}B op + ${g.reg_bytes}B reg + ${g.wide_bytes}B wide · ` +
-    `targets ${g.target_mode} · opcode cipher ${g.opCipher}` +
+    `targets ${g.target_mode} · opcode cipher ${opCipher}` +
+    `${g.arm_seed ? " · shuffled arms" : ""}` +
     `${g.fused ? ` · ${g.fused} fused` : ""}</td></tr>`;
   }).join("");
   $("vmBody").innerHTML = head + rows;
@@ -843,13 +856,15 @@ async function loadSurface() {
 const FALLBACK = {
   virtualization_level: { kind: "enum", choices: ["none", "light", "medium", "heavy", "maximum"], default: "heavy" },
   vm_family: { kind: "enum", choices: ["register", "stack", "accumulator", "hybrid"], default: "register" },
-  dispatcher_family: { kind: "enum", choices: ["none", "nested_if", "decision_tree", "bucket", "mixed"], default: "mixed" },
+  dispatcher_family: { kind: "enum", choices: ["none", "nested_if", "decision_tree", "bucket", "state_transition", "mixed"], default: "mixed" },
   cache_policy: { kind: "enum", choices: ["none", "bounded", "full"], default: "none" },
   guard_policy: { kind: "choice", choices: ["fail", "ignore"], default: "fail" },
   hash_comments: { kind: "choice", choices: ["auto", "strip", "strict"], default: "auto" },
   instruction_formats: { kind: "int", min: 0, max: 2, default: 1 },
   opcode_aliases: { kind: "int", min: 0, max: 4, default: 1 },
   string_protection_level: { kind: "int", min: 0, max: 3, default: 2 },
+  constant_protection_level: { kind: "int", min: 0, max: 3, default: 2 },
+  numeric_protection_level: { kind: "int", min: 0, max: 2, default: 1 },
   control_flow_level: { kind: "int", min: 0, max: 3, default: 2 },
   env_guard: { kind: "int", min: 0, max: 2, default: 1 },
   dump_guard: { kind: "int", min: 0, max: 2, default: 1 },
