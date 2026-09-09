@@ -14,7 +14,7 @@ assumption, the measurement is what is written here.
 | 🔶 | Partially implemented — the gap is stated |
 | ⬜ | Not implemented |
 
-**Tally: 26 ✅ · 21 🔶 · 33 ⬜** (of which 5 are ⭐).
+**Tally: 26 done · 20 partial · 34 not built.** Of the 26 done, 16 are ✅ and 10 are ⭐ (implemented and improved beyond the point as written). All 80 points are scored exactly once.
 
 Two standing caveats that apply to the whole document. Client-side
 obfuscation raises the cost of reversing; it does not make reversing
@@ -210,21 +210,24 @@ of one build, not an illustration.
 BUILD     examples/maze.luau
 PROFILE   maximum | virtualization maximum | vm_family stack | dispatcher mixed
 SEED      00000000000000000000000000c0ffee
-RESULT    3484 B -> 52390 B  (15.0x)
+RESULT    3484 B -> 52412 B  (15.0x)
           8 prototypes, 3 virtualized
-          sha256 1fe81e14cb3281f7b6b0568d...
+          sha256 86b25338391ace7dee5d1181...
           executes byte-identically to the original under the Luau runtime
 ```
+
+These are the numbers the command at the end of this section produces, so
+re-running it should reproduce them exactly — a pinned seed is the whole point.
 
 Scoring that build against the checklist:
 
 | Question | Result | Point |
 | --- | --- | --- |
 | Did it VM everything? | No — 3 of 8 prototypes | ✅ #1 |
-| Are source string literals recoverable? | 0 of 29 present | ✅ #13 |
+| Are source string literals recoverable? | 0 of the 9 distinct literals in the source appear in the output | ✅ #13 |
 | Are source identifiers present? | 13 substrings match, all accounted for: Luau keywords (`local`, `function`, `return`, `while`, `elseif`, `false`), builtins (`string`, `table`, `print`, `ipairs`, `setmetatable`, `concat`), and `state` — which is only the five `error("invalid state")` sites, not the source's `state` local (that was renamed). A naive substring check reports this as a leak; it is not one. | ✅ #38 |
 | Any diagnostic vocabulary? | 0 hits across 10 phrases | ✅ #48 |
-| Any repeated decoder boilerplate? | 29 long literals, 0 repeats | ✅ #25 |
+| Any repeated decoder boilerplate? | 29 long literals in the output, 0 repeats | ✅ #25 |
 | Does the seed change the shape? | Yes — different dispatcher across seeds | ✅ #32 |
 | Is the helper block a stable signature? | **Yes** — `_kiterpack` and friends are identical in every build | ⬜ #23 |
 | Is `pc` an obvious name? | **Yes** — 228 occurrences | 🔶 #16 |
