@@ -146,6 +146,13 @@ def build(source: str, config: Optional[Config] = None,
         vm_level=config.virtualization_level,
         vm_rng=domains.get("vm"),
         vm_protos=selected,
+        string_level=config.string_protection_level,
+        # Its own stream: reusing the constant pool's randomness for the string
+        # bank would correlate two unrelated layouts, which is exactly what
+        # domain separation exists to prevent.
+        string_rng=domains.get("strings"),
+        string_cache_policy=str(getattr(config.cache_policy, "value",
+                                        config.cache_policy)),
     )
 
     stats = _collect_stats(module, classification, out, source)

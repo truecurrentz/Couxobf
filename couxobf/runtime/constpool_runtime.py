@@ -44,7 +44,7 @@ class ConstantPoolRuntime:
         return self.n["get"]
 
     def emit(self, key: bytes, nonce: bytes, tag: bytes, ciphertext: bytes,
-             aad: bytes) -> str:
+             aad: bytes, emit_crypto: bool = True) -> str:
         n = self.n
         # The crypto module ends in `return {...}`, so wrapping it in a call
         # turns it into a value without needing a require.
@@ -88,9 +88,13 @@ class ConstantPoolRuntime:
                 f"end\n"
             )
 
-        return f"""local {n['crypto']} = (function()
-{crypto}end)()
-local {n['key']} = {byte_literal(key)}
+        # When the string bank is present too, one crypto module serves both.
+        # A second copy would be another 8KB of decoder for an analyst to find,
+        # and a second place for the two to drift apart.
+        head = f"local {n['crypto']} = (function()\n{crypto}end)()\n" \
+            if emit_crypto else ""
+
+        return f"""{head}local {n['key']} = {byte_literal(key)}
 local {n['nonce']} = {byte_literal(nonce)}
 local {n['tag']} = {byte_literal(tag)}
 local {n['ct']} = {byte_literal(ciphertext)}

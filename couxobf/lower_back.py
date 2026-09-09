@@ -186,7 +186,8 @@ def _const_expr(value: Any) -> A.Expr:
 
 class Reconstructor:
     def __init__(self, pool: Any = None, accessor: Optional[str] = None,
-                 vm: Any = None) -> None:
+                 vm: Any = None, bank: Any = None,
+                 bank_accessor: Optional[str] = None) -> None:
         """``pool`` is a :class:`~couxobf.constpool.ConstantPool`.
 
         When one is supplied, no literal reaches the output: every constant is
@@ -208,6 +209,13 @@ class Reconstructor:
         self.vm = vm
         #: proto_id -> EncodedProto, filled in as function_expr runs
         self.vm_encoded: Dict[int, Any] = {}
+        #: Optional :class:`~couxobf.strings.bank.StringBank`.  When present,
+        #: string *values* loaded by LOADK are resolved through it instead of
+        #: the pool.  Only values: table keys, method names and global names
+        #: stay in the pool, because turning every ``{foo = 1}`` into a runtime
+        #: call costs far more than it hides.
+        self.bank = bank
+        self.bank_accessor = bank_accessor
         if (pool is None) != (accessor is None):
             raise ReconstructionError("pool and accessor must be given together")
 
@@ -315,6 +323,19 @@ class Reconstructor:
             return self._upvalue_expr(proto, op.index)
         raise ReconstructionError(f"bad operand {op!r}")
 
+    def _bank_or_pool(self, proto: FuncIR, k: Kon) -> A.Expr:
+        """A loaded constant: a bank ticket for strings, a pool slot otherwise.
+
+        Each *occurrence* takes a fresh ticket, which is the point -- two uses
+        of the same literal resolve independently.  Numbers, booleans and nil
+        stay in the pool: fragmenting a double buys nothing.
+        """
+        value = proto.consts[k.index]
+        if isinstance(value, (bytes, bytearray, str)):
+            ticket = self.bank.ticket(value)
+            return A.Call(fn=_name(self.bank_accessor), args=[_num(ticket)])
+        return self._pool_ref(value)
+
     def _pool_ref(self, value: Any) -> A.Expr:
         """A runtime read of one pooled constant."""
         slot = self.pool.slot(value)
@@ -395,6 +416,8 @@ class Reconstructor:
 
         if op == OP.NOP:
             return out
+        if op == OP.LOADK and self.bank is not None:
+            return [self._assign(proto, a[0], self._bank_or_pool(proto, a[1]))]
         if op in (OP.MOV, OP.LOADK):
             return [self._assign(proto, a[0], g(1))]
         if op == OP.GETGLOBAL:
@@ -629,7 +652,11 @@ def reconstruct_protected(module: IRModule,
                           optimize_first: bool = True,
                           vm_level: Any = VirtualizationLevel.HEAVY,
                           vm_rng: Any = None,
-                          vm_protos: Any = None) -> str:
+                          vm_protos: Any = None,
+                          string_level: int = 0,
+                          string_rng: Any = None,
+                          string_cache_policy: str = "none",
+                          string_page_size: int = 512) -> str:
     """Lower an IR module to protected, self-contained Luau source.
 
     Assembles three pieces in the order they must appear: the constant pool
@@ -674,7 +701,21 @@ def reconstruct_protected(module: IRModule,
                     else _wiring.select_protos(module, vm_level))
         plan = _wiring.make_plan(vm_rng if vm_rng is not None else rng, selected)
 
-    rec = Reconstructor(pool=pool, accessor=names["get"], vm=plan)
+    # Strings get their own bank at level 2 and above: fragmented, scattered
+    # across shuffled pages, and addressed by a per-occurrence ticket rather
+    # than interned by value.  The pool interns, so one recovered accessor
+    # yields every string; the bank deliberately does not.
+    bank = None
+    bank_names = None
+    if string_level >= 2:
+        from .strings.bank import StringBank
+        from .runtime.stringbank_runtime import default_names as bank_default_names
+        bank = StringBank(keys, string_rng if string_rng is not None else rng,
+                          context, page_size=string_page_size)
+        bank_names = bank_default_names()
+
+    rec = Reconstructor(pool=pool, accessor=names["get"], vm=plan, bank=bank,
+                        bank_accessor=(bank_names["get"] if bank_names else None))
     body = rec.reconstruct(module)
 
     # The VM's bytecode and constants are interned here, before the pool is
@@ -689,15 +730,57 @@ def reconstruct_protected(module: IRModule,
 
     # A program with no constants at all needs no pool: emitting the runtime
     # for an empty blob would just be a decoder that never runs.
-    if len(pool) == 0:
-        pool_src = ""
-    else:
+    need_pool = len(pool) > 0
+    need_bank = bank is not None and len(bank) > 0
+
+    # One crypto module for both, when both exist.  The module is ~8KB; two
+    # copies would be two decoders to find and two places to drift.
+    crypto_src = ""
+    if need_pool and need_bank:
+        from .runtime.luau_crypto import crypto_runtime
+        crypto_src = ("local %s = (function()\n%s end)()\n" % (
+            names["crypto"],
+            crypto_runtime({"xor": names["c_xor"], "sha": names["c_sha"],
+                            "mac": names["c_mac"], "open": names["c_open"],
+                            "seal": names["c_seal"]})))
+
+    pool_src = ""
+    if need_pool:
         sealed = pool.seal()
         runtime = ConstantPoolRuntime(names, cache_policy=cache_policy,
                                       cache_bound=cache_bound)
         pool_src = runtime.emit(sealed.key, sealed.nonce, sealed.tag,
-                                sealed.ciphertext, sealed.aad)
+                                sealed.ciphertext, sealed.aad,
+                                emit_crypto=not crypto_src)
+
+    bank_src = ""
+    if need_bank:
+        from .runtime.luau_crypto import crypto_runtime
+        from .runtime.stringbank_runtime import StringBankRuntime
+        # "none" is the default cache policy and the right one: a table of
+        # decrypted strings is a single dump that undoes the per-occurrence
+        # tickets entirely.
+        bn = dict(bank_names)
+        if crypto_src:
+            # The shared module exports the *pool's* field names, so the bank
+            # has to call it by those.  Keeping its own would compile fine and
+            # then fail at the first decrypt with "attempt to call a nil
+            # value", because the field simply is not there.
+            bn["crypto"] = names["crypto"]
+            for role in ("c_xor", "c_sha", "c_mac", "c_open", "c_seal"):
+                bn[role] = names[role]
+        bank_runtime = StringBankRuntime(
+            bn, cache_policy=string_cache_policy,
+            emit_crypto=not crypto_src)
+        bank_src = bank_runtime.emit(
+            bank.seal(),
+            crypto_runtime({"xor": bn["c_xor"], "sha": bn["c_sha"],
+                            "mac": bn["c_mac"], "open": bn["c_open"],
+                            "seal": bn["c_seal"]}) if not crypto_src else "")
+
+    crypto_block = _parser.parse(crypto_src, "<crypto>") if crypto_src else None
     pool_block = _parser.parse(pool_src, "<constpool>") if pool_src else None
+    bank_block = _parser.parse(bank_src, "<stringbank>") if bank_src else None
     # The helper functions have to be in scope too; a loop or a multi-value
     # call anywhere in the body refers to them.
     helpers = _parser.parse(HELPERS_SRC, "<helpers>")
@@ -709,7 +792,10 @@ def reconstruct_protected(module: IRModule,
     # merely encoded -- it is encrypted in the blob like every other constant.
     vm_block = _parser.parse(vm_src, "<vm>") if vm_src else None
 
-    prefix = list(pool_block.body) if pool_block is not None else []
+    prefix: List[A.Stmt] = []
+    for block in (crypto_block, pool_block, bank_block):
+        if block is not None:
+            prefix += list(block.body)
     vm_stmts = list(vm_block.body) if vm_block is not None else []
     out = A.Block(body=prefix + list(helpers.body) + vm_stmts + list(body.body))
     return _printer.emit(out, minify=minify)
