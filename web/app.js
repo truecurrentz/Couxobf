@@ -18,7 +18,6 @@ const FIELDS = {
   opcode_randomization: { kind: "bool" },
   minify: { kind: "bool" },
   strip_types: { kind: "bool" },
-  identifier_polymorphism: { kind: "bool" },
 };
 
 /* Profiles, mirrored from couxobf.config.Config. Kept here so the buttons do

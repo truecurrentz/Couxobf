@@ -264,9 +264,30 @@ def _js_field_keys():
     return set(re.findall(r"^\s{2}([a-z_][a-z_0-9]*):", block, re.M))
 
 
-def test_every_endpoint_option_is_reachable_from_the_ui():
-    missing = sorted(_accepted_options() - _html_ids())
-    assert not missing, f"no UI control for: {missing}"
+def test_no_ui_control_is_inert():
+    """Every control must map to a capability the build actually delivers.
+
+    `identifier_polymorphism` was a checkbox here that produced byte-identical
+    output whichever way it was set: the endpoint accepted it, stored it on the
+    config, and nothing read it.  Tying the controls to Config.IMPLEMENTED is
+    what stops the next one.
+    """
+    from couxobf.config import Config
+
+    # `profile` selects a bundle of implemented fields rather than being one
+    # itself, and the seed box is a separate affordance with its own id.
+    exempt = {"profile", "seed"}
+    inert = sorted(_js_field_keys() - set(Config.IMPLEMENTED) - exempt)
+    assert not inert, f"controls with no effect: {inert}"
+
+
+def test_every_implemented_option_is_reachable_from_the_ui():
+    from couxobf.config import Config
+
+    # The seed is exposed through the seed box rather than an `opt-` control.
+    ids = _html_ids() | {"reproducible_seed"} if "seed" in _html_ids() else _html_ids()
+    missing = sorted(set(Config.IMPLEMENTED) - ids)
+    assert not missing, f"implemented but not exposed: {missing}"
 
 
 def test_every_ui_option_is_accepted_by_the_endpoint():
