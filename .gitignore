@@ -10,9 +10,7 @@ build/
 # Toolchain (built by tools/setup-luau.sh, ~200MB, never vendored)
 /.luau-toolchain/
 
-# Build artifacts from the CLI.  The ones under examples/ are tracked
-# deliberately: they are the checked-in demo output, not scratch.
+# Build artifacts from the CLI.
 *.protected.luau
-!examples/*.protected.luau
 *.report.json
 /out/
