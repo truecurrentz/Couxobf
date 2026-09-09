@@ -28,6 +28,7 @@ from . import __version__
 from .config import Config
 from .pipeline import BuildError, build
 from .toolchain import find_toolchain
+from .vm.families import FAMILIES
 from .verify.output import OutputValidationError, validate_output
 
 EXIT_OK = 0
@@ -47,6 +48,8 @@ def _config_from_args(args) -> Config:
         config.reproducible_seed = args.seed
     if args.vm_level is not None:
         config.virtualization_level = args.vm_level
+    if getattr(args, "vm_family", None) is not None:
+        config.vm_family = args.vm_family
     if args.minify:
         config.minify = True
     if args.no_strip_types:
@@ -177,6 +180,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--vm-level", choices=("none", "light", "medium", "heavy",
                                           "maximum"),
                    help="how much of the program runs in the VM")
+    p.add_argument("--vm-family", choices=list(FAMILIES), default=None,
+                   help="operand discipline of the generated interpreter")
     p.add_argument("--minify", action="store_true", help="minify the output")
     p.add_argument("--min-nodes", type=int, default=None,
                    help="virtualize functions with at least this many\n"                        "AST nodes (default 12; lower it to virtualize\n"                        "small functions too)")
@@ -203,6 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--seed", type=_parse_seed, default=None)
     r.add_argument("--vm-level", choices=("none", "light", "medium", "heavy",
                                           "maximum"))
+    r.add_argument("--vm-family", choices=list(FAMILIES), default=None)
     r.add_argument("--minify", action="store_true")
     r.add_argument("--min-nodes", type=int, default=None)
 

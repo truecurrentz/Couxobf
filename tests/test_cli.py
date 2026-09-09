@@ -19,6 +19,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from couxobf import cli
+from couxobf.toolchain import find_toolchain
 from couxobf.cli import (EXIT_BUILD, EXIT_INVALID, EXIT_OK, EXIT_USAGE,
                          build_parser, main)
 
@@ -189,3 +190,99 @@ def test_module_entry_point_runs():
         cwd=root, capture_output=True, text=True, timeout=180)
     assert proc.returncode == EXIT_OK, proc.stderr[:400]
     assert "couxobf build report" in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# --vm-family
+# ---------------------------------------------------------------------------
+#
+# The config field existed for a long time with no way to set it from the
+# command line, so "the VM has four families" was not a claim a user of the CLI
+# could exercise. These are the tests that make the flag real.
+
+FAMILIES = ("register", "accumulator", "stack", "hybrid")
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_vm_family_flag_is_accepted(family):
+    code, out, _ = run_captured(
+        ["report", FIXTURE, "--seed", "1", "--min-nodes", "4",
+         "--vm-family", family])
+    assert code == EXIT_OK
+    assert f"vm family           : {family}" in out, out
+
+
+def test_vm_family_rejects_an_unknown_value(capsys):
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args(
+            ["protect", FIXTURE, "--vm-family", "quantum"])
+    assert exc.value.code == 2          # argparse usage error
+    assert "invalid choice" in capsys.readouterr().err
+
+
+def test_vm_family_is_reachable_from_report_too():
+    """Both subcommands that build need the flag, or the report describes a
+    build the CLI cannot actually produce."""
+    parser = build_parser()
+    for argv in (["protect", FIXTURE, "--vm-family", "stack"],
+                 ["report", FIXTURE, "--vm-family", "stack"]):
+        args = parser.parse_args(argv)
+        assert args.vm_family == "stack", argv[0]
+
+
+def test_vm_family_shows_up_in_the_report():
+    code, out, _ = run_captured(
+        ["report", FIXTURE, "--seed", "1", "--min-nodes", "4",
+         "--vm-family", "accumulator"])
+    assert code == EXIT_OK
+    assert "vm family           : accumulator" in out
+
+
+def test_vm_family_changes_the_output():
+    """Four families, four different artifacts -- with virtualization on.
+
+    Without --min-nodes this fixture virtualizes nothing, the interpreter is
+    never emitted, and all four outputs are byte-identical. That is correct
+    behaviour, and it is exactly the case that would let a vacuous version of
+    this test pass.
+    """
+    outs = {}
+    for family in FAMILIES:
+        code, out, _ = run_captured(
+            ["protect", FIXTURE, "--seed", "7", "--min-nodes", "1",
+             "--vm-family", family, "--no-verify"])
+        assert code == EXIT_OK
+        outs[family] = out
+    assert "0 virtualized" not in outs["stack"], "nothing was virtualized"
+    assert len(set(outs.values())) == len(FAMILIES), (
+        "some families produced identical output")
+
+
+def test_vm_family_without_virtualization_is_a_noop():
+    """Nothing virtualized means no interpreter, so the flag changes nothing.
+
+    Pinning this keeps the flag honest: it must not inflate output for a
+    program the design says should not be virtualized at all.
+    """
+    plain = run_captured(["protect", FIXTURE, "--seed", "7", "--no-verify"])[1]
+    stacked = run_captured(["protect", FIXTURE, "--seed", "7", "--no-verify",
+                            "--vm-family", "stack"])[1]
+    assert plain == stacked
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_vm_family_output_executes(family, tmp_path):
+    toolchain = find_toolchain()
+    if not toolchain.can_execute:
+        pytest.skip("luau runtime not available")
+    path = tmp_path / f"{family}.luau"
+    code, _, err = run_captured(
+        ["protect", FIXTURE, "--seed", "7", "--min-nodes", "1",
+         "--vm-family", family, "-o", str(path)])
+    assert code == EXIT_OK, err
+    original = subprocess.run([toolchain.luau, FIXTURE], capture_output=True,
+                              text=True)
+    protected = subprocess.run([toolchain.luau, str(path)], capture_output=True,
+                               text=True)
+    assert original.returncode == protected.returncode, protected.stderr[:400]
+    assert original.stdout == protected.stdout, family
