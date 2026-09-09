@@ -395,3 +395,94 @@ def test_presets_agree_with_the_profiles_they_claim():
             f"Config.from_profile says {config.string_protection_level}")
         checked += 1
     assert checked >= 2, f"only {checked} presets were parseable -- the check is vacuous"
+
+
+# ---------------------------------------------------------------------------
+# no stable identifier fingerprint across builds
+# ---------------------------------------------------------------------------
+
+def test_runtime_name_prefixes_differ_between_builds():
+    """A fixed prefix repeated a hundred times is a signature, not a secret.
+
+    The constant-pool and string-bank prefixes were the constants `_kQ` and
+    `_kS`, identical in every build ever produced -- an automated tool could
+    match on them before understanding anything.  Each build now draws its own.
+    """
+    from couxobf.config import Config
+    from couxobf.pipeline import build
+
+    seen = {}
+    for seed in (1, 2, 3, 4, 5, 6):
+        # string_protection_level >= 2 is what builds a string bank at all;
+        # the default is 0, so without this the bank assertions below would be
+        # checking an empty set and passing on nothing.
+        r = build(INVENTORY, Config(reproducible_seed=seed,
+                                    min_virtualize_body_nodes=1,
+                                    string_protection_level=2), verify=False)
+        pool = r.runtime_names["pool"]["ct"]
+        bank = r.runtime_names["bank"]["blob"]
+        assert bank, "no string bank was built, so its prefix was never checked"
+        seen[seed] = (pool, bank)
+        assert r.runtime_names["pool"]["crypto"].startswith("_k"), pool
+
+    pools = {p for p, _ in seen.values()}
+    banks = {b for _, b in seen.values()}
+    assert len(pools) == len(seen), f"pool prefix repeated across builds: {pools}"
+    assert len(banks) == len(seen), f"bank prefix repeated across builds: {banks}"
+    # And none of them is the old hardcoded value.
+    assert not any(p.startswith("_kQ") for p in pools)
+    assert not any(b.startswith("_kS") for b in banks)
+
+
+def test_helper_uniqueness_is_checked_against_real_names():
+    """Guard against the check going vacuous.
+
+    check_helper_uniqueness counts declarations and only complains above 1, so
+    a name list that matches nothing returns all zeros and passes silently.
+    """
+    from couxobf.config import Config
+    from couxobf.pipeline import build
+
+    r = build(INVENTORY, Config(reproducible_seed=5,
+                                min_virtualize_body_nodes=1), verify=False)
+    counts = r.validation.helper_counts
+    assert counts, "no helpers were counted at all"
+    assert all(v == 1 for v in counts.values()), counts
+
+
+def test_no_diagnostic_vocabulary_reaches_the_output():
+    """Point 48: no "integrity", "invalid instruction", "VM error" in output.
+
+    Three failure paths used to raise "constant pool failed authentication" and
+    friends.  That names the check, confirms to an analyst that the edit they
+    just made was noticed, and is a stable string to grep for.  Every path now
+    raises one neutral message.
+    """
+    from couxobf.config import Config
+    from couxobf.pipeline import build
+
+    out = build(INVENTORY, Config(reproducible_seed=3, min_virtualize_body_nodes=1,
+                                  string_protection_level=2), verify=False).source
+    lowered = out.lower()
+    for phrase in ("integrity", "invalid instruction", "vm error",
+                   "failed authentication", "authentication", "tamper",
+                   "checksum", "constant pool", "string bank", "protected payload"):
+        assert phrase not in lowered, f"{phrase!r} leaked into the output"
+
+
+def test_every_runtime_failure_path_raises_the_same_message():
+    """Point 47: an integrity failure must not be distinguishable from any
+    other invalid-state failure.  Same message everywhere, so nothing outside
+    can tell which check fired."""
+    from couxobf.runtime.constpool_runtime import FAILURE_MESSAGE
+    from pathlib import Path
+
+    sites = []
+    for name in ("constpool_runtime.py", "stringbank_runtime.py"):
+        src = Path("couxobf/runtime") .joinpath(name).read_text(encoding="utf-8")
+        sites += [line.strip() for line in src.splitlines()
+                  if line.strip().startswith("error(")]
+    assert sites, "no error() sites found -- the check is vacuous"
+    distinct = set(sites)
+    assert len(distinct) == 1, f"failure paths are distinguishable: {distinct}"
+    assert FAILURE_MESSAGE in next(iter(distinct))

@@ -34,6 +34,7 @@ from couxobf import ir, lower_back, parser, rng as rngmod
 from couxobf.crypto.kdf import KeyMaterial
 from couxobf.crypto.protected import open_
 from couxobf.runtime.luau_crypto import crypto_runtime
+from couxobf.runtime.constpool_runtime import FAILURE_MESSAGE
 from couxobf.runtime.stringbank_runtime import StringBankRuntime, default_names
 from couxobf.strings.bank import (MASK_MOD, MASK_MUL, StringBank,
                                   StringBankError)
@@ -292,7 +293,7 @@ def test_tampered_pages_are_rejected():
     result = execute(TOOLCHAIN, src, "t.luau", timeout=30)
     assert result.stdout.startswith("false"), (
         f"a tampered bank was accepted: {result.stdout[:200]}")
-    assert "authentication" in result.stdout, result.stdout[:200]
+    assert FAILURE_MESSAGE in result.stdout, result.stdout[:200]
 
 
 def test_tampered_ticket_table_is_rejected():

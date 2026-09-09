@@ -284,6 +284,12 @@ def test_no_plaintext_entry_or_nparams():
     assert "nparams" not in body, body
 
 
+def result_pool_names(config):
+    """The constant-pool names a given build actually chose."""
+    return build("local function f() return 1, 2, 3 end\nprint(f())\n",
+                 config, verify=False).runtime_names["pool"]
+
+
 @pytest.mark.skipif(not TOOLCHAIN.can_execute, reason="luau runtime unavailable")
 def test_editing_the_pool_blob_fails_authentication(tmp_path):
     """Entry now lives inside the MAC'd blob, so editing it cannot be silent.
@@ -298,7 +304,10 @@ def test_editing_the_pool_blob_fails_authentication(tmp_path):
     config = Config(reproducible_seed=7, min_virtualize_body_nodes=1)
     out = build(src, config, verify=False).source
 
-    blob, blob_quote = _string_literal(out, default_names()["ct"])
+    # The pool prefix is per-build now, so the ciphertext name has to come from
+    # the build rather than from default_names() -- which would silently find
+    # nothing and make this test assert on a name that is not in the output.
+    blob, blob_quote = _string_literal(out, result_pool_names(config)["ct"])
     assert blob is not None, "pool ciphertext not found in the output"
     assert len(blob) > 40, "pool ciphertext implausibly short"
 

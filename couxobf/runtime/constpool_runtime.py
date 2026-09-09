@@ -108,7 +108,7 @@ local function {n['load']}()
   {n['loaded']} = true
   local p = {n['crypto']}.{n['c_open']}({n['key']}, {n['nonce']}, {n['ct']}, {n['tag']}, {byte_literal(aad)})
   if p == nil then
-    error("constant pool failed authentication")
+    error("invalid state")
   end
   {n['plain']} = p
   local o = {{}}
@@ -144,6 +144,16 @@ local function {n['mat']}(i)
   end
 end
 {cache_block}"""
+
+
+#: The one message every runtime failure path raises.
+#:
+#: Deliberately not "failed authentication": that names the check, confirms to
+#: an analyst that their edit was noticed, and is a stable string to grep for.
+#: Every failure in the emitted runtimes -- tag mismatch, wrong AAD, bad page
+#: size, unknown ticket -- raises this, so none of them is distinguishable from
+#: the others from outside.
+FAILURE_MESSAGE = "invalid state"
 
 
 def default_names(prefix: str = "_kQ") -> Dict[str, str]:

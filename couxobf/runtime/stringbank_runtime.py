@@ -153,19 +153,25 @@ local function {n['load']}()
   -- Verified before anything is decrypted.  One MAC over the whole blob, so
   -- per-string laziness is untouched; without it, editing a page would yield
   -- garbage strings instead of an error.
+  --
+  -- Every failure path in this runtime raises the same neutral message.  A
+  -- message reading "failed authentication" tells an analyst both where the
+  -- check is and that the edit they just made was detected, and it is a stable
+  -- string to grep for.  "invalid state" is what an ordinary bad lookup says
+  -- too, so the two are not distinguishable from the outside.
   if {n['crypto']}.{n['c_mac']}({n['bkey']}, {n['blob']}) ~= {n['btag']} then
-    error("string bank pages failed authentication")
+    error("invalid state")
   end
   local p = {n['crypto']}.{n['c_open']}({n['tkey']}, {n['tnonce']}, {n['tct']}, {n['ttag']}, {byte_literal(sealed.ticket_aad)})
   if p == nil then
-    error("string bank failed authentication")
+    error("invalid state")
   end
   {n['plain']} = p
   local tickets, pages = string.unpack(">I4I4", p, 1)
   -- the page size is a constant here, so it is read back only to check it
   local psize = string.unpack(">I4", p, 9)
   if psize ~= {n['psize']} then
-    error("string bank page size mismatch")
+    error("invalid state")
   end
   local pm = {{}}
   for i = 1, pages do
@@ -212,7 +218,7 @@ local function {n['resolve']}(ticket)
   local p = {n['plain']}
   local q = {n['index']}[ticket]
   if q == nil then
-    error("string bank: bad ticket " .. tostring(ticket))
+    error("invalid state")
   end
   local count = string.unpack(">I2", p, q)
   q += 2

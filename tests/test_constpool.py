@@ -35,7 +35,8 @@ from couxobf.constpool import (
     serialize,
 )
 from couxobf.crypto.kdf import KeyMaterial
-from couxobf.runtime.constpool_runtime import ConstantPoolRuntime, default_names
+from couxobf.runtime.constpool_runtime import (
+    FAILURE_MESSAGE, ConstantPoolRuntime, default_names)
 from couxobf.rng import make_domains, new_seed
 from couxobf.toolchain import find_toolchain, execute
 
@@ -294,7 +295,7 @@ def test_tampering_with_the_pool_is_detected():
         src += f"\nprint({rt.accessor}(1))\n"
         result = execute(TOOLCHAIN, src, "pool.luau", timeout=30)
         assert result.returncode != 0, f"bit flip at {flip} was not detected"
-        assert "authentication" in result.stderr, result.stderr[:200]
+        assert FAILURE_MESSAGE in result.stderr, result.stderr[:200]
 
 
 def test_wrong_aad_is_rejected():
@@ -310,7 +311,7 @@ def test_wrong_aad_is_rejected():
     src += f"\nprint({rt.accessor}(1))\n"
     result = execute(TOOLCHAIN, src, "pool.luau", timeout=30)
     assert result.returncode != 0
-    assert "authentication" in result.stderr
+    assert FAILURE_MESSAGE in result.stderr, result.stderr[:200]
 
 
 # ---------------------------------------------------------------------------

@@ -160,10 +160,18 @@ def check_forbidden_apis(output: str, original: str = "",
     return added
 
 
-def check_helper_uniqueness(output: str) -> Dict[str, int]:
-    """How many times each shared helper is declared."""
+def check_helper_uniqueness(output: str,
+                            helpers: Optional[Iterable[str]] = None
+                            ) -> Dict[str, int]:
+    """How many times each shared helper is declared.
+
+    ``helpers`` must be the names this build actually emitted.  Passing nothing
+    falls back to :data:`SHARED_HELPERS`, which is only correct for builds that
+    still use the legacy fixed names -- and note that every count comes back 0
+    in that case, so the check passes without checking anything.
+    """
     counts = {}
-    for helper in SHARED_HELPERS:
+    for helper in (tuple(helpers) if helpers is not None else SHARED_HELPERS):
         counts[helper] = len(
             re.findall(r"(?<![\w])local function " + re.escape(helper) + r"\s*\(",
                        output))
@@ -171,7 +179,9 @@ def check_helper_uniqueness(output: str) -> Dict[str, int]:
 
 
 def validate_output(output: str, original: str = "",
-                    toolchain: Any = None) -> ValidationReport:
+                    toolchain: Any = None,
+                    helpers: Optional[Iterable[str]] = None
+                    ) -> ValidationReport:
     """Run every check and collect the problems rather than raising early.
 
     Returning the full list matters: a build that fails three checks should
@@ -208,7 +218,7 @@ def validate_output(output: str, original: str = "",
         report.problems.append(f"build introduced a forbidden API: {api}")
 
     # -- helper uniqueness ----------------------------------------------
-    report.helper_counts = check_helper_uniqueness(output)
+    report.helper_counts = check_helper_uniqueness(output, helpers)
     for helper, count in sorted(report.helper_counts.items()):
         if count > 1:
             report.problems.append(
@@ -219,9 +229,11 @@ def validate_output(output: str, original: str = "",
 
 
 def validate_or_raise(output: str, original: str = "",
-                      toolchain: Any = None) -> ValidationReport:
+                      toolchain: Any = None,
+                      helpers: Optional[Iterable[str]] = None
+                      ) -> ValidationReport:
     """``validate_output``, but rejects the build instead of reporting it."""
-    report = validate_output(output, original, toolchain)
+    report = validate_output(output, original, toolchain, helpers)
     if not report.ok:
         raise OutputValidationError(
             "generated output failed validation:\n  " +

@@ -76,6 +76,9 @@ class BuildResult:
     stats: BuildStats
     validation: ValidationReport
     report: str = ""
+    #: Names the reconstruction actually chose.  Per-build, so nothing outside
+    #: the build can predict them.
+    runtime_names: Dict[str, Any] = field(default_factory=dict)
 
 
 def seed_from_config(config: Config) -> bytes:
@@ -135,6 +138,7 @@ def build(source: str, config: Optional[Config] = None,
     selected = _select_for_vm(module, classification)
 
     # -- back end ---------------------------------------------------------
+    runtime_names: Dict[str, Any] = {}
     out = _lower_back.reconstruct_protected(
         module,
         KeyMaterial.from_seed(seed),
@@ -159,16 +163,20 @@ def build(source: str, config: Optional[Config] = None,
         string_rng=domains.get("strings"),
         string_cache_policy=str(getattr(config.cache_policy, "value",
                                         config.cache_policy)),
+        names_out=runtime_names,
     )
 
     stats = _collect_stats(module, classification, out, source)
     stats.elapsed_ms = (time.perf_counter() - started) * 1000.0
 
-    validation = (validate_or_raise(out, source, toolchain) if verify
-                  else validate_output(out, source, toolchain))
+    # The emitted helper names, so helper uniqueness is checked against what
+    # this build really declared rather than a stale fixed list.
+    helpers = tuple(_lower_back.EMITTED_HELPERS)
+    validation = (validate_or_raise(out, source, toolchain, helpers) if verify
+                  else validate_output(out, source, toolchain, helpers))
 
     result = BuildResult(source=out, seed=seed, config=config, stats=stats,
-                         validation=validation)
+                         validation=validation, runtime_names=runtime_names)
     result.report = cost_report(result)
     return result
 

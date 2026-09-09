@@ -76,6 +76,47 @@ HELPER_ITER = "_kiter"
 HELPER_ITERPACK = "_kiterpack"
 HELPER_ITERCHECK = "_kitercheck"
 
+#: Every helper the reconstruction declares, in emission order.  Validation
+#: checks each is declared exactly once, and it has to be told these names:
+#: deriving them from a stale constant list is how a uniqueness check ends up
+#: passing while checking nothing.
+EMITTED_HELPERS: Tuple[str, ...] = (
+    HELPER_PACK, HELPER_UNPACK, HELPER_APPEND,
+    HELPER_ITER, HELPER_ITERPACK, HELPER_ITERCHECK,
+)
+
+#: Prefixes the reconstruction reserves for its own generated identifiers.  A
+#: random prefix must not start with any of these, or it could shadow one of
+#: them: the reconstructor emits ``_kR<pid>`` register files, ``_kC<pid>``
+#: program counters and ``_kP<pid>_<i>`` parameters.
+_RESERVED_PREFIX_CHARS = frozenset("RCP")
+
+
+def fresh_prefix(rng: Any, used: Optional[Set[str]] = None,
+                 body: int = 3) -> str:
+    """A per-build name prefix for one emitted runtime.
+
+    These used to be the constants ``_kQ`` and ``_kS``, identical in every
+    build.  A fixed prefix appearing a hundred-odd times is a fingerprint an
+    automated tool can match on before it has understood anything, so it is
+    drawn from the build's own randomness instead.
+    """
+    import string as _string
+
+    alphabet = _string.ascii_letters
+    while True:
+        head = rng.choice(alphabet)
+        # `_kR`/`_kC`/`_kP` are taken by register files, program counters and
+        # parameter names respectively.
+        if head in _RESERVED_PREFIX_CHARS:
+            continue
+        candidate = "_k" + head + "".join(
+            rng.choice(alphabet) for _ in range(body))
+        if used is None or candidate not in used:
+            if used is not None:
+                used.add(candidate)
+            return candidate
+
 HELPERS_SRC = f"""
 local function {HELPER_PACK}(...)
   return table.pack(...)
@@ -665,7 +706,8 @@ def reconstruct_protected(module: IRModule,
                           string_level: int = 0,
                           string_rng: Any = None,
                           string_cache_policy: str = "none",
-                          string_page_size: int = 512) -> str:
+                          string_page_size: int = 512,
+                          names_out: Optional[Dict[str, Any]] = None) -> str:
     """Lower an IR module to protected, self-contained Luau source.
 
     Assembles three pieces in the order they must appear: the constant pool
@@ -687,7 +729,13 @@ def reconstruct_protected(module: IRModule,
     from .emit import printer as _printer
     from .runtime.constpool_runtime import ConstantPoolRuntime, default_names
 
-    names = names or default_names()
+    prefixes: Set[str] = set()
+    names = names or default_names(fresh_prefix(rng, prefixes))
+    if names_out is not None:
+        # Callers need the names that were actually chosen.  Guessing them from
+        # default_names() stopped working the moment the prefix became per-build,
+        # and a validator that cannot find the helpers silently checks nothing.
+        names_out["pool"] = dict(names)
     if optimize_first:
         # before the pool is built, so folded constants are interned once
         # rather than once per site they were duplicated at
@@ -726,7 +774,13 @@ def reconstruct_protected(module: IRModule,
         from .runtime.stringbank_runtime import default_names as bank_default_names
         bank = StringBank(keys, string_rng if string_rng is not None else rng,
                           context, page_size=string_page_size)
-        bank_names = bank_default_names()
+        # Its own prefix, drawn from the string stream: sharing the constant
+        # pool's prefix would make the two runtimes recognisable as a pair.
+        bank_names = bank_default_names(
+            fresh_prefix(string_rng if string_rng is not None else rng,
+                         prefixes))
+        if names_out is not None:
+            names_out["bank"] = dict(bank_names)
 
     rec = Reconstructor(pool=pool, accessor=names["get"], vm=plan, bank=bank,
                         bank_accessor=(bank_names["get"] if bank_names else None))
