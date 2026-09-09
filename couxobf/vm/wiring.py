@@ -144,6 +144,7 @@ class VMPlan:
             "protos": len(g.protos),
             "opcodes": g.opmap.opcode_count(),
             "format": g.fmt.summary(),
+            "readers": {k: g.names.get(k) for k in ("ro", "r8", "rr", "rw", "rk", "rp", "rt")},
         } for g in self.groups]
 
 
@@ -195,7 +196,8 @@ def _fresh_names(rng: Rng, count: int, reserved: Iterable[str] = ()) -> List[str
 
 #: Per-build name roles the interpreter needs, in the order they are drawn.
 _ROLES = ("code", "exec", "enter", "call", "getfenv", "acc", "stack", "sp",
-          "pc", "regs", "consts", "env", "edges")
+          "pc", "regs", "consts", "env", "edges",
+          "ro", "r8", "rr", "rw", "rk", "rp", "rt")
 
 
 def make_plan(rng: Rng, protos: Iterable[int],
@@ -244,33 +246,19 @@ def make_plan(rng: Rng, protos: Iterable[int],
     dispatcher = _dispatcher_name(dispatcher, rng)
     tables = tuple(tables or _fresh_names(rng, 4))
     if names is None:
-        (code_name, exec_name, enter_name, call_name, getfenv_name,
-         acc_name, stack_name, sp_name, pc_name, regs_name, consts_name,
-         env_name, edges_name, _spare) = _fresh_names(rng, 14)
-        names = {
-            "code": code_name,
-            "exec": exec_name,
-            "enter": enter_name,
-            "call": call_name,
-            "getfenv": getfenv_name,
-            # the accumulator/stack locals the non-register families use
-            "acc": acc_name,
-            "stack": stack_name,
-            "sp": sp_name,
-            "pc": pc_name,
-            "regs": regs_name,
-            "consts": consts_name,
-            "env": env_name,
-            # the per-prototype control-flow edge table, when a format reads its
-            # jump targets through one (#18)
-            "edges": edges_name,
-        }
+        drawn = _fresh_names(rng, len(_ROLES) + 1)
+        names = dict(zip(_ROLES, drawn[:len(_ROLES)]))
     else:
         # A caller-supplied name set: the test harness pins these so a failure
         # names the function it came from.  They must reach the groups too -- a
         # plan whose interpreter and call sites disagree on a name is exactly the
         # "two copies that drift" bug the harness rewrite was for.
         names = dict(names)
+    # Tests and older callers can still pass the legacy core names; production
+    # draws them above.  Fill reader helper names here so `_rename_core_tokens`
+    # can erase the stable `_ro/_rr/_rk/...` decoder signature either way.
+    for role in _ROLES:
+        names.setdefault(role, role)
     for role, helper in zip(("append", "iter", "iterpack", "itercheck"), shared):
         # shared with lower_back -- see the module docstring
         names.setdefault(role, helper)
@@ -509,13 +497,14 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
     path can pass literal emitters and the protected one can pass pool reads --
     the same bytecode, protected or not.
     """
-    parts: List[str] = []
+    interpreter_parts: List[str] = []
     for group in plan.groups:
-        parts.append(runtime.interpreter_source(group.opmap, group.names,
-                                                group.family, group.dispatcher,
-                                                group.fmt,
-                                                entry_guard=entry_guard,
-                                                opaque_predicates=opaque_predicates))
+        interpreter_parts.append(runtime.interpreter_source(group.opmap, group.names,
+                                                           group.family, group.dispatcher,
+                                                           group.fmt,
+                                                           entry_guard=entry_guard,
+                                                           opaque_predicates=opaque_predicates))
+    parts: List[str] = []
     payload_rows = []
     const_rows = []
     edge_rows = []
@@ -539,6 +528,17 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
         # the interpreter anyway would be dead weight an analyst could study
         # for free.
         return ""
+
+    def _finish(metadata: List[str]) -> str:
+        if not interpreter_parts:
+            combined = metadata
+        else:
+            seed = sum(g.fmt.arm_seed + g.index * 17 for g in plan.groups)
+            cut = seed % (len(interpreter_parts) + 1)
+            combined = (interpreter_parts[:cut] + metadata +
+                        interpreter_parts[cut:])
+        return "\n".join(combined) + "\n"
+
     if fragmented is None:
         fragmented = plan.fragmented
     if not fragmented:
@@ -558,7 +558,7 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
                           % (pid, code_expr(enc.code), consts, edges))
         parts.append("local %s = {\n%s\n}"
                      % (plan.rows_table, "\n".join(joined)))
-        return "\n".join(parts) + "\n"
+        return _finish(parts)
     parts.append("local %s = {\n%s\n}" % (plan.table, "\n".join(payload_rows)))
     parts.append("local %s = {\n%s\n}"
                  % (plan.consts_table, "\n".join(const_rows)))
@@ -578,4 +578,4 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
                       % (pid, plan.table, pid, plan.consts_table, pid, edges))
     parts.append("local %s = {\n%s\n}"
                  % (plan.rows_table, "\n".join(joined)))
-    return "\n".join(parts) + "\n"
+    return _finish(parts)

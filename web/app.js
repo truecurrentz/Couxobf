@@ -856,7 +856,7 @@ async function loadSurface() {
 const FALLBACK = {
   virtualization_level: { kind: "enum", choices: ["none", "light", "medium", "heavy", "maximum"], default: "heavy" },
   vm_family: { kind: "enum", choices: ["register", "stack", "accumulator", "hybrid"], default: "register" },
-  dispatcher_family: { kind: "enum", choices: ["none", "nested_if", "decision_tree", "bucket", "state_transition", "mixed"], default: "mixed" },
+  dispatcher_family: { kind: "enum", choices: ["none", "nested_if", "decision_tree", "bucket", "state_transition", "threaded", "mixed"], default: "mixed" },
   cache_policy: { kind: "enum", choices: ["none", "bounded", "full"], default: "none" },
   guard_policy: { kind: "choice", choices: ["fail", "ignore"], default: "fail" },
   hash_comments: { kind: "choice", choices: ["auto", "strip", "strict"], default: "auto" },

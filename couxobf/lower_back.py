@@ -293,7 +293,8 @@ class Reconstructor:
     def __init__(self, pool: Any = None, accessor: Optional[str] = None,
                  vm: Any = None, bank: Any = None,
                  bank_accessor: Optional[str] = None,
-                 helpers: Optional[Dict[str, str]] = None) -> None:
+                 helpers: Optional[Dict[str, str]] = None,
+                 native_prefix: str = PREFIX) -> None:
         """``pool`` is a :class:`~couxobf.constpool.ConstantPool`.
 
         When one is supplied, no literal reaches the output: every constant is
@@ -317,6 +318,7 @@ class Reconstructor:
         #: ``helpers_src`` declared, or the interpreter calls functions that do
         #: not exist -- which is a runtime error, not a build error.
         self.helpers: Dict[str, str] = dict(helpers or DEFAULT_HELPERS)
+        self.native_prefix = native_prefix
         #: proto_id -> EncodedProto, filled in as function_expr runs
         self.vm_encoded: Dict[int, Any] = {}
         #: Randomness for per-prototype layout choices (padding bytes, alias
@@ -344,7 +346,7 @@ class Reconstructor:
             wrapper = self._vm_closure(proto)
             if wrapper is not None:
                 return wrapper
-        params = [A.Param(name=param_name(proto.proto_id, i))
+        params = [A.Param(name=self._param_name(proto.proto_id, i))
                   for i in range(proto.num_params)]
         if proto.is_vararg:
             params.append(A.Param(name=None))
@@ -416,8 +418,17 @@ class Reconstructor:
         walk(module.main, None)
 
     # -- addressing ------------------------------------------------------
+    def _regs_name(self, proto_id: int) -> str:
+        return f"{self.native_prefix}r{proto_id}"
+
+    def _pc_name(self, proto_id: int) -> str:
+        return f"{self.native_prefix}c{proto_id}"
+
+    def _param_name(self, proto_id: int, i: int) -> str:
+        return f"{self.native_prefix}p{proto_id}_{i}"
+
     def _reg(self, proto: FuncIR, i: int) -> A.Index:
-        return A.Index(obj=_name(regs_name(proto.proto_id)), key=_num(i))
+        return A.Index(obj=_name(self._regs_name(proto.proto_id)), key=_num(i))
 
     def _upvalue_expr(self, proto: FuncIR, i: int) -> A.Expr:
         """The expression an upvalue resolves to in the enclosing scope.
@@ -507,23 +518,40 @@ class Reconstructor:
             # chunk may run after user code has replaced or cleared `table`,
             # and depending on a global here would make the scaffolding fail
             # for reasons that have nothing to do with the program.
-            A.Local(names=[_local_name(regs_name(pid))],
+            A.Local(names=[_local_name(self._regs_name(pid))],
                     values=[A.Table(items=[])]),
         ]
         for i in range(proto.num_params):
             stmts.append(A.Assign(targets=[self._reg(proto, i)],
-                                  values=[_name(param_name(pid, i))]))
-        pc = pc_name(pid)
+                                  values=[_name(self._param_name(pid, i))]))
+        pc = self._pc_name(pid)
         stmts.append(A.Local(names=[_local_name(pc)], values=[_num(proto.entry)]))
 
+        # The native flattened driver no longer uses one canonical
+        # ``while true; if pc == block`` signature.  The state stays numeric and
+        # exact, but the loop is keyed by the liveness of the state and the block
+        # tests can carry a build-local additive bias.
+        salt = 0
+        if self.vm_layout_rng is not None:
+            try:
+                salt = self.vm_layout_rng.randbelow(257)
+            except AttributeError:
+                salt = 0
         arms: List[Tuple[A.Expr, A.Block]] = []
         for b in proto.blocks:
-            cond = A.Bin(op="==", left=_name(pc), right=_num(b.id))
+            left: A.Expr = _name(pc)
+            right: A.Expr = _num(b.id)
+            if salt:
+                left = A.Bin(op="+", left=left, right=_num(salt))
+                right = _num(b.id + salt)
+            cond = A.Bin(op="==", left=left, right=right)
             arms.append((cond, A.Block(body=self._block_body(proto, b, pc))))
         stmts.append(A.While(
-            cond=A.Bool(value=True),
+            cond=_name(pc),
             body=A.Block(body=[A.If(arms=arms,
-                                    otherwise=A.Block(body=[A.Break()]))])))
+                                    otherwise=A.Block(body=[
+                                        A.Assign(targets=[_name(pc)],
+                                                 values=[A.Nil()])]))])))
         return stmts
 
     def _set_pc(self, pc: str, target: int) -> A.Assign:
@@ -969,7 +997,8 @@ def reconstruct_protected(module: IRModule,
 
     rec = Reconstructor(pool=pool, accessor=names["get"], vm=plan, bank=bank,
                         bank_accessor=(bank_names["get"] if bank_names else None),
-                        helpers=helper_map)
+                        helpers=helper_map,
+                        native_prefix=fresh_prefix(rng, prefixes))
     rec.vm_layout_rng = layout_rng if layout_rng is not None else vm_rng
     body = rec.reconstruct(module)
 
@@ -1097,23 +1126,55 @@ def reconstruct_protected(module: IRModule,
         names_out["guard"] = guard.summary()
         names_out["guard_capture"] = dict(captured)
 
-    prefix: List[A.Stmt] = []
-    if guard_block is not None:
+    def _guard_stmts() -> List[A.Stmt]:
+        if guard_block is None:
+            return []
         # The guard no longer emits ``local alias = global`` captures here.  The
         # emitted chunk is wrapped below in a parameterized IIFE whose parameters
         # are exactly these aliases, and whose arguments are the real globals in a
         # build-random order.  That leaves the protected scaffold reading locals
         # after entry while avoiding the stable local-alias prelude that used to
         # identify every build.
-        prefix += [s for s in guard_block.body
-                   if not (isinstance(s, A.Local)
-                           and len(s.names) == 1
-                           and s.names[0].name in set(captured.values()))]
-    for block in (crypto_block, pool_block, bank_block):
-        if block is not None:
-            prefix += list(block.body)
-    vm_stmts = list(vm_block.body) if vm_block is not None else []
-    out = A.Block(body=prefix + list(helpers.body) + vm_stmts + list(body.body))
+        aliases = set(captured.values())
+        return [s for s in guard_block.body
+                if not (isinstance(s, A.Local)
+                        and len(s.names) == 1
+                        and s.names[0].name in aliases)]
+
+    component_blocks: Dict[str, List[A.Stmt]] = {
+        "guard": _guard_stmts(),
+        "crypto": list(crypto_block.body) if crypto_block is not None else [],
+        "pool": list(pool_block.body) if pool_block is not None else [],
+        "bank": list(bank_block.body) if bank_block is not None else [],
+        "helpers": list(helpers.body),
+        "vm": list(vm_block.body) if vm_block is not None else [],
+    }
+    deps: Dict[str, Set[str]] = {k: set() for k, v in component_blocks.items() if v}
+    if "pool" in deps and "crypto" in deps:
+        deps["pool"].add("crypto")
+    if "bank" in deps and "crypto" in deps:
+        deps["bank"].add("crypto")
+    if "vm" in deps:
+        for need in ("pool", "helpers", "guard"):
+            if need in deps:
+                deps["vm"].add(need)
+    order: List[str] = []
+    pending_components = set(deps)
+    while pending_components:
+        ready = [k for k in pending_components if deps[k] <= set(order)]
+        try:
+            rng.shuffle(ready)
+        except AttributeError:
+            pass
+        pick = ready[0]
+        order.append(pick)
+        pending_components.remove(pick)
+    prefix: List[A.Stmt] = []
+    for key in order:
+        prefix += component_blocks[key]
+    if names_out is not None:
+        names_out["bootstrap_order"] = list(order) + ["driver"]
+    out = A.Block(body=prefix + list(body.body))
     emitted = _printer.emit(out, minify=minify)
     if captured:
         order = list(captured.items())

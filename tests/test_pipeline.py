@@ -529,8 +529,6 @@ def test_the_opcode_cipher_is_in_the_reader_not_only_in_the_config():
     half that matters most: a disguise the encoder applies and the interpreter
     forgets is a wrong program, not an insecure one.
     """
-    bare = re.compile(r"function _ro\(a\)\s*return\s+_bd\(\w+,\s*a\)\s*end")
-
     off = build(CIPHER_PROGRAM, _live_config(opcode_cipher=False,
                                              reproducible_seed=4),
                 name="cipher.luau", verify=True)
@@ -538,8 +536,16 @@ def test_the_opcode_cipher_is_in_the_reader_not_only_in_the_config():
                                             reproducible_seed=4),
                name="cipher.luau", verify=True)
     assert off.stats.virtualized >= 1 and on.stats.virtualized >= 1
-    assert bare.search(off.source), "the reader should be a plain byte fetch"
-    assert not bare.search(on.source), "the cipher did not reach the interpreter"
+    for group in off.stats.vm_groups:
+        ro = group["readers"]["ro"]
+        bare = re.compile(r"function %s\(a\)\s*return\s+_bd\(\w+,\s*a\)\s*end"
+                          % re.escape(ro))
+        assert bare.search(off.source), "the reader should be a plain byte fetch"
+    for group in on.stats.vm_groups:
+        ro = group["readers"]["ro"]
+        bare = re.compile(r"function %s\(a\)\s*return\s+_bd\(\w+,\s*a\)\s*end"
+                          % re.escape(ro))
+        assert not bare.search(on.source), "the cipher did not reach the interpreter"
     assert all(g["format"]["op_cipher"] == "none" for g in off.stats.vm_groups)
     assert all(g["format"]["op_cipher"] != "none" for g in on.stats.vm_groups)
     assert "opcode cipher none" in off.report

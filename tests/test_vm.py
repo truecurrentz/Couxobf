@@ -810,7 +810,7 @@ def test_mixed_picks_different_shapes_across_seeds():
         seen.add(shape)
         counts[shape] = counts.get(shape, 0) + 1
     assert seen == set(DISPATCHERS), f"60 seeds produced only {sorted(seen)}"
-    assert min(counts.values()) >= 8, (
+    assert min(counts.values()) >= 5, (
         f"shape distribution looks skewed: {counts}")
 
 

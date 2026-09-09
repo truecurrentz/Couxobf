@@ -83,6 +83,7 @@ class DispatcherFamily(enum.Enum):
     SEGMENTED = "segmented"
     DECISION_TREE = "decision_tree"
     STATE_TRANSITION = "state_transition"
+    THREADED = "threaded"
     INDIRECT = "indirect"
     MIXED = "mixed"
 

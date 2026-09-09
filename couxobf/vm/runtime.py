@@ -187,7 +187,7 @@ def _target_jump(fmt: FormatSpec, travel: int = 0) -> str:
 
 
 def _body(op: str, fam: Family, n: Dict[str, str], fmt: FormatSpec,
-          travel: int = 0) -> List[str]:
+          travel: int = 0, variant: int = 0) -> List[str]:
     """What one opcode *does*, given its operands in locals.
 
     Every branch here reads only names -- never offsets -- because the layout is
@@ -199,8 +199,16 @@ def _body(op: str, fam: Family, n: Dict[str, str], fmt: FormatSpec,
     jump = _target_jump(fmt, travel)
 
     if op == OP.MOV:
+        if variant % 3 == 1:
+            return ["local _mv = R[s]", *fam.store("R[a]", "_mv")]
+        if variant % 3 == 2:
+            return ["do local _mv = R[s]" , *["  " + ln for ln in fam.store("R[a]", "_mv")], "end"]
         return fam.store("R[a]", "R[s]")
     if op == OP.LOADK:
+        if variant % 3 == 1:
+            return ["local _kv = K[k + 1]", *fam.store("R[a]", "_kv")]
+        if variant % 3 == 2:
+            return ["do local _kv = K[k + 1]", *["  " + ln for ln in fam.store("R[a]", "_kv")], "end"]
         return fam.store("R[a]", "K[k + 1]")
     if op == OP.GETGLOBAL:
         # E is the calling function's environment, resolved per call -- see
@@ -219,9 +227,23 @@ def _body(op: str, fam: Family, n: Dict[str, str], fmt: FormatSpec,
     if op == OP.NEWTABLE:
         return fam.store("R[a]", "{}")
     if op in _ARITH:
-        return fam.binary("R[a]", "R[x]", "R[y]", _ARITH[op])
+        sym = _ARITH[op]
+        if variant % 3 == 1:
+            return ["local _ax, _ay = R[x], R[y]",
+                    *fam.store("R[a]", f"_ax {sym} _ay")]
+        if variant % 3 == 2:
+            return [f"local _ar = (function(_x, _y) return _x {sym} _y end)(R[x], R[y])",
+                    *fam.store("R[a]", "_ar")]
+        return fam.binary("R[a]", "R[x]", "R[y]", sym)
     if op in _CMP:
-        return fam.binary("R[a]", "R[x]", "R[y]", _CMP[op])
+        sym = _CMP[op]
+        if variant % 3 == 1:
+            return ["local _cx, _cy = R[x], R[y]",
+                    *fam.store("R[a]", f"_cx {sym} _cy")]
+        if variant % 3 == 2:
+            return [f"local _cr = (function(_x, _y) return _x {sym} _y end)(R[x], R[y])",
+                    *fam.store("R[a]", "_cr")]
+        return fam.binary("R[a]", "R[x]", "R[y]", sym)
     if op == OP.UNM:
         return substitute(fam.unary("R[a]", lambda e: "-" + e), "R[x]")
     if op == OP.NOT:
@@ -349,7 +371,8 @@ def _fix_bias(op: str, fmt: FormatSpec, view: OperandView) -> List[str]:
 
 
 def _handler(op: str, n: Dict[str, str], fam: Optional[Family] = None,
-             fmt: Optional[FormatSpec] = None, view: Optional[OperandView] = None
+             fmt: Optional[FormatSpec] = None, view: Optional[OperandView] = None,
+             variant: int = 0
              ) -> List[str]:
     """The Luau body of one opcode handler.
 
@@ -378,7 +401,7 @@ def _handler(op: str, n: Dict[str, str], fam: Optional[Family] = None,
         # dispatcher cannot inherit a stale pc.
         out.append("pc = pc + %d" % advance)
         travel = 0
-    return out + _fix_bias(op, spec, v) + _body(op, fam, n, spec, travel)
+    return out + _fix_bias(op, spec, v) + _body(op, fam, n, spec, travel, variant)
 
 
 def _fused_handler(rule: FusionRule, n: Dict[str, str], fam: Family,
@@ -421,15 +444,23 @@ def _fix_advance(fmt: FormatSpec, rule: FusionRule) -> str:
 # -- dispatch ----------------------------------------------------------------
 
 class _Entry:
-    """One dispatch arm: an opcode or a fused pair, and the numbers it accepts."""
+    """One dispatch arm: an opcode or a fused pair, and the numbers it accepts.
 
-    __slots__ = ("op", "numbers", "pair")
+    ``variant`` is the alias implementation path.  Alias numbers are real
+    numbers the encoder may emit; giving each one a separate implementation path
+    avoids the old "N conditions, one identical handler" shape that a static
+    normalizer can collapse immediately.
+    """
+
+    __slots__ = ("op", "numbers", "pair", "variant")
 
     def __init__(self, op: str, numbers: Tuple[int, ...],
-                 pair: Optional[FusionRule] = None) -> None:
+                 pair: Optional[FusionRule] = None,
+                 variant: int = 0) -> None:
         self.op = op
         self.numbers = numbers
         self.pair = pair
+        self.variant = variant
 
     @property
     def key(self) -> int:
@@ -447,7 +478,7 @@ class _Entry:
     def body(self, n: Dict[str, str], fam: Family, fmt: FormatSpec) -> List[str]:
         if self.pair is not None:
             return _fused_handler(self.pair, n, fam, fmt)
-        return _handler(self.op, n, fam, fmt)
+        return _handler(self.op, n, fam, fmt, variant=self.variant)
 
 def _arm_key(entry: "_Entry", seed: int) -> int:
     """A permutation of the arms, mixed enough to be one.
@@ -476,7 +507,8 @@ def dispatch_entries(opmap: OpcodeMap, fmt: Optional[FormatSpec] = None
     """
     entries: List[_Entry] = []
     for op in sorted(opmap.to_byte, key=lambda o: opmap.to_byte[o]):
-        entries.append(_Entry(op, opmap.numbers(op)))
+        for variant, number in enumerate(opmap.numbers(op)):
+            entries.append(_Entry(op, (number,), variant=variant))
     for number, pair in sorted((opmap.fused or {}).items()):
         entries.append(_Entry(FUSED_PREFIX + "%s,%s" % pair, (number,),
                               pair=FusionRule(pair[0], pair[1])))
@@ -653,6 +685,42 @@ def _emit_bucket(lines: List[str], entries: Sequence[_Entry],
     lines.append("    end")
 
 
+def _emit_threaded(lines: List[str], entries: Sequence[_Entry],
+                   n: Dict[str, str], fam: Family, fmt: FormatSpec,
+                   trace: Optional[List[Tuple[Tuple[int, ...], Tuple[str, ...]]]] = None
+                   ) -> None:
+    """Table-directed dispatch: opcode number -> transient handler state.
+
+    It is intentionally direct-threaded-ish rather than a literal threaded VM:
+    Luau has no computed goto, and handler closures cannot `return` from the
+    interpreter.  The table still breaks the recognizable compare-opcode-first
+    shape: the opcode selects a build-local state through data, then an inner
+    dispatcher executes the state.
+    """
+    seed = dispatch_seed(entries)
+    state_name = "_dt%d" % (seed % 997)
+    table_name = "_tt%d" % ((seed // 997) % 997)
+    rows = []
+    for idx, entry in enumerate(entries, 1):
+        for number in entry.numbers:
+            rows.append("[%d]=%d" % (number, idx))
+    lines.append(f"    local {table_name} = {{{','.join(rows)}}}")
+    lines.append(f"    local {state_name} = {table_name}[op]")
+    lines.append(f"    if {state_name} == nil then error(\"invalid state\") end")
+    first = True
+    for idx, entry in enumerate(entries, 1):
+        cond = f"{state_name} == {idx}"
+        lines.append(f"    {'if' if first else 'elseif'} {cond} then")
+        first = False
+        if trace is not None:
+            trace.append((tuple(entry.numbers), (entry.condition(fmt),)))
+        for body_line in entry.body(n, fam, fmt):
+            lines.append(f"      {body_line}")
+    lines.append("    else")
+    lines.append('      error("invalid state")')
+    lines.append("    end")
+
+
 def _emit_state_transition(lines: List[str], entries: Sequence[_Entry],
                            n: Dict[str, str], fam: Family, fmt: FormatSpec,
                            trace: Optional[List[Tuple[Tuple[int, ...], Tuple[str, ...]]]] = None
@@ -690,7 +758,7 @@ def _emit_state_transition(lines: List[str], entries: Sequence[_Entry],
 #: Dispatch shapes this can emit.  NESTED_IF is the flat chain every build used
 #: to have; the others are genuinely different control structures, not the same
 #: chain with different spacing.
-DISPATCHERS = ("nested_if", "decision_tree", "bucket", "state_transition")
+DISPATCHERS = ("nested_if", "decision_tree", "bucket", "state_transition", "threaded")
 
 
 def dispatch_seed(entries: Sequence[_Entry]) -> int:
@@ -719,6 +787,8 @@ def _emit_dispatch(lines: List[str], entries: Sequence[_Entry],
         _emit_bucket(lines, entries, n, fam, fmt, buckets, multiplier, trace)
     elif dispatcher == "state_transition":
         _emit_state_transition(lines, entries, n, fam, fmt, trace)
+    elif dispatcher == "threaded":
+        _emit_threaded(lines, entries, n, fam, fmt, trace)
     elif dispatcher == "nested_if":
         _emit_chain(lines, "    ", entries, n, fam, fmt, (), trace)
     else:
@@ -884,7 +954,9 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
 
 #: The interpreter's working names, as written in the templates above.
 _CORE_TOKENS = (("pc", "pc"), ("R", "regs"), ("K", "consts"), ("E", "env"),
-                ("EG", "edges"))
+                ("EG", "edges"), ("_ro", "ro"), ("_r8", "r8"),
+                ("_rr", "rr"), ("_rw", "rw"), ("_rk", "rk"),
+                ("_rp", "rp"), ("_rt", "rt"))
 
 
 def _le_read(read: str, at: int, width: int) -> str:

@@ -58,7 +58,7 @@ def test_a_build_succeeds_and_reports_what_it_did():
 
 @pytest.mark.skipif(not TOOLCHAIN.can_execute, reason="luau runtime unavailable")
 @pytest.mark.parametrize("family", ("register", "accumulator", "stack", "hybrid"))
-@pytest.mark.parametrize("dispatcher", ("nested_if", "bucket", "decision_tree", "state_transition"))
+@pytest.mark.parametrize("dispatcher", ("nested_if", "bucket", "decision_tree", "state_transition", "threaded"))
 def test_every_web_option_combination_produces_runnable_luau(family, dispatcher):
     """The UI exposes these as dropdowns, so every pairing has to work.
 

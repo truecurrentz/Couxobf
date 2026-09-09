@@ -54,6 +54,8 @@ def default_names(prefix: str = "_kS") -> Dict[str, str]:
         "unmask": prefix + "e",
         "frag": prefix + "f",
         "resolve": prefix + "p",
+        "resolve_alt": prefix + "u",
+        "resolve_alt2": prefix + "v",
         "get": prefix + "g",
         "cache": prefix + "h",
         "seen": prefix + "i",
@@ -105,9 +107,9 @@ class StringBankRuntime:
                 f"    return {n['resolve']}(ticket)\n"
                 f"  elseif cls == 1 then\n"
                 f"    local indirect = ticket\n"
-                f"    return {n['resolve']}(indirect)\n"
+                f"    return {n['resolve_alt']}(indirect)\n"
                 f"  end\n"
-                f"  return (function(t) return {n['resolve']}(t) end)(ticket)\n"
+                f"  return {n['resolve_alt2']}(ticket)\n"
                 f"end\n"
             )
         else:
@@ -136,9 +138,9 @@ class StringBankRuntime:
                 f"    v = {n['resolve']}(ticket)\n"
                 f"  elseif cls == 1 then\n"
                 f"    local indirect = ticket\n"
-                f"    v = {n['resolve']}(indirect)\n"
+                f"    v = {n['resolve_alt']}(indirect)\n"
                 f"  else\n"
-                f"    v = (function(t) return {n['resolve']}(t) end)(ticket)\n"
+                f"    v = {n['resolve_alt2']}(ticket)\n"
                 f"  end\n"
                 f"  {n['cache']}[ticket] = v\n"
                 f"  {n['seen']}[ticket] = true\n"
@@ -254,5 +256,43 @@ local function {n['resolve']}(ticket)
     end
   end
   return table.concat(parts)
+end
+local function {n['resolve_alt']}(ticket)
+  local p = {n['plain']}
+  local q = {n['index']}[ticket]
+  if q == nil then
+    error("invalid state")
+  end
+  local count = string.unpack(">I2", p, q)
+  q += 2
+  local out = ""
+  for _ = 1, count do
+    local off, len, seed = string.unpack(">I4I2I4", p, q)
+    q += 10
+    if len > 0 then
+      out = out .. {n['frag']}(off, len, seed)
+    end
+  end
+  return out
+end
+local function {n['resolve_alt2']}(ticket)
+  local p = {n['plain']}
+  local q = {n['index']}[ticket]
+  if q == nil then
+    error("invalid state")
+  end
+  local count = string.unpack(">I2", p, q)
+  q += 2
+  local parts = table.create(count)
+  for i = 1, count do
+    local off, len, seed = string.unpack(">I4I2I4", p, q)
+    q += 10
+    parts[i] = len > 0 and {n['frag']}(off, len, seed) or ""
+  end
+  local out = ""
+  for i = #parts, 1, -1 do
+    out = parts[i] .. out
+  end
+  return out
 end
 {cache_block}"""
