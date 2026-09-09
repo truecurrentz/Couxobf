@@ -249,8 +249,12 @@ class Reconstructor:
         ok, _reason = _encode.can_virtualize(proto)
         if not ok:
             return None
+        order = None
+        if self.vm.permute_blocks and self.vm.layout_rng is not None:
+            from .vm import layout as _layout
+            order = _layout.permuted_order(proto, self.vm.layout_rng)
         self.vm_encoded[proto.proto_id] = _encode.encode_proto(
-            proto, self.vm.opmap)
+            proto, self.vm.opmap, order=order)
         # A vararg parameter list, not the prototype's declared parameters:
         # the descriptor carries the real count and the interpreter distributes
         # the arguments itself.  From the caller's side this is an ordinary
@@ -654,6 +658,8 @@ def reconstruct_protected(module: IRModule,
                           vm_rng: Any = None,
                           vm_protos: Any = None,
                           vm_family: Any = "register",
+                          block_permutation: bool = False,
+                          layout_rng: Any = None,
                           string_level: int = 0,
                           string_rng: Any = None,
                           string_cache_policy: str = "none",
@@ -701,7 +707,9 @@ def reconstruct_protected(module: IRModule,
         selected = (set(vm_protos) if vm_protos is not None
                     else _wiring.select_protos(module, vm_level))
         plan = _wiring.make_plan(vm_rng if vm_rng is not None else rng,
-                                 selected, family=vm_family)
+                                 selected, family=vm_family,
+                                 permute_blocks=block_permutation,
+                                 layout_rng=layout_rng)
 
     # Strings get their own bank at level 2 and above: fragmented, scattered
     # across shuffled pages, and addressed by a per-occurrence ticket rather

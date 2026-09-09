@@ -94,8 +94,18 @@ _JUMP_OPS = frozenset({
 #: RETURNMULTI and TAILCALL.  Every one of those is a legal last instruction,
 #: so the walk fell off the end of the blob and rejected 227 otherwise-correct
 #: builds with "control flow reaches offset N, outside the range".
-_CONDITIONAL = frozenset({OP.JMPFALSE, OP.JMPTRUE, OP.FORPREP, OP.FORINPREP,
-                          OP.FORLOOP, OP.FORIN})
+#: Only these have a fall-through successor.  ``FORPREP`` and ``FORINPREP`` are
+#: *not* among them: they always jump.  ``ir.TERMINATORS`` says so outright --
+#: "every one of these sets the program counter, so an emitter must not also
+#: append a fall-through" -- and the IR agrees, giving those blocks exactly one
+#: successor where the conditional ones have two.
+#:
+#: They were in this set until block permutation exposed it.  In the default
+#: layout a ``FORPREP`` is always followed by its target, so the walk's extra
+#: fall-through edge happened to land on a real instruction start and nothing
+#: complained.  Permute the blocks and that edge lands one past the end of the
+#: blob, which is how a wrong assumption in the checker survived this long.
+_CONDITIONAL = frozenset({OP.JMPFALSE, OP.JMPTRUE, OP.FORLOOP, OP.FORIN})
 _NO_FALLTHROUGH = TERMINATORS - _CONDITIONAL
 
 

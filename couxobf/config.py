@@ -294,6 +294,7 @@ class Config:
     IMPLEMENTED: ClassVar[FrozenSet[str]] = frozenset({
         "virtualization_level",
         "vm_family",
+        "block_permutation",
         "string_protection_level",
         "cache_policy",
         "bounded_cache_size",

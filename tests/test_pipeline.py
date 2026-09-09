@@ -353,3 +353,66 @@ def test_globals_are_preserved():
     protected = execute(TOOLCHAIN, out, "p.luau", timeout=30)
     assert original.returncode == protected.returncode, protected.stderr[:300]
     assert original.stdout == protected.stdout
+
+
+# ---------------------------------------------------------------------------
+# comment stripping
+# ---------------------------------------------------------------------------
+#
+# The pipeline is source -> lexer -> parser -> AST -> printer, and the AST has
+# no comment node, so comments cannot survive: there is nothing to carry them.
+# That is the right architecture for this -- a regex stripper would have to
+# understand strings and long brackets to avoid eating code -- but it is worth
+# pinning, because "add comment preservation for debug builds" is an obvious
+# future request and the default must stay clean.
+
+COMMENTED_SOURCE = '''-- a line comment
+local greeting = "hello" -- inline comment
+--[[ a long comment
+     over several lines ]]
+--[=[ a level-one long comment, with ]] inside it ]=]
+--!strict
+--!nonstrict
+print(greeting) -- trailing
+--[[=] nested-looking ]=]]
+'''
+
+
+@pytest.mark.parametrize("profile", ("compact", "balanced", "hardened", "maximum"))
+@pytest.mark.parametrize("minify", (False, True))
+def test_no_comment_survives_the_build(profile, minify):
+    out = build(COMMENTED_SOURCE,
+                Config.from_profile(profile).overrides(
+                    reproducible_seed=5, minify=minify,
+                    min_virtualize_body_nodes=1),
+                verify=False).source
+    # The comment markers themselves, not just the text: a stripper that left
+    # `--` behind with nothing after it would still emit a comment.
+    assert "--" not in out, "a comment marker survived"
+    assert "[[" not in out and "]]" not in out, "a long bracket survived"
+    for text in ("a line comment", "inline comment", "a long comment",
+                 "level-one long comment", "trailing", "nested-looking"):
+        assert text not in out, text
+    # ...and the directive comments are gone too, since they are comments
+    assert "strict" not in out and "nonstrict" not in out
+
+
+def test_comment_stripping_does_not_eat_code():
+    """A comment adjacent to meaningful tokens must not take them with it.
+
+    `]]` inside a level-one long comment, and `--` inside a string literal, are
+    the two cases a naive stripper gets wrong.  Checking behaviour is the only
+    assertion that covers both.
+    """
+    if not TOOLCHAIN.can_execute:
+        pytest.skip("luau runtime not available")
+    src = ('local s = "a--b" -- comment\n'
+           'local t = "-- not a comment"\n'
+           'print(s, t, #"--")\n')
+    out = build(src, Config(reproducible_seed=5, virtualization_level="none"),
+                verify=False).source
+    assert "--" not in out, "a comment marker survived"
+    original = execute(TOOLCHAIN, src, "c.luau", timeout=30)
+    protected = execute(TOOLCHAIN, out, "c2.luau", timeout=30)
+    assert original.returncode == protected.returncode, protected.stderr[:300]
+    assert original.stdout == protected.stdout

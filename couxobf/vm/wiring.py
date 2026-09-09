@@ -54,6 +54,11 @@ class VMPlan:
     table: str = ""
     #: Operand discipline -- see :mod:`couxobf.vm.families`.
     family: str = "register"
+    #: Shuffle each prototype's block layout.  See :mod:`couxobf.vm.layout`.
+    permute_blocks: bool = False
+    #: Randomness for that shuffle.  Its own domain, so changing the opcode map
+    #: does not also re-layout every function.
+    layout_rng: Any = None
 
     def selects(self, proto: FuncIR) -> bool:
         return proto.proto_id in self.protos
@@ -73,7 +78,9 @@ def _fresh_names(rng: Rng, count: int) -> List[str]:
 
 def make_plan(rng: Rng, protos: Iterable[int],
               opmap: Optional[OpcodeMap] = None,
-              family: str = "register") -> VMPlan:
+              family: str = "register",
+              permute_blocks: bool = False,
+              layout_rng: Any = None) -> VMPlan:
     """Build a :class:`VMPlan` from the build's ``vm`` randomness stream.
 
     ``rng`` should be the domain-separated stream for VM generation, not the
@@ -103,7 +110,9 @@ def make_plan(rng: Rng, protos: Iterable[int],
                   names=names,
                   protos=set(protos),
                   table=table_name,
-                  family=_family_name(family))
+                  family=_family_name(family),
+                  permute_blocks=bool(permute_blocks),
+                  layout_rng=layout_rng)
 
 
 #: Node-count floor per level, keyed on :class:`VirtualizationLevel` so the

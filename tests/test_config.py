@@ -76,7 +76,7 @@ def test_defaults_request_thirty_five_unimplemented_features():
     measurable event rather than a quiet edit.
     """
     pending = Config().pending_fields()
-    assert len(pending) == 35, [n for n, _ in pending]
+    assert len(pending) == 34, [n for n, _ in pending]
 
 
 def test_turning_a_feature_off_removes_it_from_the_pending_list():
@@ -107,8 +107,8 @@ def test_report_lists_the_unapplied_capabilities():
                    verify=False)
     report = result.report
     assert "requested but not applied" in report
-    assert "35 declared capabilities are not implemented" in report
-    for probe in ("opaque_predicates", "block_permutation",
+    assert "34 declared capabilities are not implemented" in report
+    for probe in ("opaque_predicates", "branch_inversion",
                   "fingerprint_reduction"):
         assert probe in report, f"{probe} missing from the report"
 
@@ -146,7 +146,7 @@ def test_cli_warns_about_unapplied_capabilities():
                               "-o", "/dev/null", "--no-verify"])
     assert args.func(args, out=io.StringIO(), err=err) == cli.EXIT_OK
     text = err.getvalue()
-    assert "35 requested capabilities are not implemented" in text
+    assert "34 requested capabilities are not implemented" in text
 
 
 def test_cli_warning_is_suppressed_by_quiet():

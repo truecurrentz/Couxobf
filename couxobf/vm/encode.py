@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..ir import MULTIRET, OP, FuncIR, Instr, Kon, Reg
+from .layout import CONDITIONAL_OPS, JUMP_ARG, NO_FALLTHROUGH_OPS, fallthrough
 from .isa import (
     MAX_REGISTERS,
     MAX_WIDE,
@@ -141,22 +142,70 @@ def _biased(value: int, op: str, field: str) -> int:
     return _wide(value + BIAS, op, field)
 
 
-def encode_proto(proto: FuncIR, opmap: OpcodeMap) -> EncodedProto:
-    """Encode one prototype.  Raises if it cannot be virtualized."""
+_JUMP_ARG = JUMP_ARG
+_NO_FALLTHROUGH_OPS = NO_FALLTHROUGH_OPS
+_CONDITIONAL_OPS = CONDITIONAL_OPS
+_fallthrough = fallthrough
+
+
+def _layout(proto: FuncIR,
+            order: Optional[Sequence[int]]) -> List[Tuple[Any, List[Instr]]]:
+    """The blocks in emission order, each with the instructions to emit.
+
+    Execution is linear between jumps, so a block runs into whatever the layout
+    puts next.  In the IR's own order that is always where it should go, so
+    nothing is added and the bytes are exactly what they were before this
+    existed.  Under a permutation it may not be, and then the edge has to
+    become an explicit ``JMP``.
+
+    Both fall-through shapes need this, not just the terminator-less one.  A
+    conditional jump moved to the end of the layout falls through past the last
+    byte of the blob, which the interpreter reads as an opcode it does not
+    know; the first version of this only handled the terminator-less case and
+    was caught by the payload walk on the fifth permutation tried.
+    """
+    by_id = {b.id: b for b in proto.blocks}
+    ids = list(order) if order is not None else [b.id for b in proto.blocks]
+    if sorted(ids) != sorted(by_id):
+        raise EncodingError(
+            f"prototype {proto.proto_id}: layout order {ids} does not cover "
+            f"exactly the blocks {sorted(by_id)}")
+
+    blocks = [by_id[i] for i in ids]
+    out: List[Tuple[Any, List[Instr]]] = []
+    for i, block in enumerate(blocks):
+        instrs = list(block.instrs)
+        following = blocks[i + 1].id if i + 1 < len(blocks) else None
+        falls_into = _fallthrough(block)
+        if falls_into is not None and falls_into != following:
+            instrs.append(Instr(OP.JMP, (falls_into,)))
+        out.append((block, instrs))
+    return out
+
+
+def encode_proto(proto: FuncIR, opmap: OpcodeMap,
+                 order: Optional[Sequence[int]] = None) -> EncodedProto:
+    """Encode one prototype.  Raises if it cannot be virtualized.
+
+    ``order`` is the block emission order, as a sequence of block ids.  It
+    defaults to the IR's own order, which leaves the output byte-identical to
+    an unpermuted build; see :mod:`couxobf.vm.layout`.
+    """
     ok, reason = can_virtualize(proto)
     if not ok:
         raise EncodingError(f"prototype {proto.proto_id} is not virtualizable: {reason}")
 
     consts: List[Any] = list(proto.consts)
+    layout = _layout(proto, order)
 
     # First pass: lay blocks out and record where each one starts, so jump
     # operands (which name block ids in the IR) can become byte offsets.
     offsets: Dict[int, int] = {}
     starts: List[int] = []
     pc = HEADER.size
-    for block in proto.blocks:
+    for block, instrs in layout:
         offsets[block.id] = pc
-        for ins in block.instrs:
+        for ins in instrs:
             # Recorded for the integrity check: a payload validator can only
             # rediscover instruction boundaries by decoding, and decoding from
             # a wrong offset sometimes succeeds by luck.  Carrying the real
@@ -178,8 +227,8 @@ def encode_proto(proto: FuncIR, opmap: OpcodeMap) -> EncodedProto:
         offsets[proto.entry],
     )
 
-    for block in proto.blocks:
-        for ins in block.instrs:
+    for block, instrs in layout:
+        for ins in instrs:
             out += _encode_instruction(ins, opmap, target, len(consts))
 
     return EncodedProto(

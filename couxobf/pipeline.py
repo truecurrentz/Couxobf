@@ -148,6 +148,8 @@ def build(source: str, config: Optional[Config] = None,
         vm_rng=domains.get("vm"),
         vm_protos=selected,
         vm_family=config.vm_family,
+        block_permutation=config.block_permutation,
+        layout_rng=domains.get("cfg"),
         string_level=config.string_protection_level,
         # Its own stream: reusing the constant pool's randomness for the string
         # bank would correlate two unrelated layouts, which is exactly what
