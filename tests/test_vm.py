@@ -504,6 +504,16 @@ def test_protected_path_hides_the_bytecode():
         assert original.stdout == protected.stdout == "22\n"
 
 
+def test_vm_row_keys_are_build_specific_tickets():
+    plan = wiring.make_plan(rngmod.make_domains(b"\x33" * 16).get("vm"), {7})
+    assert plan.row_key(7) != 7
+    src = wiring.prelude_source(
+        plan, {7: type("E", (), {"code": b"abc", "consts": (), "edges": ()})()},
+        const_expr=lambda v: "nil", code_expr=lambda b: '"abc"')
+    assert "[%d]" % plan.row_key(7) in src
+    assert "[7] = { code" not in src
+
+
 def test_vm_descriptors_materialize_code_and_constants_lazily():
     """Encrypted VM blobs should not become plaintext descriptor rows at load."""
     out, selected = protected_vm_reconstruct(

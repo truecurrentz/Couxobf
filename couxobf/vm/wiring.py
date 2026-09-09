@@ -95,6 +95,10 @@ class VMPlan:
     edges_table: str = ""
     #: The assembled per-prototype record every ``enter`` is handed.
     rows_table: str = ""
+    #: Build-specific mask for descriptor row keys.  Call sites pass tickets, not
+    #: prototype ids, so the entry closure does not advertise which source
+    #: function owns a VM row.
+    row_mask: int = 0
     #: Whether the three descriptor tables above are actually kept apart.  See
     #: :func:`prelude_source`; this is :attr:`Config.metadata_fragmentation`.
     fragmented: bool = True
@@ -123,6 +127,9 @@ class VMPlan:
             if group.describes(proto_id):
                 return group
         return None
+
+    def row_key(self, proto_id: int) -> int:
+        return (int(proto_id) ^ int(self.row_mask or 0)) & 0xffffffff
 
     def fmt_for(self, proto_id: int) -> FormatSpec:
         group = self.group_for(proto_id)
@@ -282,6 +289,7 @@ def make_plan(rng: Rng, protos: Iterable[int],
                   consts_table=tables[1],
                   edges_table=tables[2],
                   rows_table=tables[3],
+                  row_mask=(rng.u32() | 1),
                   family=primary.family,
                   permute_blocks=bool(permute_blocks),
                   layout_rng=layout_rng,
@@ -557,7 +565,7 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
             edges = (" edges = function() return " + edges_expr(_pack_edges(enc.edges)) + " end,") if (
                 enc.edges and edges_expr is not None) else ""
             joined.append("  [%d] = { code = function() return %s end, consts = function() return { %s } end,%s },"
-                          % (pid, code_expr(enc.code), consts, edges))
+                          % (plan.row_key(pid), code_expr(enc.code), consts, edges))
         parts.append("local %s = {\n%s\n}"
                      % (plan.rows_table, "\n".join(joined)))
         return _finish(parts)
@@ -577,7 +585,7 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
         enc = encoded[pid]
         edges = ("%s[%d]" % (plan.edges_table, pid)) if edge_rows else "nil"
         joined.append("  [%d] = { code = %s[%d], consts = %s[%d], edges = %s },"
-                      % (pid, plan.table, pid, plan.consts_table, pid, edges))
+                      % (plan.row_key(pid), plan.table, pid, plan.consts_table, pid, edges))
     parts.append("local %s = {\n%s\n}"
                  % (plan.rows_table, "\n".join(joined)))
     return _finish(parts)

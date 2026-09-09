@@ -408,7 +408,7 @@ class Reconstructor:
             body=A.Block(body=[A.Return(values=[A.Call(
                 fn=A.Name(name=enter),
                 args=[A.Index(obj=A.Name(name=self.vm.rows_table),
-                              key=_num(proto.proto_id)),
+                              key=_num(self.vm.row_key(proto.proto_id))),
                       A.Call(fn=A.Name(name=self.vm.names["getfenv"]),
                              args=[_num(1)]),
                       A.Vararg()])])]))
