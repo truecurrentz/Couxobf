@@ -498,8 +498,11 @@ class _FuncBuilder:
 
 
 class Lowerer:
-    def __init__(self) -> None:
+    def __init__(self, *, table_key_protection: bool = False,
+                 rng: Any = None) -> None:
         self.protos: List[FuncIR] = []
+        self.table_key_protection = bool(table_key_protection)
+        self.rng = rng
 
     # -- entry -----------------------------------------------------------
     def lower(self, root: A.Block) -> IRModule:
@@ -692,8 +695,23 @@ class Lowerer:
         if isinstance(e, A.MethodCall):
             obj = fb.new_reg()
             self._expr(fb, e.obj, obj)
-            key = fb.proto.add_const(e.method.encode("utf-8", "surrogatepass"))
-            fb.emit(OP.SELF, base, obj, key, line=line, origin=e)
+            raw_method = e.method.encode("utf-8", "surrogatepass")
+            if self.table_key_protection and len(raw_method) >= 2:
+                # `obj:method(a)` is `obj[method](obj, a)`, with `obj`
+                # evaluated once and before the arguments.  Building the key in
+                # registers lets table-key protection cover method names too;
+                # otherwise SELF would keep the whole name as a constant-wide
+                # operand for the VM/runtime to expose as one vocabulary item.
+                key = self._table_key_operand(fb, e.method, line)
+                if not isinstance(key, Reg):  # pragma: no cover - length guard
+                    kreg = fb.new_reg()
+                    fb.emit(OP.LOADK, kreg, key, line=line)
+                    key = kreg
+                fb.emit(OP.GETTABLE, base, obj, key, line=line, origin=e)
+                fb.emit(OP.MOV, base + 1, obj, line=line, origin=e)
+            else:
+                key = fb.proto.add_const(raw_method)
+                fb.emit(OP.SELF, base, obj, key, line=line, origin=e)
             argstart = 2
         else:
             self._expr(fb, e.fn, base)
@@ -798,7 +816,7 @@ class Lowerer:
             obj = fb.new_reg()
             self._expr(fb, t.obj, obj)
             if isinstance(t, A.Field):
-                key = fb.proto.add_const(t.name.encode("utf-8", "surrogatepass"))
+                key = self._table_key_operand(fb, t.name, line)
             else:
                 kreg = fb.new_reg()
                 self._expr(fb, t.key, kreg)
@@ -820,6 +838,46 @@ class Lowerer:
                 fb.emit(OP.SETUPVAL, up, src, line=line)
                 return
         fb.emit(OP.SETGLOBAL, fb.proto.add_name(name), src, line=line)
+
+    def _table_key_operand(self, fb: _FuncBuilder, name: str,
+                           line: int) -> Union[Kon, Reg]:
+        """Return the key operand for a syntactic field name.
+
+        With table-key protection enabled, keys such as ``state.token`` and
+        ``{token = v}`` are assembled from several constants in registers rather
+        than emitted as one constant operand.  This keeps field names out of the
+        easy GETTABLEK/SETTABLEK shape and prevents a constant-table scan from
+        seeing a complete property vocabulary.  The split is side-effect-free,
+        so it does not disturb Luau's table/metatable evaluation order.
+        """
+        raw = name.encode("utf-8", "surrogatepass")
+        if not self.table_key_protection or len(raw) < 2:
+            return fb.proto.add_const(raw)
+        parts = self._split_key(raw)
+        dst = fb.new_reg()
+        fb.emit(OP.LOADK, dst, fb.proto.add_const(parts[0]), line=line)
+        for part in parts[1:]:
+            r = fb.new_reg()
+            fb.emit(OP.LOADK, r, fb.proto.add_const(part), line=line)
+            out = fb.new_reg()
+            fb.emit(OP.CONCAT, out, dst, r, line=line)
+            dst = out
+        return dst
+
+    def _split_key(self, raw: bytes) -> List[bytes]:
+        if len(raw) <= 2:
+            return [raw[:1], raw[1:]]
+        if self.rng is None:
+            cut = 1 + (sum(raw) % (len(raw) - 1))
+            return [raw[:cut], raw[cut:]]
+        first = 1 + self.rng.randbelow(len(raw) - 1)
+        parts = [raw[:first], raw[first:]]
+        if len(raw) >= 6 and self.rng.chance(0.45):
+            second_len = len(parts[1])
+            if second_len >= 2:
+                cut = 1 + self.rng.randbelow(second_len - 1)
+                parts = [parts[0], parts[1][:cut], parts[1][cut:]]
+        return [p for p in parts if p]
 
     def _compound(self, fb: _FuncBuilder, s: A.Compound) -> None:
         op = _BINARY_OPS[s.op.rstrip("=")]
@@ -845,7 +903,7 @@ class Lowerer:
         obj = fb.new_reg()
         self._expr(fb, t.obj, obj)
         if isinstance(t, A.Field):
-            key = fb.proto.add_const(t.name.encode("utf-8", "surrogatepass"))
+            key = self._table_key_operand(fb, t.name, line)
         else:
             key = fb.new_reg()
             self._expr(fb, t.key, key)
@@ -1133,7 +1191,7 @@ class Lowerer:
         elif isinstance(e, A.Field):
             obj = fb.new_reg()
             self._expr(fb, e.obj, obj)
-            k = fb.proto.add_const(e.name.encode("utf-8", "surrogatepass"))
+            k = self._table_key_operand(fb, e.name, line)
             fb.emit(OP.GETTABLE, dst, obj, k, line=line, origin=e)
         elif isinstance(e, A.Table):
             self._table(fb, e, dst, line)
@@ -1223,8 +1281,7 @@ class Lowerer:
             # TableItem.kind is "array" | "field" (name = key) | "key"
             # ([expr] = value), matching what the parser produces.
             if item.kind == "field":
-                k = fb.proto.add_const(
-                    (item.key_name or "").encode("utf-8", "surrogatepass"))
+                k = self._table_key_operand(fb, item.key_name or "", line)
             elif item.kind == "key":
                 k = fb.new_reg()
                 self._expr(fb, item.key_expr, k)

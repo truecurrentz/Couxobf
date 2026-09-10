@@ -95,6 +95,10 @@ class VMPlan:
     edges_table: str = ""
     #: The assembled per-prototype record every ``enter`` is handed.
     rows_table: str = ""
+    #: Build-specific mask for descriptor row keys.  Call sites pass tickets, not
+    #: prototype ids, so the entry closure does not advertise which source
+    #: function owns a VM row.
+    row_mask: int = 0
     #: Whether the three descriptor tables above are actually kept apart.  See
     #: :func:`prelude_source`; this is :attr:`Config.metadata_fragmentation`.
     fragmented: bool = True
@@ -124,6 +128,9 @@ class VMPlan:
                 return group
         return None
 
+    def row_key(self, proto_id: int) -> int:
+        return (int(proto_id) ^ int(self.row_mask or 0)) & 0xffffffff
+
     def fmt_for(self, proto_id: int) -> FormatSpec:
         group = self.group_for(proto_id)
         return group.fmt if group is not None else self.groups[0].fmt
@@ -144,6 +151,7 @@ class VMPlan:
             "protos": len(g.protos),
             "opcodes": g.opmap.opcode_count(),
             "format": g.fmt.summary(),
+            "readers": {k: g.names.get(k) for k in ("ro", "r8", "rr", "rw", "rk", "rp", "rt")},
         } for g in self.groups]
 
 
@@ -195,7 +203,8 @@ def _fresh_names(rng: Rng, count: int, reserved: Iterable[str] = ()) -> List[str
 
 #: Per-build name roles the interpreter needs, in the order they are drawn.
 _ROLES = ("code", "exec", "enter", "call", "getfenv", "acc", "stack", "sp",
-          "pc", "regs", "consts", "env", "edges")
+          "pc", "regs", "consts", "env", "edges",
+          "ro", "r8", "rr", "rw", "rk", "rp", "rt")
 
 
 def make_plan(rng: Rng, protos: Iterable[int],
@@ -244,33 +253,19 @@ def make_plan(rng: Rng, protos: Iterable[int],
     dispatcher = _dispatcher_name(dispatcher, rng)
     tables = tuple(tables or _fresh_names(rng, 4))
     if names is None:
-        (code_name, exec_name, enter_name, call_name, getfenv_name,
-         acc_name, stack_name, sp_name, pc_name, regs_name, consts_name,
-         env_name, edges_name, _spare) = _fresh_names(rng, 14)
-        names = {
-            "code": code_name,
-            "exec": exec_name,
-            "enter": enter_name,
-            "call": call_name,
-            "getfenv": getfenv_name,
-            # the accumulator/stack locals the non-register families use
-            "acc": acc_name,
-            "stack": stack_name,
-            "sp": sp_name,
-            "pc": pc_name,
-            "regs": regs_name,
-            "consts": consts_name,
-            "env": env_name,
-            # the per-prototype control-flow edge table, when a format reads its
-            # jump targets through one (#18)
-            "edges": edges_name,
-        }
+        drawn = _fresh_names(rng, len(_ROLES) + 1)
+        names = dict(zip(_ROLES, drawn[:len(_ROLES)]))
     else:
         # A caller-supplied name set: the test harness pins these so a failure
         # names the function it came from.  They must reach the groups too -- a
         # plan whose interpreter and call sites disagree on a name is exactly the
         # "two copies that drift" bug the harness rewrite was for.
         names = dict(names)
+    # Tests and older callers can still pass the legacy core names; production
+    # draws them above.  Fill reader helper names here so `_rename_core_tokens`
+    # can erase the stable `_ro/_rr/_rk/...` decoder signature either way.
+    for role in _ROLES:
+        names.setdefault(role, role)
     for role, helper in zip(("append", "iter", "iterpack", "itercheck"), shared):
         # shared with lower_back -- see the module docstring
         names.setdefault(role, helper)
@@ -294,6 +289,7 @@ def make_plan(rng: Rng, protos: Iterable[int],
                   consts_table=tables[1],
                   edges_table=tables[2],
                   rows_table=tables[3],
+                  row_mask=(rng.u32() | 1),
                   family=primary.family,
                   permute_blocks=bool(permute_blocks),
                   layout_rng=layout_rng,
@@ -323,11 +319,9 @@ def _make_groups(rng: Rng, proto_ids: List[int], names: Dict[str, str], *,
     with each other, and round-robin guarantees they get equal populations
     instead of 63 prototypes in one VM and one in the other.
     """
-    count = max(1, min(int(variety), 4))
-    if len(proto_ids) < 2:
-        count = 1
-    family_pool = list(families) if families else [family]
-    dispatcher_pool = list(dispatchers) if dispatchers else [dispatcher]
+    count = 1
+    family_pool = ["woven"]
+    dispatcher_pool = ["woven"]
     if len(family_pool) < count:
         # Not enough distinct families for the requested groups: fall back to
         # drawing from every family the tool can emit, which is what "more
@@ -463,22 +457,20 @@ def _dispatcher_name(value: Any, rng: Rng) -> str:
     interpreter's locals, so a build's shape and its names move together.
     """
     name = str(getattr(value, "value", value)).strip().lower()
-    if name in ("", "mixed", "none"):
-        return rng.choice(list(runtime.DISPATCHERS))
-    if name not in runtime.DISPATCHERS:
-        raise ValueError(
-            f"dispatcher family {value!r} is not implemented; this build can "
-            f"emit {', '.join(runtime.DISPATCHERS)} (or mixed)")
-    return name
+    if name in {"", "mixed", "none", "nested_if", "decision_tree", "bucket",
+                "state_transition", "threaded", "woven"}:
+        return "woven"
+    raise ValueError(
+        f"dispatcher family {value!r} is not implemented; this build emits woven")
 
 
 def _family_name(value: Any) -> str:
     """Normalise a family, which may arrive as a ``VMFamily`` enum."""
     name = getattr(value, "value", value)
     key = str(name).strip().lower()
-    if key not in FAMILIES:
-        raise ValueError(f"unknown VM family {value!r}; expected one of {FAMILIES}")
-    return key
+    if key in {"register", "accumulator", "stack", "hybrid", "woven"}:
+        return "woven"
+    raise ValueError(f"unknown VM family {value!r}; expected woven")
 
 
 def _pack_edges(edges: Sequence[int]) -> bytes:
@@ -493,7 +485,8 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
                    code_expr: Callable[[bytes], str],
                    edges_expr: Optional[Callable[[bytes], str]] = None,
                    entry_guard: Sequence[str] = (),
-                   fragmented: Optional[bool] = None) -> str:
+                   fragmented: Optional[bool] = None,
+                   opaque_predicates: bool = True) -> str:
     """The interpreters plus the descriptor tables, as Luau source.
 
     One interpreter per VM group, then three tables keyed by prototype id: the
@@ -508,12 +501,14 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
     path can pass literal emitters and the protected one can pass pool reads --
     the same bytecode, protected or not.
     """
-    parts: List[str] = []
+    interpreter_parts: List[str] = []
     for group in plan.groups:
-        parts.append(runtime.interpreter_source(group.opmap, group.names,
-                                                group.family, group.dispatcher,
-                                                group.fmt,
-                                                entry_guard=entry_guard))
+        interpreter_parts.append(runtime.interpreter_source(group.opmap, group.names,
+                                                           group.family, group.dispatcher,
+                                                           group.fmt,
+                                                           entry_guard=entry_guard,
+                                                           opaque_predicates=opaque_predicates))
+    parts: List[str] = []
     payload_rows = []
     const_rows = []
     edge_rows = []
@@ -525,18 +520,29 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
         # interpreter reads them from there.  Putting them here as well created
         # a second, plaintext, unauthenticated copy that an editor could change
         # without invalidating any tag.
-        payload_rows.append("  [%d] = %s," % (pid, code_expr(enc.code)))
-        const_rows.append("  [%d] = { %s }," % (pid, consts))
+        payload_rows.append("  [%d] = function() return %s end," % (pid, code_expr(enc.code)))
+        const_rows.append("  [%d] = function() return { %s } end," % (pid, consts))
         if enc.edges and edges_expr is not None:
             # Four bytes per edge, so the stream itself carries only ordinals
             # and the positions they mean live somewhere else entirely (#18).
             blob = _pack_edges(enc.edges)
-            edge_rows.append("  [%d] = %s," % (pid, edges_expr(blob)))
+            edge_rows.append("  [%d] = function() return %s end," % (pid, edges_expr(blob)))
     if not payload_rows:
         # No prototype made it in, so there is nothing to dispatch.  Emitting
         # the interpreter anyway would be dead weight an analyst could study
         # for free.
         return ""
+
+    def _finish(metadata: List[str]) -> str:
+        if not interpreter_parts:
+            combined = metadata
+        else:
+            seed = sum(g.fmt.arm_seed + g.index * 17 for g in plan.groups)
+            cut = seed % (len(interpreter_parts) + 1)
+            combined = (interpreter_parts[:cut] + metadata +
+                        interpreter_parts[cut:])
+        return "\n".join(combined) + "\n"
+
     if fragmented is None:
         fragmented = plan.fragmented
     if not fragmented:
@@ -550,13 +556,13 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
         for pid in sorted(encoded):
             enc = encoded[pid]
             consts = ", ".join(const_expr(v) for v in enc.consts)
-            edges = (" edges = " + edges_expr(_pack_edges(enc.edges)) + ",") if (
+            edges = (" edges = function() return " + edges_expr(_pack_edges(enc.edges)) + " end,") if (
                 enc.edges and edges_expr is not None) else ""
-            joined.append("  [%d] = { code = %s, consts = { %s },%s },"
-                          % (pid, code_expr(enc.code), consts, edges))
+            joined.append("  [%d] = { code = function() return %s end, consts = function() return { %s } end,%s },"
+                          % (plan.row_key(pid), code_expr(enc.code), consts, edges))
         parts.append("local %s = {\n%s\n}"
                      % (plan.rows_table, "\n".join(joined)))
-        return "\n".join(parts) + "\n"
+        return _finish(parts)
     parts.append("local %s = {\n%s\n}" % (plan.table, "\n".join(payload_rows)))
     parts.append("local %s = {\n%s\n}"
                  % (plan.consts_table, "\n".join(const_rows)))
@@ -573,7 +579,7 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
         enc = encoded[pid]
         edges = ("%s[%d]" % (plan.edges_table, pid)) if edge_rows else "nil"
         joined.append("  [%d] = { code = %s[%d], consts = %s[%d], edges = %s },"
-                      % (pid, plan.table, pid, plan.consts_table, pid, edges))
+                      % (plan.row_key(pid), plan.table, pid, plan.consts_table, pid, edges))
     parts.append("local %s = {\n%s\n}"
                  % (plan.rows_table, "\n".join(joined)))
-    return "\n".join(parts) + "\n"
+    return _finish(parts)

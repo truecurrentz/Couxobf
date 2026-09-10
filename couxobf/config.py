@@ -50,17 +50,17 @@ class VirtualizationLevel(enum.IntEnum):
 
 
 class VMFamily(enum.Enum):
-    """The shape of the VM's state machine.
+    """Compatibility names for the VM family selector.
 
-    All four execute the same instruction set semantics; they differ in where
-    operands live, which changes the interpreter's shape enough that a
-    deobfuscator written for one does not transfer to the others.
+    Protected output uses the single woven VM.  Older names remain accepted so
+    saved configurations do not fail to load; they normalize during planning.
     """
 
     REGISTER = "register"
     STACK = "stack"
     ACCUMULATOR = "accumulator"
     HYBRID = "hybrid"
+    WOVEN = "woven"
 
     @classmethod
     def parse(cls, value: Any) -> "VMFamily":
@@ -77,12 +77,14 @@ class DispatcherFamily(enum.Enum):
     #: way to decline it -- and Config.pending_fields, which treats an enum
     #: with a NONE member as turn-off-able, had to special-case it.
     NONE = "none"
+    WOVEN = "woven"
     NESTED_IF = "nested_if"
     TABLE = "table"
     BUCKET = "bucket"
     SEGMENTED = "segmented"
     DECISION_TREE = "decision_tree"
     STATE_TRANSITION = "state_transition"
+    THREADED = "threaded"
     INDIRECT = "indirect"
     MIXED = "mixed"
 
@@ -128,7 +130,7 @@ class IntegrityLevel(enum.Enum):
 class Config:
     # ---- selection -------------------------------------------------------
     virtualization_level: VirtualizationLevel = VirtualizationLevel.HEAVY
-    vm_family: VMFamily = VMFamily.REGISTER
+    vm_family: VMFamily = VMFamily.WOVEN
     max_vm_depth: int = 2
     mixed_execution: bool = True
 
@@ -148,8 +150,15 @@ class Config:
     #: 0 keeps the historical layout, 1 mixes, 2 spends every knob.  A level
     #: rather than a bool because the size cost is real and per-group.
     instruction_formats: int = 1
-    #: How many distinct VMs one build emits.  Each group gets its own family,
-    #: dispatcher and format, so 2 means two interpreters in the artifact.
+    #: One switch for the "best mixed VM" mode.  On means the build chooses and
+    #: combines the strongest pieces of every VM architecture and dispatch shape:
+    #: single woven VM state and guarded opcode dispatch
+    #: dispatch, per-group formats and per-build opcode maps.  Off keeps a single
+    #: pinned VM for debugging/reproducibility.
+    vm_polymorphism: bool = True
+    #: How many distinct VMs one build emits.  In polymorphic mode this is treated
+    #: as a floor and the build may raise it enough to exercise more than one
+    #: architecture when the program has enough functions.
     vm_variety: int = 1
     #: Register fields are widened and masked.  A full register permutation is
     #: not on the table: FORLOOP, CALL and SETLIST all address base+1, base+2,
@@ -158,9 +167,12 @@ class Config:
     #: this does.
     register_randomization: bool = True
     #: Fuse independent instruction pairs into super-instructions (#6).
-    instruction_fusion: bool = True
+    #: Disabled by default: distinctive fused semantics can be easier to match
+    #: than smaller primitive handlers.  The option remains for compatibility.
+    instruction_fusion: bool = False
     #: Offer fused pairs as distinct opcodes, growing the handler set.
-    super_instructions: bool = True
+    #: Disabled by default for the same reason as instruction_fusion.
+    super_instructions: bool = False
     handler_splitting: bool = True
     dispatcher_family: DispatcherFamily = DispatcherFamily.MIXED
     #: When several VMs are emitted, give each one a different dispatch shape
@@ -187,7 +199,7 @@ class Config:
     vm_isa_subset: bool = True
     #: Keep control-flow edges out of the instruction stream: the payload
     #: carries an ordinal and the destinations live in their own blob.
-    edge_indirection: bool = False
+    edge_indirection: bool = True
     #: Spread VM state across the families (accumulator/stack/register) rather
     #: than one discipline for the whole build.
     state_distribution: bool = True
@@ -197,7 +209,6 @@ class Config:
     control_flow_level: int = 2
     opaque_predicates: bool = True
     branch_inversion: bool = True
-    edge_indirection: bool = True
     block_permutation: bool = True
     encoded_pc: bool = True
     epoch_masks: bool = True
@@ -212,7 +223,7 @@ class Config:
     #: infinities stay on the exact path because no arithmetic encoding is safe
     #: for them.
     numeric_protection_level: int = 1
-    constant_protection_level: int = 2
+    constant_protection_level: int = 1
     table_key_protection: bool = True
     cache_policy: CachePolicy = CachePolicy.NONE
     bounded_cache_size: int = 16
@@ -222,7 +233,7 @@ class Config:
 
     # ---- integrity -------------------------------------------------------
     integrity_level: IntegrityLevel = IntegrityLevel.TAG_AND_HASH
-    self_test: bool = True
+    self_test: bool = False
 
     # ---- output shaping --------------------------------------------------
     #: Dead-but-valid padding in the flattened dispatcher: 0 none, 1 a few
@@ -262,11 +273,6 @@ class Config:
     guard_policy: str = "fail"
 
     # ---- environment -----------------------------------------------------
-    #: Compile-check the emitted runtime against the Roblox API surface, and use
-    #: only globals Roblox actually provides.  It does not make the build run
-    #: Roblox code -- there is no runtime here to run it against, and pretending
-    #: otherwise would be the fake verification the design rules out.
-    roblox_mode: bool = True
     debug_build: bool = False
 
     # ---- source handling -------------------------------------------------
@@ -329,6 +335,7 @@ class Config:
         return cls(
             virtualization_level=VirtualizationLevel.NONE,
             instruction_formats=0,
+            vm_polymorphism=False,
             vm_variety=1,
             opcode_aliases=0,
             edge_indirection=False,
@@ -371,17 +378,23 @@ class Config:
             control_flow_level=3,
             string_protection_level=3,
             numeric_protection_level=2,
-            constant_protection_level=3,
+            constant_protection_level=1,
             chunking_level=3,
             junk_level=2,
-            # Two VMs, every format knob, fused super-ops, indirect edges.  The
-            # price is stated in the report rather than hidden: roughly one
-            # extra interpreter.
-            vm_variety=2,
+            # One hardened VM, every format knob, aliases and indirect edges.
+            # Fused super-ops are intentionally not enabled by default: they make
+            # highly distinctive semantic signatures for a static matcher.
+            vm_polymorphism=True,
+            instruction_fusion=False,
+            super_instructions=False,
+            vm_variety=3,
             instruction_formats=2,
             opcode_aliases=2,
             edge_indirection=True,
+            env_guard=2,
+            dump_guard=2,
             decoy_constants=24,
+            max_output_growth=0,
         )
 
     PROFILES = ("compact", "balanced", "hardened", "maximum")
@@ -425,9 +438,9 @@ class Config:
     #: Fields that are read by the compiler and change the output.
     IMPLEMENTED: ClassVar[FrozenSet[str]] = frozenset({
         "virtualization_level",
+        "vm_polymorphism",
         "vm_family",
         "block_permutation",
-        "dispatcher_family",
         "opcode_randomization",
         "opcode_aliases",
         "operand_randomization",
@@ -440,15 +453,19 @@ class Config:
         "opcode_cipher",
         "vm_isa_subset",
         "edge_indirection",
-        "state_distribution",
-        "dispatcher_splitting",
+        "dispatcher_family",
         "metadata_fragmentation",
         "string_protection_level",
+        "constant_protection_level",
+        "numeric_protection_level",
+        "table_key_protection",
         "cache_policy",
         "bounded_cache_size",
         "decoys",
         "decoy_constants",
         "control_flow_level",
+        "opaque_predicates",
+        "branch_inversion",
         "env_guard",
         "dump_guard",
         "guard_policy",
@@ -512,6 +529,6 @@ class Config:
             problems.append("integrity checking is enabled but nothing is protected")
         if self.junk_level > 0 and self.minify:
             problems.append("junk_level > 0 is partly undone by minify")
-        if self.max_output_growth < 1.0:
-            problems.append("max_output_growth must be >= 1.0")
+        if self.max_output_growth != 0 and self.max_output_growth < 1.0:
+            problems.append("max_output_growth must be 0 (disabled) or >= 1.0")
         return problems

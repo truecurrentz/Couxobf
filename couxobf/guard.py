@@ -30,20 +30,12 @@ so that a runner which replaced those functions to intercept the artifact's own
 decryption is detected, and the artifact can react before it hands plaintext to
 the thing doing the reading.
 
-**Neutralise, at the intrusive level only.**  When the platform exposes
-``getrawmetatable``/``setreadonly`` (Roblox does, the reference interpreter does
-not) and a logging metatable is present, level 2 clears its ``__index`` and
-``__newindex`` under ``pcall``, and clears a script hook the same way.  That
-mutates shared state: a framework which installed the metatable for its own
-reasons loses it.  Hence the numbering -- 1 observes, 2 acts -- and level 2 not
-being the default.
-
-``guard_policy`` decides what a detected violation costs the artifact.  ``fail``
-raises the same generic error a corrupt payload raises, which is worth something
-precisely because a dumper cannot tell the two apart.  ``ignore`` keeps running
-after neutralising, which is the setting for measuring whether a given runner
-trips a check at all -- and it is why the check is never dead code: its result
-always drives the neutralisation, and only the refusal is conditional.
+**Refuse, never fight the executor.**  Level 2 does not mutate metatables,
+clear hooks, or call executor-only APIs.  This project is free for everyone, so
+the guard should not punish a user's chosen runner.  ``guard_policy`` decides
+what a detected violation costs the artifact: ``fail`` raises the same generic
+error a corrupt payload raises, while ``ignore`` keeps running so the checks can
+be measured on a machine that legitimately has a hooked environment.
 
 The emitted text is generated from this build's name set, so none of it can be
 found by grepping for a marker string.
@@ -51,6 +43,7 @@ found by grepping for a marker string.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
@@ -61,23 +54,44 @@ from . import ast_nodes as A
 #: outlive a ``setfenv`` that changed them, and the artifact would then be running
 #: a different program than the source described.
 CAPTURED: Tuple[str, ...] = (
-    "string", "table", "math", "os", "coroutine", "getfenv", "setmetatable",
+    "_G", "bit32", "string", "table", "math", "os", "coroutine", "getfenv", "setmetatable",
     "getmetatable", "rawget", "rawset", "rawequal", "next", "type", "tonumber",
     "tostring", "select", "pcall", "xpcall", "error", "assert", "ipairs",
     "pairs", "unpack", "gcinfo", "debug", "print", "warn",
 )
 
-#: Dump and inspection surfaces the guard watches, as ``(table, field, call_it)``.
-#: A ``None`` table means "look it up on the environment", which is where the
-#: Roblox-only dump functions live.  Either half may be absent on a given
-#: platform, and absence is not a violation -- it is the norm off Roblox.
+#: Dump, inspection and late-injected hook surfaces the guard watches, as
+#: ``(table, field, call_it)``.  Every lookup is nil-safe: normal sandboxes that
+#: do not expose executor globals snapshot ``nil`` and keep running, while a host
+#: that injects or swaps them after load trips the same generic refusal path.
 SURFACES: Tuple[Tuple[Optional[str], str, bool], ...] = (
     ("string", "dump", False),
+    ("debug", "info", False),
+    ("debug", "getinfo", False),
+    ("debug", "traceback", False),
+    ("debug", "gethook", True),
+    ("debug", "sethook", False),
+    (None, "hookfunction", False),
+    (None, "replaceclosure", False),
     (None, "getbytecode", False),
     (None, "getscriptbytecode", False),
-    ("debug", "getinfo", False),
-    ("debug", "gethook", True),
+    (None, "getgc", False),
+    (None, "getreg", False),
+    (None, "getregistry", False),
+    (None, "getconnections", False),
+    (None, "saveinstance", False),
+    (None, "getsenv", False),
+    (None, "getrenv", False),
+    (None, "getrawmetatable", False),
+    (None, "setrawmetatable", False),
+    (None, "setreadonly", False),
 )
+
+#: Metatable fields that matter for logging/proxying.  ``__index`` and
+#: ``__newindex`` are the classic environment logger; the others catch proxy
+#: state without using executor-only APIs or mutating the table.
+_META_KEYS: Tuple[str, ...] = ("__index", "__newindex", "__namecall",
+                              "__metatable", "__mode", "__call")
 
 #: What a detected violation does.
 POLICIES = ("fail", "ignore")
@@ -88,7 +102,17 @@ POLICIES = ("fail", "ignore")
 REFUSAL = "invalid state"
 
 #: The roles the guard needs a name for, beyond the library captures.
-_ROLES = ("env", "meta", "index", "write", "check", "flag")
+_ROLES = ("env", "meta", "index", "write", "namecall", "metaguard",
+          "metamode", "metacall", "rawmeta", "check", "flag")
+
+_META_ROLE = {
+    "__index": "index",
+    "__newindex": "write",
+    "__namecall": "namecall",
+    "__metatable": "metaguard",
+    "__mode": "metamode",
+    "__call": "metacall",
+}
 
 
 def used_globals(node: A.Node, allowed: Iterable[str] = CAPTURED) -> List[str]:
@@ -243,6 +267,8 @@ class Guard:
     #: ``index``, ``write``, ``check``, ``flag``) and one ``surface:<i>`` per
     #: watched surface.
     names: Dict[str, str] = field(default_factory=dict)
+    #: Dump/debug surfaces this build watches.
+    surfaces: Tuple[Tuple[Optional[str], str, bool], ...] = SURFACES
     #: The library names this build actually binds, after :meth:`bind` has seen
     #: the scaffolding.  Empty until then, which is also what an inactive capture
     #: block looks like -- a build whose runtime happens to touch no library
@@ -256,19 +282,33 @@ class Guard:
 
     @property
     def neutralises(self) -> bool:
-        """Level 2 on either axis: clear what the check found, not just flag it."""
-        return self.active and (self.env_level >= 2 or self.dump_level >= 2)
+        """Whether this build mutates the host to clear hooks/proxies.
+
+        Always false by design: Couxobf may refuse when a protected runtime is
+        being inspected, but it does not alter executor or framework state.
+        """
+        return False
 
     @property
     def refuses(self) -> bool:
         """Refuse to run on a violation: level 2 plus the failing policy."""
-        return self.neutralises and self.policy == "fail"
+        return self.active and (self.env_level >= 2 or self.dump_level >= 2) and self.policy == "fail"
 
     def n(self, role: str) -> str:
         try:
             return self.names[role]
         except KeyError as exc:
             raise KeyError(f"guard has no local for role {role!r}") from exc
+
+    def fail_literal(self, site: str) -> str:
+        token = hashlib.sha256((self.n("check") + ":" + site).encode()).digest()[:8]
+        return '"' + ''.join('\\x%02x' % b for b in token) + '"'
+
+    @staticmethod
+    def literal(text: str) -> str:
+        chunks = [text[i:i + 3] for i in range(0, len(text), 3)] or [""]
+        return "..".join('"' + ''.join('\\x%02x' % b for b in chunk.encode()) + '"'
+                         for chunk in chunks)
 
     def cap(self, name: str) -> str:
         """The local holding a library global, or the global itself.
@@ -289,10 +329,10 @@ class Guard:
         is a global read on every call -- exactly the thing the capture exists to
         remove, and a logger would see the guard more often than the program.
         """
-        out = ["getfenv", "getmetatable", "rawget", "error"]
+        out = ["_G", "getfenv", "getmetatable", "rawget", "rawequal", "error"]
         if self.neutralises:
             out += ["pcall", "rawset"]
-        for table, _name, _call in SURFACES:
+        for table, _name, _call in self.surfaces:
             if table:
                 out.append(table)
         return tuple(dict.fromkeys(out))
@@ -327,8 +367,8 @@ class Guard:
             # `getfenv` and no `_G` must still have *something* to look a metatable
             # up on, or the guard's own first line is a nil index and the artifact
             # dies for want of a defence.
-            "local %s = (%s) and (%s)(1) or _G or {}"
-            % (env, self.cap("getfenv"), self.cap("getfenv")),
+            "local %s = (%s) and (%s)(1) or %s or {}"
+            % (env, self.cap("getfenv"), self.cap("getfenv"), self.cap("_G")),
             # `getmetatable` itself is not guaranteed to exist -- a sandbox can
             # strip it -- so it is called through a presence test rather than
             # assumed.  A guard that errors on the runtime it is defending is the
@@ -336,12 +376,12 @@ class Guard:
             # produces.
             "local %s = (%s) and (%s)(%s) or nil" % (self.n("meta"), getmt,
                                                       getmt, env),
-            "local %s = %s and (%s)(%s, \"__index\")"
-            % (self.n("index"), self.n("meta"), rawget, self.n("meta")),
-            "local %s = %s and (%s)(%s, \"__newindex\")"
-            % (self.n("write"), self.n("meta"), rawget, self.n("meta")),
         ]
-        for index, (table, name, call_it) in enumerate(SURFACES):
+        for key in _META_KEYS:
+            lines.append("local %s = %s and (%s)(%s, %s)"
+                         % (self.n(_META_ROLE[key]), self.n("meta"), rawget,
+                            self.n("meta"), self.literal(key)))
+        for index, (table, name, call_it) in enumerate(self.surfaces):
             slot = self.n(f"surface:{index}")
             lines.append("local %s = %s" % (slot, self._read_surface(table, name,
                                                                      call_it)))
@@ -351,29 +391,30 @@ class Guard:
         """Luau text for one surface's current value, nil-safe on every platform."""
         rawget = self.cap("rawget")
         if table is None:
-            return "(%s)(%s, \"%s\")" % (rawget, self.n("env"), name)
+            return "(%s)(%s, %s)" % (rawget, self.n("env"), self.literal(name))
         base = self.cap(table)
         if call_it:
-            return "(%s) and (%s).%s and (%s).%s()" % (base, base, name, base, name)
-        return "(%s) and (%s).%s" % (base, base, name)
+            return "(%s) and (%s)(%s, %s) and (%s)(%s, %s)()" % (
+                base, rawget, base, self.literal(name), rawget, base, self.literal(name))
+        return "(%s) and (%s)(%s, %s)" % (base, rawget, base, self.literal(name))
 
     def check_lines(self) -> List[str]:
         """The verifier, the flag, and the neutralisation and refusal it drives."""
         if not self.active:
             return []
         check, rawget, getmt = self.n("check"), self.cap("rawget"), self.cap("getmetatable")
+        raweq = self.cap("rawequal")
         env = self.n("env")
         body = [
             "local m = (%s) and (%s)(%s) or nil" % (getmt, getmt, env),
-            "if m ~= %s then return false end" % self.n("meta"),
+            "if not (%s)(m, %s) then return false end" % (raweq, self.n("meta")),
             "if m then",
-            "  if (%s)(m, \"__index\") ~= %s then return false end"
-            % (rawget, self.n("index")),
-            "  if (%s)(m, \"__newindex\") ~= %s then return false end"
-            % (rawget, self.n("write")),
-            "end",
         ]
-        for index, (table, name, call_it) in enumerate(SURFACES):
+        for key in _META_KEYS:
+            body.append("  if not (%s)((%s)(m, %s), %s) then return false end"
+                        % (raweq, rawget, self.literal(key), self.n(_META_ROLE[key])))
+        body.append("end")
+        for index, (table, name, call_it) in enumerate(self.surfaces):
             body.append("if %s ~= %s then return false end"
                         % (self._read_surface(table, name, call_it),
                            self.n(f"surface:{index}")))
@@ -388,39 +429,13 @@ class Guard:
             lines.append(f"  {self.n('flag')} = {check}()")
             lines.append("end")
         if self.refuses:
-            lines.append("if not %s then %s(\"%s\") end"
-                         % (self.n("flag"), self.cap("error"), REFUSAL))
+            lines.append("if not %s then %s(%s) end"
+                         % (self.n("flag"), self.cap("error"), self.fail_literal("load")))
         return lines
 
     def neutralise_lines(self) -> List[str]:
-        """Clear a logging metatable and a script hook, where the platform allows.
-
-        Every action is under ``pcall``: ``getrawmetatable`` and ``setreadonly`` are
-        Roblox extensions, and on the reference interpreter calling a nil is an
-        error that would take the script down over a check that was supposed to be
-        optional.  The hook is cleared through whatever ``debug.sethook`` the
-        environment has, which on Roblox is itself protected -- so if it throws, the
-        pcall swallows it and the guard's flag still reflects what was seen.
-        """
-        rawget, pcall, env = self.cap("rawget"), self.cap("pcall"), self.n("env")
-        debug = self.cap("debug")
-        return [
-            f"local raw = ({rawget})({env}, \"getrawmetatable\")",
-            f"local lock = ({rawget})({env}, \"setreadonly\")",
-            f"local unhook = ({debug}) and ({debug}).sethook",
-            "if raw and lock then",
-            f"  ({pcall})(function()",
-            f"    local m = raw({env})",
-            "    if m then",
-            "      lock(m, false)",
-            "      %s(m, \"__index\", nil)" % self.cap("rawset"),
-            "      %s(m, \"__newindex\", nil)" % self.cap("rawset"),
-            "      lock(m, true)",
-            "    end",
-            "  end)",
-            "end",
-            f"if unhook then ({pcall})(unhook, nil) end",
-        ]
+        """No host mutation is emitted.  Kept for callers/tests of old guards."""
+        return []
 
     def entry_lines(self) -> List[str]:
         """The per-call check, at the top of each VM entry point.
@@ -435,8 +450,8 @@ class Guard:
         """
         if not self.refuses:
             return []
-        return ["if not %s() then %s(\"%s\") end"
-                % (self.n("check"), self.cap("error"), REFUSAL)]
+        return ["if not %s() then %s(%s) end"
+                % (self.n("check"), self.cap("error"), self.fail_literal("entry"))]
 
     # -- reporting ---------------------------------------------------------
     def summary(self) -> Dict[str, Any]:
@@ -445,7 +460,7 @@ class Guard:
             "dump_guard": self.dump_level,
             "policy": self.policy,
             "captured": list(self.bound),
-            "surfaces": [f"{t or 'env'}.{n}" for t, n, _ in SURFACES],
+            "surfaces": [f"{t or 'env'}.{n}" for t, n, _ in self.surfaces],
             "refuses": self.refuses,
             "neutralises": self.neutralises,
             # The emitted names, so a report or a verification pass can find the
@@ -471,10 +486,10 @@ class Guard:
             "  bound at load   : %d library name%s; after that the runtime "
             "reads" % (bound, plural),
             "                    locals, which no environment hook can see",
-            "  surfaces checked: %d, at load and at each VM entry"
-            % len(SURFACES),
+            "  surfaces checked: %d dump/debug slots and %d metatable slots"
+            " at load and at each VM entry" % (len(self.surfaces), len(_META_KEYS)),
             "  neutralise      : "
-            + ("yes" if self.neutralises else "no (level 1 observes only)"),
+            + "no (host state is never mutated)",
             "  refuse on trip  : " + refusal,
         ]
 
@@ -491,14 +506,14 @@ def make(env_level: int = 0, dump_level: int = 0, policy: str = "fail",
     if policy not in POLICIES:
         raise ValueError(f"guard_policy must be one of {POLICIES}, got {policy!r}")
     names: Dict[str, str] = {
-        "capture:" + name: (f"{prefix}b{index:02x}" if prefix
+        "capture:" + name: (f"{prefix}{_token(prefix, 'cap:' + name, index)}" if prefix
                             else f"_g{index:02x}")
         for index, name in enumerate(CAPTURED)
     }
     names.update({f"capture:{k}": v for k, v in (capture or {}).items()})
     taken = set(names.values())
-    for role in _ROLES + tuple(f"surface:{i}" for i in range(len(SURFACES))):
-        name = (prefix + _ALIAS[role] if prefix
+    for index, role in enumerate(_ROLES + tuple(f"surface:{i}" for i in range(len(SURFACES)))):
+        name = (prefix + _token(prefix, role, index + 97) if prefix
                 else "_" + _ALIAS[role])
         while name in taken:
             name += "_"
@@ -509,12 +524,34 @@ def make(env_level: int = 0, dump_level: int = 0, policy: str = "fail",
                  policy=policy, names=names)
 
 
+def _token(prefix: str, role: str, salt: int) -> str:
+    """Small deterministic name fragment with no role mnemonic in production.
+
+    The prefix is already per-build; mixing the role through an LCG-derived token
+    keeps reproducibility for a seed while removing stable suffixes like ``_k`` or
+    ``_s0`` that made the guard easy to fingerprint across artifacts.
+    """
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    x = (salt ^ 0xA5A5A5A5) & 0xffffffff
+    for ch in (prefix + role):
+        x ^= (ord(ch) + 0x9E3779B9) & 0xffffffff
+        x = ((x << 13) | (x >> 19)) & 0xffffffff
+        x ^= (x >> 7)
+    chars = []
+    for _ in range(4):
+        x ^= (x << 11) & 0xffffffff
+        x ^= (x >> 17)
+        x ^= (x << 5) & 0xffffffff
+        chars.append(alphabet[x % len(alphabet)])
+    return "".join(chars)
+
 #: Defaults for the guard's own locals.  A build that supplies per-build names
 #: overrides them through ``capture``'s collision loop; these exist so the module
 #: is usable on its own, and so a test failure names the role rather than a hash.
 _ALIAS = {
     "env": "e", "meta": "m", "index": "i", "write": "w",
-    "check": "k", "flag": "f",
+    "namecall": "n", "metaguard": "g", "metamode": "o",
+    "metacall": "c", "rawmeta": "r", "check": "k", "flag": "f",
 }
 for _i in range(len(SURFACES)):
     _ALIAS[f"surface:{_i}"] = f"s{_i}"

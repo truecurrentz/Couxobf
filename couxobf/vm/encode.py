@@ -708,7 +708,7 @@ def _encode_unit(unit: Any, opmap: OpcodeMap, fmt: FormatSpec, target,
     # generated reader, `opcode_at` in the validator), both derived from the same
     # FormatSpec -- so this cannot disagree with the interpreter the way two
     # hand-written halves of a format always eventually do.
-    number = fmt.encode_op(number)
+    number = fmt.encode_op(number, instr_start + 1)
     for i in range(fmt.op_bytes):
         body[i] = (number >> (8 * i)) & 0xFF
     if fmt.pad:

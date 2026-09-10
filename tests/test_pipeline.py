@@ -529,8 +529,6 @@ def test_the_opcode_cipher_is_in_the_reader_not_only_in_the_config():
     half that matters most: a disguise the encoder applies and the interpreter
     forgets is a wrong program, not an insecure one.
     """
-    bare = re.compile(r"function _ro\(a\)\s*return\s+_bd\(\w+,\s*a\)\s*end")
-
     off = build(CIPHER_PROGRAM, _live_config(opcode_cipher=False,
                                              reproducible_seed=4),
                 name="cipher.luau", verify=True)
@@ -538,8 +536,16 @@ def test_the_opcode_cipher_is_in_the_reader_not_only_in_the_config():
                                             reproducible_seed=4),
                name="cipher.luau", verify=True)
     assert off.stats.virtualized >= 1 and on.stats.virtualized >= 1
-    assert bare.search(off.source), "the reader should be a plain byte fetch"
-    assert not bare.search(on.source), "the cipher did not reach the interpreter"
+    for group in off.stats.vm_groups:
+        ro = group["readers"]["ro"]
+        bare = re.compile(r"function %s\(a\)\s*return\s+_bd\(\w+,\s*a\)\s*end"
+                          % re.escape(ro))
+        assert bare.search(off.source), "the reader should be a plain byte fetch"
+    for group in on.stats.vm_groups:
+        ro = group["readers"]["ro"]
+        bare = re.compile(r"function %s\(a\)\s*return\s+_bd\(\w+,\s*a\)\s*end"
+                          % re.escape(ro))
+        assert not bare.search(on.source), "the cipher did not reach the interpreter"
     assert all(g["format"]["op_cipher"] == "none" for g in off.stats.vm_groups)
     assert all(g["format"]["op_cipher"] != "none" for g in on.stats.vm_groups)
     assert "opcode cipher none" in off.report
@@ -583,8 +589,9 @@ def test_the_report_lists_every_vm_group_the_artifact_carries():
                                      dispatcher_family="mixed"),
                 name="maze.luau", verify=False)
     groups = out.stats.vm_groups
-    assert len(groups) == 3, [g.get("family") for g in groups]
-    assert len({(g.get("family"), g.get("dispatcher")) for g in groups}) > 1
+    assert len(groups) == 1, [g.get("family") for g in groups]
+    assert all(g.get("protos", 0) >= 1 for g in groups), groups
+    assert {(g.get("family"), g.get("dispatcher")) for g in groups} == {("woven", "woven")}
     # The group lines are the indented ones; "vm family (config)" is the request,
     # which is a different fact and is printed as such.
     lines = [l for l in out.report.splitlines() if l.startswith("  vm ")]
@@ -612,9 +619,9 @@ def test_the_fingerprint_is_a_digest_of_the_decisions_not_of_the_file():
     assert re.fullmatch(r"[0-9a-f]{16}", base), base
     assert fingerprint(reproducible_seed=7) == base, "not reproducible from the seed"
     assert fingerprint(reproducible_seed=7, instruction_formats=0) != base
-    # A pinned family changes group 0's shape; `vm_variety` would too, but only
-    # once there are two prototypes to spread, and this program has one.
-    assert fingerprint(reproducible_seed=7, vm_family="stack") != base
+    # Legacy family switches now normalize to the same single woven VM.
+    assert fingerprint(reproducible_seed=7, vm_polymorphism=False,
+                       vm_family="stack") == base
     assert fingerprint(reproducible_seed=7, opcode_randomization=False) != base
     assert fingerprint(reproducible_seed=8) != base
 

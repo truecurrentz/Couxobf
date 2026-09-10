@@ -25,20 +25,29 @@ easily.  See ``docs/SECURITY.md`` for the threat model.
 
 from __future__ import annotations
 
+import hashlib
 import struct
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from .crypto.kdf import KeyMaterial
-from .crypto.protected import seal
+from .crypto.protected import ENC_DOMAIN, MAC_DOMAIN, open_, seal
 from .rng import Rng
 
 # Wire format tags.  Kept explicit and stable: the Luau decoder in
-# :mod:`couxobf.runtime.constpool_runtime` matches these numbers.
+# :mod:`couxobf.runtime.constpool_runtime` matches these numbers.  The first
+# four are the historical canonical encodings; the later tags are dynamic
+# encodings drawn per entry so a pool does not reduce to one static parser.
 TAG_NIL = 0
 TAG_BOOL = 1
 TAG_NUM = 2
 TAG_STR = 3
+TAG_NUM_MASKED = 4
+TAG_STR_FRAG = 5
+
+DEFAULT_MASK_MUL = (0x12 << 12) | 0x345
+DEFAULT_MASK_ADD = 0x5BD1E995
+DEFAULT_MASK_SHIFT = 13
 
 # Cache policies for materialized constants.  "none" re-materializes on every
 # read, which leaves the least plaintext sitting in the heap; "full" keeps
@@ -76,10 +85,83 @@ def encode_value(value: Any) -> bytes:
     raise ConstantPoolError(f"cannot encode constant of type {type(value).__name__}")
 
 
+def _mask8(seed: int, mul: int, add: int, shift: int) -> bytes:
+    out = bytearray()
+    x = seed & 0x7FFFFFFF
+    for _ in range(8):
+        x = (x * mul + add) % (1 << 31)
+        out.append((x >> shift) & 0xFF)
+    return bytes(out)
+
+
+
+
+def mask_params(material: bytes) -> tuple[int, int, int]:
+    h = hashlib.sha256(material).digest()
+    mul = (int.from_bytes(h[:3], "big") & 0x1fffff) | 1
+    if mul < 0x10000:
+        mul |= 0x10001
+    if mul == ((0x10 << 16) | 0xd69b):
+        mul ^= 0x2041
+    add = (int.from_bytes(h[3:7], "big") & 0x7fffffff) | 1
+    if add == ((0x30 << 8) | 0x39):
+        add ^= 0x4041
+    shift = 8 + (h[7] & 15)
+    return mul, add, shift
+
+def _xor(a: bytes, b: bytes) -> bytes:
+    return bytes(x ^ y for x, y in zip(a, b))
+
+
 def serialize(values: List[Any]) -> bytes:
     """Serialize a whole pool: a u32 count followed by the tagged entries."""
     out = [struct.pack(">I", len(values))]
     for v in values:
+        out.append(encode_value(v))
+    return b"".join(out)
+
+
+def serialize_dynamic(values: List[Any], rng: Rng,
+                      constant_level: int = 0,
+                      numeric_level: int = 0,
+                      mask_mul: int = DEFAULT_MASK_MUL,
+                      mask_add: int = DEFAULT_MASK_ADD,
+                      mask_shift: int = DEFAULT_MASK_SHIFT) -> bytes:
+    """Serialize the pool with per-entry dynamic encodings when enabled.
+
+    The outer pool remains ChaCha20 + HMAC protected.  These inner encodings are
+    for diversification: each string or number occurrence can carry a different
+    representation that the runtime reconstructs lazily, while booleans/nil keep
+    their tiny canonical form.
+    """
+    out = [struct.pack(">I", len(values))]
+    for v in values:
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and numeric_level > 0:
+            seed = rng.randbelow(0x7FFFFFFF)
+            raw = struct.pack(">d", float(v))
+            out.append(bytes([TAG_NUM_MASKED]) + struct.pack(">I", seed) +
+                       _xor(raw, _mask8(seed, mask_mul, mask_add, mask_shift)))
+            continue
+        if isinstance(v, (bytes, bytearray)) and constant_level >= 2:
+            raw = bytes(v)
+            # Fragment into small independently-masked spans.  Empty strings use
+            # zero fragments and are still represented by the dynamic tag.
+            pos = 0
+            pieces = []
+            while pos < len(raw):
+                size = min(len(raw) - pos, 1 + rng.randbelow(9))
+                seed = rng.randbelow(0x7FFFFFFF)
+                mask = _mask8(seed, mask_mul, mask_add, mask_shift)
+                piece = raw[pos:pos + size]
+                masked = bytes(b ^ mask[i % 8] for i, b in enumerate(piece))
+                pieces.append((seed, masked))
+                pos += size
+            buf = bytearray([TAG_STR_FRAG])
+            buf += struct.pack(">H", len(pieces))
+            for seed, masked in pieces:
+                buf += struct.pack(">IH", seed, len(masked)) + masked
+            out.append(bytes(buf))
+            continue
         out.append(encode_value(v))
     return b"".join(out)
 
@@ -93,13 +175,19 @@ class SealedPool:
     tag: bytes
     ciphertext: bytes
     aad: bytes
+    enc_domain: bytes
+    mac_domain: bytes
+    mask_mul: int
+    mask_add: int
+    mask_shift: int
     count: int
 
     def open_plaintext(self) -> bytes:
         """Decrypt on the Python side -- used to cross-check the Luau runtime."""
         from .crypto.protected import open_
 
-        return open_(self.key, self.nonce, self.ciphertext, self.tag, self.aad)
+        return open_(self.key, self.nonce, self.ciphertext, self.tag, self.aad,
+                     enc_domain=self.enc_domain, mac_domain=self.mac_domain)
 
 
 class ConstantPool:
@@ -113,6 +201,10 @@ class ConstantPool:
         cache_policy: str = "full",
         cache_bound: int = 64,
         decoys: int = 0,
+        constant_level: int = 0,
+        numeric_level: int = 0,
+        enc_domain: bytes = None,
+        mac_domain: bytes = None,
     ) -> None:
         if cache_policy not in CACHE_POLICIES:
             raise ConstantPoolError(f"unknown cache policy {cache_policy!r}")
@@ -121,8 +213,12 @@ class ConstantPool:
         self.context = context
         self.cache_policy = cache_policy
         self.cache_bound = cache_bound
+        self.constant_level = max(0, min(3, int(constant_level)))
+        self.numeric_level = max(0, min(3, int(numeric_level)))
+        self.enc_domain = enc_domain
+        self.mac_domain = mac_domain
         self._values: List[Any] = []
-        self._index: Dict[Any, int] = {}
+        self._index: Dict[Tuple[Any, ...], int] = {}
         self._sealed: Optional[SealedPool] = None
         # See :meth:`_plant_decoys`.  The budget is per build, not per prototype,
         # because a fixed number per function would make the decoy count a
@@ -240,20 +336,35 @@ class ConstantPool:
             return self._sealed
         if not self._values:
             raise ConstantPoolError("refusing to seal an empty pool")
-        plaintext = serialize(self._values)
         # A fresh key per pool region, and a random nonce per build: reusing a
         # (key, nonce) pair across two different pools would leak their XOR.
         region = self.rng.bytes(16)
         key = self.keys.region_key("constants", region)
         nonce = self.rng.bytes(12)
-        aad = b"couxobf/constpool/v1\0" + self.context
-        nonce_out, ciphertext, tag = seal(key, plaintext, aad, nonce=nonce)
+        aad = hashlib.sha256(b"pool-aad" + self.context + region).digest()
+        self._mask_mul, self._mask_add, self._mask_shift = mask_params(key + nonce + aad)
+        plaintext = serialize_dynamic(self._values, self.rng,
+                                      constant_level=self.constant_level,
+                                      numeric_level=self.numeric_level,
+                                      mask_mul=self._mask_mul,
+                                      mask_add=self._mask_add,
+                                      mask_shift=self._mask_shift)
+        enc_domain = self.enc_domain if self.enc_domain is not None else ENC_DOMAIN
+        mac_domain = self.mac_domain if self.mac_domain is not None else MAC_DOMAIN
+        nonce_out, ciphertext, tag = seal(key, plaintext, aad, nonce=nonce,
+                                          enc_domain=enc_domain,
+                                          mac_domain=mac_domain)
         self._sealed = SealedPool(
             key=key,
             nonce=nonce_out,
             tag=tag,
             ciphertext=ciphertext,
             aad=aad,
+            enc_domain=enc_domain,
+            mac_domain=mac_domain,
+            mask_mul=self._mask_mul,
+            mask_add=self._mask_add,
+            mask_shift=self._mask_shift,
             count=len(self._values),
         )
         return self._sealed
@@ -263,7 +374,9 @@ class ConstantPool:
         return serialize(self._values)
 
 
-def decode_pool(plaintext: bytes) -> List[Any]:
+def decode_pool(plaintext: bytes, mask_mul: int = DEFAULT_MASK_MUL,
+                mask_add: int = DEFAULT_MASK_ADD,
+                mask_shift: int = DEFAULT_MASK_SHIFT) -> List[Any]:
     """Python mirror of the Luau decoder, used to verify the two agree."""
     if len(plaintext) < 4:
         raise ConstantPoolError("truncated pool header")
@@ -287,6 +400,25 @@ def decode_pool(plaintext: bytes) -> List[Any]:
             pos += 4
             out.append(plaintext[pos : pos + length])
             pos += length
+        elif tag == TAG_NUM_MASKED:
+            (seed,) = struct.unpack_from(">I", plaintext, pos)
+            pos += 4
+            raw = _xor(plaintext[pos:pos + 8], _mask8(seed, mask_mul, mask_add, mask_shift))
+            pos += 8
+            (value,) = struct.unpack(">d", raw)
+            out.append(value)
+        elif tag == TAG_STR_FRAG:
+            (count_frag,) = struct.unpack_from(">H", plaintext, pos)
+            pos += 2
+            buf = bytearray()
+            for _frag in range(count_frag):
+                seed, length = struct.unpack_from(">IH", plaintext, pos)
+                pos += 6
+                mask = _mask8(seed, mask_mul, mask_add, mask_shift)
+                piece = bytes(b ^ mask[i % 8] for i, b in enumerate(plaintext[pos:pos + length]))
+                pos += length
+                buf += piece
+            out.append(bytes(buf))
         else:
             raise ConstantPoolError(f"unknown constant tag {tag}")
     if pos != len(plaintext):

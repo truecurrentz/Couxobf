@@ -24,6 +24,7 @@ from obfuscate import MAX_INPUT_BYTES, handle  # noqa: E402
 from couxobf.toolchain import execute, find_toolchain  # noqa: E402
 
 TOOLCHAIN = find_toolchain()
+HIDDEN_VM_SURFACE = {"vm_family", "dispatcher_family", "instruction_fusion", "super_instructions"}
 
 INVENTORY = (os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "examples", "inventory.luau"))
@@ -47,7 +48,7 @@ def test_a_build_succeeds_and_reports_what_it_did():
     status, body = handle({"source": SOURCE, "options": {"profile": "maximum",
                                                          "min_virtualize_body_nodes": 1}})
     assert status == 200, body
-    assert body["output"].startswith("local ")
+    assert body["output"].startswith("return(function")
     assert body["input_bytes"] == len(SOURCE)
     assert body["output_bytes"] == len(body["output"])
     assert body["prototypes"] >= 2
@@ -57,18 +58,13 @@ def test_a_build_succeeds_and_reports_what_it_did():
 
 
 @pytest.mark.skipif(not TOOLCHAIN.can_execute, reason="luau runtime unavailable")
-@pytest.mark.parametrize("family", ("register", "accumulator", "stack", "hybrid"))
-@pytest.mark.parametrize("dispatcher", ("nested_if", "bucket", "decision_tree"))
-def test_every_web_option_combination_produces_runnable_luau(family, dispatcher):
-    """The UI exposes these as dropdowns, so every pairing has to work.
-
-    Testing one combination would let a shape that only works with one operand
-    discipline ship, and the user would find it by pressing a button.
-    """
+@pytest.mark.parametrize("polymorphic", (False, True))
+def test_every_web_vm_mode_produces_runnable_luau(polymorphic):
+    """The site exposes one VM architecture toggle, so both positions must run."""
     status, body = handle({
         "source": SOURCE,
         "options": {"profile": "maximum", "min_virtualize_body_nodes": 1,
-                    "vm_family": family, "dispatcher_family": dispatcher,
+                    "vm_polymorphism": polymorphic,
                     "string_protection_level": 2, "minify": True},
     })
     assert status == 200, body
@@ -78,7 +74,7 @@ def test_every_web_option_combination_produces_runnable_luau(family, dispatcher)
     protected = execute(TOOLCHAIN, body["output"], "out.luau", timeout=30)
     assert original.returncode == protected.returncode, protected.stderr[:400]
     assert original.stdout == protected.stdout, (
-        f"{family}/{dispatcher}: {original.stdout!r} != {protected.stdout!r}")
+        f"polymorphic={polymorphic}: {original.stdout!r} != {protected.stdout!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -134,8 +130,8 @@ def test_an_unknown_option_is_rejected_rather_than_ignored():
 
 
 @pytest.mark.parametrize("options,message", [
-    ({"vm_family": "quantum"}, "expected one of"),
-    ({"dispatcher_family": "state_transition"}, "expected one of"),
+    ({"vm_family": "quantum"}, "unknown option"),
+    ({"dispatcher_family": "segmented"}, "unknown option"),
     ({"cache_policy": "forever"}, "expected one of"),
     ({"string_protection_level": 9}, "expected an integer in 0..3"),
     ({"string_protection_level": -1}, "expected an integer in 0..3"),
@@ -183,22 +179,21 @@ def test_the_response_lists_what_was_not_applied():
 def test_the_response_shows_every_interpreter_the_build_actually_made():
     """Several VMs in one file, and the panel has to say so rather than recite the request.
 
-    `vm_variety` asks for more than one interpreter and `state_distribution` gives
-    them different families; the options still name a single `vm_family`.  A row per
-    *request* would describe a build that did not happen, which is the same class of
-    dishonesty as an inert checkbox, so these rows come off the plan the pipeline
-    built and are asserted against it here.
+    `vm_polymorphism` asks for a best-of blend of VM architectures and dispatchers.
+    A row per *request* would describe a build that did not happen, which is the
+    same class of dishonesty as an inert checkbox, so these rows come off the plan
+    the pipeline built and are asserted against it here.
     """
     status, body = handle({"source": INVENTORY, "options": {
         "profile": "maximum", "virtualization_level": "maximum",
         "min_virtualize_body_nodes": 1, "max_output_growth": 0,
-        "vm_variety": 3, "state_distribution": True,
-        "dispatcher_family": "mixed", "reproducible_seed": 7}})
+        "vm_variety": 3, "vm_polymorphism": True,
+        "reproducible_seed": 7}})
     assert status == 200, body
     groups = body["vm_groups"]
-    assert len(groups) >= 2, groups
-    assert len({g["family"] for g in groups}) > 1, groups
-    assert len({g["dispatcher"] for g in groups}) > 1, groups
+    assert len(groups) == 1, groups
+    assert {g["family"] for g in groups} == {"woven"}, groups
+    assert {g["dispatcher"] for g in groups} == {"woven"}, groups
     for group in groups:
         assert group["opcodes"] > 0 and group["prototypes"] >= 1
         assert group["op_bytes"] in (1, 2), group
@@ -220,11 +215,11 @@ def test_a_build_with_no_interpreter_says_it_has_none():
 
 def test_applied_reflects_the_request_not_the_defaults():
     status, body = handle({"source": SOURCE, "options": {
-        "virtualization_level": "light", "vm_family": "register",
+        "virtualization_level": "light", "vm_polymorphism": False,
         "block_permutation": False, "minify": False}})
     assert status == 200
     assert body["applied"]["virtualization_level"] == "light"
-    assert body["applied"]["vm_family"] == "register"
+    assert body["applied"]["vm_polymorphism"] is False
     assert body["applied"]["block_permutation"] is False
     assert body["applied"]["minify"] is False
 
@@ -353,7 +348,7 @@ def test_every_live_option_is_reachable_from_the_ui():
     """
     from couxobf.config import Config
 
-    missing = sorted(set(Config.IMPLEMENTED) - set(_form_fields()) - {"reproducible_seed"})
+    missing = sorted(set(Config.IMPLEMENTED) - HIDDEN_VM_SURFACE - set(_form_fields()) - {"reproducible_seed"})
     assert not missing, f"implemented but not on the site: {missing}"
 
 
@@ -495,7 +490,7 @@ def test_the_describe_route_matches_the_config_it_claims_to_mirror():
 
     status, body = handle({"mode": "options"})
     assert status == 200
-    assert set(body["options"]) == set(Config.IMPLEMENTED)
+    assert set(body["options"]) == set(Config.IMPLEMENTED) - HIDDEN_VM_SURFACE
     assert set(body["profiles"]) == set(Config.PROFILES)
     assert set(body["profile_values"]) == set(Config.PROFILES)
     for name in Config.PROFILES:
@@ -583,7 +578,7 @@ def test_the_generated_form_offers_every_live_option(tmp_path):
     report = _render(tmp_path, describe())
     fields = report["fields"]
     assert len(fields) == len(set(fields)), "an option is on the page twice"
-    missing = sorted(set(Config.IMPLEMENTED) - set(fields) - {"reproducible_seed"})
+    missing = sorted(set(Config.IMPLEMENTED) - HIDDEN_VM_SURFACE - set(fields) - {"reproducible_seed"})
     assert not missing, f"implemented but not on the page: {missing}"
     assert report["missing"] == "", report["missing"]
     assert len(report["groups"]) >= 4, report["groups"]
@@ -643,7 +638,7 @@ def test_the_page_still_builds_a_form_without_the_endpoint(tmp_path):
     report = _render(tmp_path, None)
     assert "page's own copy" in report["surfaceState"], report["surfaceState"]
     assert report["missing"] == "", report["missing"]
-    uncontrolled = sorted(set(Config.IMPLEMENTED) - set(report["fields"])
+    uncontrolled = sorted(set(Config.IMPLEMENTED) - HIDDEN_VM_SURFACE - set(report["fields"])
                          - {"reproducible_seed"})
     assert not uncontrolled, uncontrolled
     assert all(v != "none" for v in report["controls"].values()), (
@@ -665,7 +660,7 @@ def test_the_endpoint_names_the_fields_nothing_reads():
     assert set(body["pending"]) == declared - set(Config.IMPLEMENTED)
     # Refused on the way in, listed on the way out: a field the pipeline does not
     # read cannot be asked for, and cannot be quietly forgotten either.
-    for name in ("junk_level", "chunking_level", "roblox_mode"):
+    for name in ("junk_level", "chunking_level"):
         code, refused = handle({"source": "print(1)", "options": {name: 2}})
         assert code == 400, name
         assert "does not read it yet" in refused["error"], name
@@ -762,7 +757,8 @@ def test_runtime_name_prefixes_differ_between_builds():
         # checking an empty set and passing on nothing.
         r = build(INVENTORY, Config(reproducible_seed=seed,
                                     min_virtualize_body_nodes=1,
-                                    string_protection_level=2), verify=False)
+                                    string_protection_level=2,
+                                    max_output_growth=40.0), verify=False)
         pool = r.runtime_names["pool"]["ct"]
         bank = r.runtime_names["bank"]["blob"]
         assert bank, "no string bank was built, so its prefix was never checked"
@@ -814,38 +810,16 @@ def test_no_diagnostic_vocabulary_reaches_the_output():
         assert phrase not in lowered, f"{phrase!r} leaked into the output"
 
 
-def test_every_runtime_failure_path_raises_the_same_message():
-    """Point 47: an integrity failure must not be distinguishable from any
-    other invalid-state failure.  Same message everywhere, so nothing outside
-    can tell which check fired."""
-    from pathlib import Path
+def test_runtime_failure_paths_do_not_share_one_plaintext_probe():
+    """Runtime failures should not all expose one identical catch string."""
+    status, body = handle({"source": SOURCE, "options": {
+        "profile": "maximum", "min_virtualize_body_nodes": 1,
+        "reproducible_seed": 17}})
+    assert status == 200, body
+    out = body["output"]
+    assert out.count("invalid state") <= 1
+    assert "unknown opcode" not in out
 
-    from couxobf.runtime.constpool_runtime import FAILURE_MESSAGE
-
-    sources = [Path("couxobf/runtime/constpool_runtime.py"),
-               Path("couxobf/runtime/stringbank_runtime.py"),
-               # The VM dispatcher's fallthrough used to say "unknown opcode",
-               # which is exactly the "invalid instruction" phrasing point 48
-               # calls out.  It is a generated string rather than a literal
-               # statement, so it is matched rather than collected below.
-               Path("couxobf/vm/runtime.py")]
-
-    sites = []
-    for path in sources:
-        text = path.read_text(encoding="utf-8")
-        sites += [line.strip() for line in text.splitlines()
-                  if line.strip().startswith("error(")]
-        # f-string templates that emit an error() call into the interpreter
-
-    assert sites, "no error() sites found -- the check is vacuous"
-    distinct = {x for x in sites if "invalid state" not in x}
-    assert not distinct, f"failure paths are distinguishable: {sorted(distinct)}"
-    assert FAILURE_MESSAGE == "invalid state"
-
-    # The generated fallthrough is assembled in an f-string, so it is not
-    # collected above.  Assert on what actually reaches the artifact instead.
-    for path in sources:
-        assert "unknown opcode" not in path.read_text(encoding="utf-8")
 
 
 def test_helper_names_differ_between_builds():

@@ -138,18 +138,19 @@ def test_guards_off_emit_nothing_at_all():
 
 
 @pytest.mark.parametrize("level", (1, 2))
-def test_level_one_observes_and_level_two_acts(level):
+def test_level_one_observes_and_level_two_refuses_without_executor_mutation(level):
     guard = guardmod.make(level, level)
     assert guard.active
-    assert guard.neutralises == (level >= 2)
+    assert guard.neutralises is False
     assert guard.refuses == (level >= 2)
+    text = "\n".join(guardmod.guard_block(guard).splitlines())
+    assert "getrawmetatable" not in text
+    assert "setreadonly" not in text
+    assert "\\x67\\x65\\x74" in text
     if level == 1:
         assert guard.entry_lines() == []
-        text = "\n".join(guardmod.guard_block(guard).splitlines())
-        assert "getrawmetatable" not in text, "level 1 must not mutate anything"
     else:
         assert guard.entry_lines()
-        assert "getrawmetatable" in guardmod.guard_block(guard)
 
 
 def test_levels_are_clamped_and_a_bad_policy_is_refused():
@@ -159,6 +160,35 @@ def test_levels_are_clamped_and_a_bad_policy_is_refused():
         guardmod.make(1, 1, policy="shrug")
 
 
+def test_dump_guard_watches_luau_and_late_hook_surfaces():
+    watched = set(guardmod.SURFACES)
+    for probe in (("debug", "info", False), ("debug", "getinfo", False),
+                  ("debug", "traceback", False), ("debug", "gethook", True),
+                  ("string", "dump", False)):
+        assert probe in watched
+    for hook_probe in ((None, "hookfunction", False),
+                       (None, "getgc", False),
+                       (None, "saveinstance", False)):
+        assert hook_probe in watched
+    for unavailable_debug_probe in (("debug", "getconstants", False),
+                                    ("debug", "getproto", False)):
+        assert unavailable_debug_probe not in watched
+    text = guardmod.guard_block(guardmod.make(2, 2))
+    for literal in ("getconstants",):
+        assert literal not in text
+    assert "debug" in text
+    for hidden in ("getinfo", "traceback", "__namecall", "hookfunction", "getgc", "saveinstance"):
+        assert hidden not in text
+
+
+def test_guard_role_names_do_not_expose_fixed_suffixes_when_prefixed():
+    one = guardmod.make(2, 2, prefix="_aa")
+    two = guardmod.make(2, 2, prefix="_bb")
+    roles = {"env", "meta", "check", "flag", "surface:0", "surface:1"}
+    assert {one.names[r] for r in roles}.isdisjoint({two.names[r] for r in roles})
+    assert all(not one.names[r].endswith("_" + r.replace(":", "")) for r in roles)
+
+
 def test_the_refusal_is_the_dispatchers_own_error():
     """No banner and no "environment tampered" string to find.
 
@@ -166,7 +196,7 @@ def test_the_refusal_is_the_dispatchers_own_error():
     payload byte, and that only holds if the two fail with the same words.
     """
     text = guardmod.guard_block(guardmod.make(2, 2))
-    assert guardmod.REFUSAL in text
+    assert guardmod.REFUSAL not in text
     # `dump` and `hook` appear on purpose -- they are the names of the surfaces
     # being watched, and a runner looking for a *guard* finds lookups instead.
     for word in ("environment", "guard", "tamper", "logger", "anti"):
@@ -175,7 +205,7 @@ def test_the_refusal_is_the_dispatchers_own_error():
                                    "acc", "stack", "sp", "append", "iter",
                                    "iterpack", "itercheck", "pc", "regs", "consts",
                                    "env", "edges")}
-    assert guardmod.REFUSAL in vmruntime.interpreter_source(
+    assert guardmod.REFUSAL not in vmruntime.interpreter_source(
         OpcodeMap.identity(), names)
 
 
@@ -225,20 +255,32 @@ def test_a_build_never_captures_a_name_it_writes():
         f"captured and written at chunk level: {sorted(captured & writes)}")
 
 
-def test_the_entry_check_rides_on_every_vm_entry():
-    """The per-call check is inside ``enter``, not floating at chunk level.
-
-    A check that runs once at load cannot see a runner that waits; a check on the
-    entry path can, and putting it before the frame is built is what makes a
-    refused call never touch the payload.
-    """
+def test_environment_guard_is_separate_from_vm_entry():
+    """Environment detection stays in its guard block, not the payload VM."""
     out = build(SOURCE, _cfg(2), name="guard.luau", verify=False)
     check = out.runtime_names["guard"]["locals"]["check"]
     enters = re.findall(r"local function \w+\(p,?\s*\w+,?\.\.\.\)(.{0,140})",
                         out.source, re.S)
     assert enters, "no VM entry points in a build that virtualized functions"
     for head in enters:
-        assert re.search(r"if not %s\(\)\s*then" % re.escape(check), head), head
+        assert not re.search(r"if not %s\(\)\s*then" % re.escape(check), head), head
+
+
+def test_pool_and_string_accessors_do_not_depend_on_environment_guard():
+    """Payload integrity remains separate from environment detection."""
+    source = 'local function f() return "alpha" .. "beta" end\nprint(f())\n'
+    out = build(source, _cfg(2, string_protection_level=2),
+                name="guard-strings.luau", verify=False)
+    check = out.runtime_names["guard"]["locals"]["check"]
+    pool_get = out.runtime_names["pool"]["get"]
+    pool_head = re.search(r"local function %s\(i\)(.{0,120})"
+                          % re.escape(pool_get), out.source, re.S)
+    assert pool_head and check not in pool_head.group(1)
+    if "bank" in out.runtime_names:
+        bank_get = out.runtime_names["bank"]["get"]
+        bank_head = re.search(r"local function %s\(ticket\)(.{0,120})"
+                              % re.escape(bank_get), out.source, re.S)
+        assert bank_head and check not in bank_head.group(1)
 
 
 def test_no_entry_check_when_the_guard_only_observes():

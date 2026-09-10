@@ -23,6 +23,7 @@ error, which is confidentiality without integrity.
 """
 
 import os
+import re
 import struct
 import sys
 
@@ -36,8 +37,7 @@ from couxobf.crypto.protected import open_
 from couxobf.runtime.luau_crypto import crypto_runtime
 from couxobf.runtime.constpool_runtime import FAILURE_MESSAGE
 from couxobf.runtime.stringbank_runtime import StringBankRuntime, default_names
-from couxobf.strings.bank import (MASK_MOD, MASK_MUL, StringBank,
-                                  StringBankError)
+from couxobf.strings.bank import MASK_MOD, StringBank, StringBankError
 from couxobf.toolchain import execute, find_toolchain
 
 TOOLCHAIN = find_toolchain()
@@ -60,11 +60,12 @@ def make_bank(seed=b"\x33" * 16, page_size=256, **kw):
                       b"test-ctx", page_size=page_size, **kw)
 
 
-def emit(sealed, names, cache_policy="none"):
+def emit(sealed, names, cache_policy="none", ticket_mask=0):
     """The bank runtime plus a shared crypto module, as Luau source."""
     crypto = crypto_runtime({k: names["c_" + k]
                              for k in ("xor", "sha", "mac", "open", "seal")})
-    return StringBankRuntime(names, cache_policy=cache_policy).emit(sealed, crypto)
+    return StringBankRuntime(names, cache_policy=cache_policy).emit(
+        sealed, crypto, ticket_mask=ticket_mask)
 
 
 def lit(raw: bytes) -> str:
@@ -161,13 +162,13 @@ def test_no_fragment_straddles_a_page():
 
 
 def test_mask_stays_exact_under_doubles():
-    """Luau numbers are exact only below 2^53.
-
-    The usual glibc LCG multiplier (1103515245) would reach ~2^61 and silently
-    round, so the Python mask and the Luau mask would disagree.
-    """
-    worst = (MASK_MOD - 1) * MASK_MUL + 12345
+    bank = StringBank(KeyMaterial.from_seed(b"\x21" * 16),
+                      rngmod.make_domains(b"\x22" * 16).get("strings"), b"c")
+    bank.ticket("abc")
+    sealed = bank.seal()
+    worst = (MASK_MOD - 1) * sealed.mask_mul + sealed.mask_add
     assert worst < 2 ** 53, f"mask intermediate {worst} is not exact in Luau"
+    assert (sealed.mask_mul, sealed.mask_add) != (((0x10 << 16) | 0xd69b), ((0x30 << 8) | 0x39))
 
 
 def test_page_size_constraints():
@@ -244,6 +245,49 @@ def test_runtime_resolves_every_ticket(policy):
     assert "BAD" not in result.stdout, (
         f"cache_policy={policy}: {result.stdout[:300]}")
     assert "resolved" in result.stdout
+
+
+def test_runtime_accepts_build_specific_ticket_images():
+    if not TOOLCHAIN.can_execute:
+        pytest.skip("luau runtime not available; run tools/setup-luau.sh")
+    bank = make_bank(randomized_ids=True)
+    raw = bank.ticket(b"ticketed string")
+    sealed = bank.seal()
+    mask = 0x13579BDF
+    names = default_names()
+    src = emit(sealed, names, ticket_mask=mask)
+    src += 'print(%s(%d) == %s)\n' % (names["get"], raw ^ mask,
+                                      lit(b"ticketed string"))
+    result = execute(TOOLCHAIN, src, "ticketed-bank.luau", timeout=30)
+    assert result.returncode == 0, result.stderr[:300]
+    assert result.stdout.strip() == "true"
+
+
+def test_string_bank_key_material_is_not_emitted_as_adjacent_named_locals():
+    bank = make_bank(randomized_ids=True)
+    bank.ticket(b"alpha")
+    sealed = bank.seal()
+    names = default_names()
+    src = emit(sealed, names)
+    assert "local %s =" % names["meta"] in src
+    for key in ("tkey", "tnonce", "ttag", "tct", "skey", "snonce", "bkey", "btag"):
+        assert "local %s =" % names[key] not in src
+
+
+
+def test_reconstructed_string_calls_do_not_expose_raw_bank_tickets():
+    runtime_names = {}
+    out = _protected('local function f() return "left" .. "right" end\nprint(f())\n',
+                     names_out=runtime_names)
+    mask = runtime_names["bank_ticket_mask"]
+    assert mask
+    assert "bit32.bxor(ticket," in out
+    assert "ticket % 3" not in out
+    assert "couxobf/stringbank" not in out
+    # Raw ticket ids are encrypted into the ticket table; call sites carry their
+    # build-specific images, so an argument scrape is not the runtime index map.
+    for raw in re.findall(r"ix\[(\d+)\]", out):
+        assert int(raw) ^ mask != int(raw)
 
 
 def test_repeated_reads_are_stable_under_every_policy():

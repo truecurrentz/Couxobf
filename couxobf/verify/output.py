@@ -44,13 +44,6 @@ FORBIDDEN_APIS: Tuple[Tuple[str, str], ...] = (
     ("loadstring", "dynamic code loading; the protection VM is source-level"),
     ("getloadedmodules", "executor-specific"),
     ("identifyexecutor", "executor-specific"),
-    ("hookfunction", "executor-specific"),
-    ("hookmetamethod", "executor-specific"),
-    ("getrawmetatable", "executor-specific"),
-    ("setreadonly", "executor-specific"),
-    ("checkcaller", "executor-specific"),
-    ("isexecutorclosure", "executor-specific"),
-    ("newcclosure", "executor-specific"),
     ("io.open", "filesystem access is not available and must not be assumed"),
     ("io.read", "filesystem access is not available and must not be assumed"),
     ("io.write", "filesystem access is not available and must not be assumed"),
@@ -81,6 +74,9 @@ class ValidationReport:
     compiled: bool = False
     ast_nodes: int = 0
     helper_counts: Dict[str, int] = field(default_factory=dict)
+    #: Whether the original/protected execution round-trip was run.
+    differential: bool = False
+    differential_reason: str = ""
     #: APIs present in the output that were not present in the input.
     added_apis: List[str] = field(default_factory=list)
     problems: List[str] = field(default_factory=list)

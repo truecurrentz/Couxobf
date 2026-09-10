@@ -278,6 +278,20 @@ def test_luau_decoder_matches_python(policy):
     assert not bad, f"policy={policy}: {bad}"
 
 
+def test_runtime_literals_are_masked_fragments_not_whole_blobs():
+    pool = make_pool()
+    for v in TRICKY:
+        pool.slot(v)
+    sealed = pool.seal()
+    names = default_names()
+    rt = ConstantPoolRuntime(names)
+    src = rt.emit(sealed.key, sealed.nonce, sealed.tag, sealed.ciphertext, sealed.aad)
+    assert names["lit"] in src
+    literal = lambda raw: '"' + "".join("\\x%02x" % b for b in raw) + '"'
+    for blob in (sealed.key, sealed.nonce, sealed.tag, sealed.ciphertext, sealed.aad):
+        assert literal(blob) not in src
+
+
 def test_tampering_with_the_pool_is_detected():
     """The tag covers the ciphertext; flipping a bit must stop the runtime
     rather than hand back garbage constants."""
@@ -307,7 +321,7 @@ def test_wrong_aad_is_rejected():
     sealed = pool.seal()
     rt = ConstantPoolRuntime(default_names())
     src = rt.emit(sealed.key, sealed.nonce, sealed.tag, sealed.ciphertext,
-                  b"couxobf/constpool/v1\0stolen-build")
+                  b"stolen-build" + b"\x00" * 7)
     src += f"\nprint({rt.accessor}(1))\n"
     result = execute(TOOLCHAIN, src, "pool.luau", timeout=30)
     assert result.returncode != 0
@@ -337,6 +351,23 @@ def test_protected_output_contains_no_plaintext_constants():
     # string values, table keys and method names all live in the pool
     for needle in ("a distinctive marker", "hunter2", "alpha", "beta", "gamma"):
         assert needle not in out, f"{needle!r} leaked into the protected output"
+
+
+def test_pool_call_sites_use_per_build_tickets_not_raw_slots():
+    src = 'local a = "one"\nlocal b = "two"\nprint(a, b, 123)\n'
+    seed = b"\x42" * 16
+    runtime_names = {}
+    out = lower_back.reconstruct_protected(
+        ir.Lowerer().lower(parser.parse(src, "tickets.luau")),
+        KeyMaterial.from_seed(seed),
+        make_domains(seed).get("constants"),
+        b"tickets",
+        names_out=runtime_names,
+    )
+    get = runtime_names["pool"]["get"]
+    assert "bit32.bxor(i," in out, "runtime should deticket pool requests"
+    assert f"{get}(1)" not in out
+    assert f"{get}(2)" not in out
 
 
 def test_global_names_remain_visible_and_why():

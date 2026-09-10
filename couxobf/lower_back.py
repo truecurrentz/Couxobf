@@ -174,14 +174,40 @@ def _fusion_rules(level: Any):
     return FUSION_RULES
 
 
+def _helper_variant(h: Dict[str, str], role: str, modulo: int) -> int:
+    """Deterministic per-build helper layout selector."""
+    seed = role + "|" + "|".join(h.get(k, "") for k in sorted(h))
+    x = 2166136261
+    for ch in seed:
+        x = ((x ^ ord(ch)) * 16777619) & 0xffffffff
+    return x % modulo
+
+
 def helpers_src(h: Dict[str, str]) -> str:
     """The shared helper block, with this build's names."""
+    pack_variant = _helper_variant(h, "pack", 3)
+    unpack_variant = _helper_variant(h, "unpack", 2)
+    append_variant = _helper_variant(h, "append", 3)
+    if pack_variant == 0:
+        pack_body = "return table.pack(...)"
+    elif pack_variant == 1:
+        pack_body = "local t={...};t.n=select(\"#\",...);return t"
+    else:
+        pack_body = "local n=select(\"#\",...);local t={...};t.n=n;return t"
+    unpack_body = ("return table.unpack(t, i, t.n)" if unpack_variant == 0
+                   else "local a=i or 1;return table.unpack(t,a,t.n)")
+    if append_variant == 0:
+        append_body = "local n=#dst\n      for i = 1, t.n do\n        n += 1\n        dst[n] = t[i]\n      end"
+    elif append_variant == 1:
+        append_body = "local n=#dst;local i=1\n      while i <= t.n do\n        n += 1;dst[n]=t[i];i += 1\n      end"
+    else:
+        append_body = "local n=#dst\n      for i = 1, t.n do dst[n + i] = t[i] end"
     return f"""
     local function {h['pack']}(...)
-      return table.pack(...)
+      {pack_body}
     end
     local function {h['unpack']}(t, i)
-      return table.unpack(t, i, t.n)
+      {unpack_body}
     end
     local function {h['iter']}(v)
       -- Luau's generalized iteration.  The order matters: __iter wins over
@@ -233,11 +259,7 @@ def helpers_src(h: Dict[str, str]) -> str:
       error("attempt to iterate over a " .. ty .. " value")
     end
     local function {h['append']}(dst, t)
-      local n = #dst
-      for i = 1, t.n do
-        n += 1
-        dst[n] = t[i]
-      end
+      {append_body}
     end
     """
 
@@ -293,7 +315,10 @@ class Reconstructor:
     def __init__(self, pool: Any = None, accessor: Optional[str] = None,
                  vm: Any = None, bank: Any = None,
                  bank_accessor: Optional[str] = None,
-                 helpers: Optional[Dict[str, str]] = None) -> None:
+                 helpers: Optional[Dict[str, str]] = None,
+                 native_prefix: str = PREFIX,
+                 pool_ticket: Optional[Any] = None,
+                 bank_ticket: Optional[Any] = None) -> None:
         """``pool`` is a :class:`~couxobf.constpool.ConstantPool`.
 
         When one is supplied, no literal reaches the output: every constant is
@@ -312,11 +337,16 @@ class Reconstructor:
         self.snapshots: Dict[Tuple[int, int], str] = {}
         self.pool = pool
         self.accessor = accessor
+        #: Slot numbers are not passed to the runtime directly.  The pool
+        #: accessor receives a per-build ticket and decodes it locally, so a dump
+        #: of call-site constants is not an index over the decrypted table.
+        self.pool_ticket = pool_ticket or (lambda slot: slot)
         self.vm = vm
         #: The shared helpers' names for this build.  Must match what
         #: ``helpers_src`` declared, or the interpreter calls functions that do
         #: not exist -- which is a runtime error, not a build error.
         self.helpers: Dict[str, str] = dict(helpers or DEFAULT_HELPERS)
+        self.native_prefix = native_prefix
         #: proto_id -> EncodedProto, filled in as function_expr runs
         self.vm_encoded: Dict[int, Any] = {}
         #: Randomness for per-prototype layout choices (padding bytes, alias
@@ -331,6 +361,7 @@ class Reconstructor:
         #: call costs far more than it hides.
         self.bank = bank
         self.bank_accessor = bank_accessor
+        self.bank_ticket = bank_ticket or (lambda ticket: ticket)
         if (pool is None) != (accessor is None):
             raise ReconstructionError("pool and accessor must be given together")
 
@@ -344,7 +375,7 @@ class Reconstructor:
             wrapper = self._vm_closure(proto)
             if wrapper is not None:
                 return wrapper
-        params = [A.Param(name=param_name(proto.proto_id, i))
+        params = [A.Param(name=self._param_name(proto.proto_id, i))
                   for i in range(proto.num_params)]
         if proto.is_vararg:
             params.append(A.Param(name=None))
@@ -401,7 +432,7 @@ class Reconstructor:
             body=A.Block(body=[A.Return(values=[A.Call(
                 fn=A.Name(name=enter),
                 args=[A.Index(obj=A.Name(name=self.vm.rows_table),
-                              key=_num(proto.proto_id)),
+                              key=_num(self.vm.row_key(proto.proto_id))),
                       A.Call(fn=A.Name(name=self.vm.names["getfenv"]),
                              args=[_num(1)]),
                       A.Vararg()])])]))
@@ -416,8 +447,17 @@ class Reconstructor:
         walk(module.main, None)
 
     # -- addressing ------------------------------------------------------
+    def _regs_name(self, proto_id: int) -> str:
+        return f"{self.native_prefix}r{proto_id}"
+
+    def _pc_name(self, proto_id: int) -> str:
+        return f"{self.native_prefix}c{proto_id}"
+
+    def _param_name(self, proto_id: int, i: int) -> str:
+        return f"{self.native_prefix}p{proto_id}_{i}"
+
     def _reg(self, proto: FuncIR, i: int) -> A.Index:
-        return A.Index(obj=_name(regs_name(proto.proto_id)), key=_num(i))
+        return A.Index(obj=_name(self._regs_name(proto.proto_id)), key=_num(i))
 
     def _upvalue_expr(self, proto: FuncIR, i: int) -> A.Expr:
         """The expression an upvalue resolves to in the enclosing scope.
@@ -467,13 +507,14 @@ class Reconstructor:
         value = proto.consts[k.index]
         if isinstance(value, (bytes, bytearray, str)):
             ticket = self.bank.ticket(value)
-            return A.Call(fn=_name(self.bank_accessor), args=[_num(ticket)])
+            return A.Call(fn=_name(self.bank_accessor),
+                          args=[_num(self.bank_ticket(ticket))])
         return self._pool_ref(value)
 
     def _pool_ref(self, value: Any) -> A.Expr:
         """A runtime read of one pooled constant."""
         slot = self.pool.slot(value)
-        return A.Call(fn=_name(self.accessor), args=[_num(slot)])
+        return A.Call(fn=_name(self.accessor), args=[_num(self.pool_ticket(slot))])
 
     def _global_expr(self, proto: FuncIR, k: Kon) -> A.Expr:
         """The expression naming a global.
@@ -507,23 +548,65 @@ class Reconstructor:
             # chunk may run after user code has replaced or cleared `table`,
             # and depending on a global here would make the scaffolding fail
             # for reasons that have nothing to do with the program.
-            A.Local(names=[_local_name(regs_name(pid))],
+            A.Local(names=[_local_name(self._regs_name(pid))],
                     values=[A.Table(items=[])]),
         ]
         for i in range(proto.num_params):
             stmts.append(A.Assign(targets=[self._reg(proto, i)],
-                                  values=[_name(param_name(pid, i))]))
-        pc = pc_name(pid)
+                                  values=[_name(self._param_name(pid, i))]))
+        pc = self._pc_name(pid)
         stmts.append(A.Local(names=[_local_name(pc)], values=[_num(proto.entry)]))
+        if len(proto.blocks) == 1:
+            stmts.extend(self._block_body(proto, proto.blocks[0], pc))
+            return stmts
 
+        # The native flattened driver varies per function: some blocks use an
+        # affine image of the state, some a shifted image, and single-block
+        # functions above bypass the driver entirely.  That keeps reconstructed
+        # native code from becoming one giant repeated state-machine signature.
+        salt = 0
+        mul = 1
+        modulus = 65536
+        mode = 0
+        if self.vm_layout_rng is not None:
+            try:
+                salt = 17 + self.vm_layout_rng.randbelow(60000)
+                mul = 3 + 2 * self.vm_layout_rng.randbelow(20000)
+                mode = self.vm_layout_rng.randbelow(3)
+            except AttributeError:
+                salt = 0
+                mul = 1
+                mode = 0
         arms: List[Tuple[A.Expr, A.Block]] = []
         for b in proto.blocks:
-            cond = A.Bin(op="==", left=_name(pc), right=_num(b.id))
+            if mode == 1:
+                left = A.Bin(op="%", left=A.Bin(op="-", left=_name(pc), right=_num(salt)),
+                             right=_num(modulus))
+                right = _num((b.id - salt) % modulus)
+            elif mode == 2:
+                left = A.Bin(op="%",
+                             left=A.Bin(op="+",
+                                        left=A.Bin(op="*", left=A.Bin(op="+", left=_name(pc), right=_num(salt)), right=_num(mul)),
+                                        right=_num(salt % 251)),
+                             right=_num(modulus))
+                right = _num((((b.id + salt) * mul) + (salt % 251)) % modulus)
+            else:
+                left = A.Bin(
+                    op="%",
+                    left=A.Bin(op="+",
+                               left=A.Bin(op="*", left=_name(pc), right=_num(mul)),
+                               right=_num(salt)),
+                    right=_num(modulus),
+                )
+                right = _num(((b.id * mul) + salt) % modulus)
+            cond = A.Bin(op="==", left=left, right=right)
             arms.append((cond, A.Block(body=self._block_body(proto, b, pc))))
         stmts.append(A.While(
-            cond=A.Bool(value=True),
+            cond=_name(pc),
             body=A.Block(body=[A.If(arms=arms,
-                                    otherwise=A.Block(body=[A.Break()]))])))
+                                    otherwise=A.Block(body=[
+                                        A.Assign(targets=[_name(pc)],
+                                                 values=[A.Nil()])]))])))
         return stmts
 
     def _set_pc(self, pc: str, target: int) -> A.Assign:
@@ -788,6 +871,8 @@ def reconstruct_protected(module: IRModule,
                           cache_policy: str = "full",
                           cache_bound: int = 64,
                           pool_decoys: int = 0,
+                          constant_level: int = 0,
+                          numeric_level: int = 0,
                           fingerprint: bool = True,
                           metadata_fragmentation: bool = True,
                           names: Optional[Dict[str, str]] = None,
@@ -798,6 +883,7 @@ def reconstruct_protected(module: IRModule,
                           vm_protos: Any = None,
                           vm_family: Any = "register",
                           block_permutation: bool = False,
+                          opaque_predicates: bool = True,
                           layout_rng: Any = None,
                           dispatcher_family: Any = "mixed",
                           opcode_randomization: bool = True,
@@ -859,9 +945,15 @@ def reconstruct_protected(module: IRModule,
         # before the pool is built, so folded constants are interned once
         # rather than once per site they were duplicated at
         _optimize.optimize_module(module)
+    crypto_enc_domain = rng.bytes(24)
+    crypto_mac_domain = rng.bytes(24)
     pool = ConstantPool(keys, rng, context,
                         cache_policy=cache_policy, cache_bound=cache_bound,
-                        decoys=pool_decoys)
+                        decoys=pool_decoys,
+                        constant_level=constant_level,
+                        numeric_level=numeric_level,
+                        enc_domain=crypto_enc_domain,
+                        mac_domain=crypto_mac_domain)
 
     # Selected after optimization, so prototypes the optimizer shrank below the
     # size floor are not virtualized on the strength of code that no longer
@@ -952,7 +1044,10 @@ def reconstruct_protected(module: IRModule,
         from .strings.bank import StringBank
         from .runtime.stringbank_runtime import default_names as bank_default_names
         bank = StringBank(keys, string_rng if string_rng is not None else rng,
-                          context, page_size=string_page_size)
+                          context, page_size=string_page_size,
+                          randomized_ids=True,
+                          enc_domain=crypto_enc_domain,
+                          mac_domain=crypto_mac_domain)
         # Its own prefix, drawn from the string stream: sharing the constant
         # pool's prefix would make the two runtimes recognisable as a pair.
         bank_names = bank_default_names(
@@ -961,9 +1056,26 @@ def reconstruct_protected(module: IRModule,
         if names_out is not None:
             names_out["bank"] = dict(bank_names)
 
+    ticket_rng = rng.fork("pool-ticket") if hasattr(rng, "fork") else rng
+    pool_ticket_mask = (ticket_rng.u32() if hasattr(ticket_rng, "u32") else 0x5A17C0DE) & 0xffffffff
+    if pool_ticket_mask == 0:
+        pool_ticket_mask = 0x5A17C0DE
+    pool_ticket = lambda slot: (int(slot) ^ pool_ticket_mask) & 0xffffffff
+    bank_ticket_rng = ((string_rng if string_rng is not None else rng).fork("bank-ticket")
+                       if hasattr(string_rng if string_rng is not None else rng, "fork")
+                       else ticket_rng)
+    bank_ticket_mask = (bank_ticket_rng.u32() if hasattr(bank_ticket_rng, "u32") else 0x13579BDF) & 0xffffffff
+    if bank_ticket_mask == 0:
+        bank_ticket_mask = 0x13579BDF
+    bank_ticket = lambda ticket: (int(ticket) ^ bank_ticket_mask) & 0xffffffff
+    if names_out is not None:
+        names_out["bank_ticket_mask"] = bank_ticket_mask if bank is not None else 0
     rec = Reconstructor(pool=pool, accessor=names["get"], vm=plan, bank=bank,
                         bank_accessor=(bank_names["get"] if bank_names else None),
-                        helpers=helper_map)
+                        helpers=helper_map,
+                        native_prefix=fresh_prefix(rng, prefixes),
+                        pool_ticket=pool_ticket,
+                        bank_ticket=bank_ticket)
     rec.vm_layout_rng = layout_rng if layout_rng is not None else vm_rng
     body = rec.reconstruct(module)
 
@@ -987,10 +1099,11 @@ def reconstruct_protected(module: IRModule,
                     if group.describes(pid)}
             if mine:
                 _validate_payload(mine, group.opmap, group.fmt)
-        pooled = lambda value: "%s(%d)" % (names["get"], pool.slot(value))
+        pooled = lambda value: "%s(%d)" % (names["get"], pool_ticket(pool.slot(value)))
         vm_src = _wiring.prelude_source(plan, rec.vm_encoded, pooled, pooled,
                                         edges_expr=pooled,
-                                        entry_guard=guard.entry_lines())
+                                        entry_guard=(),
+                                        opaque_predicates=bool(opaque_predicates))
 
     # A program with no constants at all needs no pool: emitting the runtime
     # for an empty blob would just be a decoder that never runs.
@@ -1006,7 +1119,11 @@ def reconstruct_protected(module: IRModule,
             names["crypto"],
             crypto_runtime({"xor": names["c_xor"], "sha": names["c_sha"],
                             "mac": names["c_mac"], "open": names["c_open"],
-                            "seal": names["c_seal"]})))
+                            "seal": names["c_seal"]},
+                           enc_domain=crypto_enc_domain,
+                           mac_domain=crypto_mac_domain)))
+
+    runtime_guard_check = ""
 
     pool_src = ""
     if need_pool:
@@ -1021,7 +1138,11 @@ def reconstruct_protected(module: IRModule,
                                       cache_bound=cache_bound)
         pool_src = runtime.emit(sealed.key, sealed.nonce, sealed.tag,
                                 sealed.ciphertext, sealed.aad,
-                                emit_crypto=not crypto_src)
+                                emit_crypto=not crypto_src,
+                                guard_check=runtime_guard_check,
+                                ticket_mask=pool_ticket_mask,
+                                enc_domain=sealed.enc_domain,
+                                mac_domain=sealed.mac_domain)
 
     bank_src = ""
     if need_bank:
@@ -1046,7 +1167,11 @@ def reconstruct_protected(module: IRModule,
             bank.seal(),
             crypto_runtime({"xor": bn["c_xor"], "sha": bn["c_sha"],
                             "mac": bn["c_mac"], "open": bn["c_open"],
-                            "seal": bn["c_seal"]}) if not crypto_src else "")
+                            "seal": bn["c_seal"]},
+                           enc_domain=crypto_enc_domain,
+                           mac_domain=crypto_mac_domain) if not crypto_src else "",
+            guard_check=runtime_guard_check,
+            ticket_mask=bank_ticket_mask)
 
     crypto_block = _parser.parse(crypto_src, "<crypto>") if crypto_src else None
     pool_block = _parser.parse(pool_src, "<constpool>") if pool_src else None
@@ -1090,13 +1215,73 @@ def reconstruct_protected(module: IRModule,
         names_out["guard"] = guard.summary()
         names_out["guard_capture"] = dict(captured)
 
+    def _guard_stmts() -> List[A.Stmt]:
+        if guard_block is None:
+            return []
+        # The guard no longer emits ``local alias = global`` captures here.  The
+        # emitted chunk is wrapped below in a parameterized IIFE whose parameters
+        # are exactly these aliases, and whose arguments are the real globals in a
+        # build-random order.  That leaves the protected scaffold reading locals
+        # after entry while avoiding the stable local-alias prelude that used to
+        # identify every build.
+        aliases = set(captured.values())
+        return [s for s in guard_block.body
+                if not (isinstance(s, A.Local)
+                        and len(s.names) == 1
+                        and s.names[0].name in aliases)]
+
+    component_blocks: Dict[str, List[A.Stmt]] = {
+        "guard": _guard_stmts(),
+        "crypto": list(crypto_block.body) if crypto_block is not None else [],
+        "pool": list(pool_block.body) if pool_block is not None else [],
+        "bank": list(bank_block.body) if bank_block is not None else [],
+        "helpers": list(helpers.body),
+        "vm": list(vm_block.body) if vm_block is not None else [],
+    }
+    deps: Dict[str, Set[str]] = {k: set() for k, v in component_blocks.items() if v}
+    if "pool" in deps and "crypto" in deps:
+        deps["pool"].add("crypto")
+    if "bank" in deps and "crypto" in deps:
+        deps["bank"].add("crypto")
+    # Integrity/decryption paths are intentionally independent of environment
+    # detection.  The guard block can refuse on its own, but pool/string/VM code
+    # does not branch on executor-surface checks while materializing payload.
+    if "vm" in deps:
+        for need in ("pool", "helpers"):
+            if need in deps:
+                deps["vm"].add(need)
+    order: List[str] = []
+    pending_components = set(deps)
+    while pending_components:
+        ready = [k for k in pending_components if deps[k] <= set(order)]
+        try:
+            rng.shuffle(ready)
+        except AttributeError:
+            pass
+        pick = ready[0]
+        order.append(pick)
+        pending_components.remove(pick)
     prefix: List[A.Stmt] = []
-    if guard_block is not None:
-        # First, because its locals are what the blocks below now read.
-        prefix += list(guard_block.body)
-    for block in (crypto_block, pool_block, bank_block):
-        if block is not None:
-            prefix += list(block.body)
-    vm_stmts = list(vm_block.body) if vm_block is not None else []
-    out = A.Block(body=prefix + list(helpers.body) + vm_stmts + list(body.body))
-    return _printer.emit(out, minify=minify)
+    for key in order:
+        prefix += component_blocks[key]
+    if names_out is not None:
+        names_out["bootstrap_order"] = list(order) + ["driver"]
+    out = A.Block(body=prefix + list(body.body))
+    emitted = _printer.emit(out, minify=minify)
+    if captured:
+        order = list(captured.items())
+        # Randomize parameter ordering per build.  The mapping itself is already
+        # per-build by name, but position matters for the wrapper shape: two
+        # artifacts with the same library set no longer present the same capture
+        # sequence to a reader.
+        try:
+            rng.shuffle(order)
+        except AttributeError:
+            import random as _random
+            _random.shuffle(order)
+        params = ", ".join(alias for _global, alias in order)
+        args = ", ".join(global_name for global_name, _alias in order)
+        sep = "" if minify else "\n"
+        emitted = "return(function(%s)%s%s%send)(%s)\n" % (
+            params, sep, emitted, sep, args)
+    return emitted

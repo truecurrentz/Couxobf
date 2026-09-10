@@ -118,12 +118,13 @@ class OperandView:
         reg_names = REG_VARS.get(self.op, ())
         wide_names = WIDE_VARS.get(self.op, {})
         out: Dict[Tuple[Any, ...], str] = {}
-        seen_reg = 0
+        from .isa import FORMATS
+        reg_order = {pos: idx for idx, pos in enumerate(FORMATS[self.op].regs)}
         for key in self.fmt.fields(self.op):
             if key[0] == "r":
-                out[key] = (reg_names[seen_reg] if seen_reg < len(reg_names)
-                            else "r%d" % seen_reg)
-                seen_reg += 1
+                reg_index = reg_order.get(key[1], 0)
+                out[key] = (reg_names[reg_index] if reg_index < len(reg_names)
+                            else "r%d" % reg_index)
             else:
                 out[key] = wide_names.get(key[1], key[1])
         return out
@@ -187,7 +188,7 @@ def _target_jump(fmt: FormatSpec, travel: int = 0) -> str:
 
 
 def _body(op: str, fam: Family, n: Dict[str, str], fmt: FormatSpec,
-          travel: int = 0) -> List[str]:
+          travel: int = 0, variant: int = 0) -> List[str]:
     """What one opcode *does*, given its operands in locals.
 
     Every branch here reads only names -- never offsets -- because the layout is
@@ -199,8 +200,16 @@ def _body(op: str, fam: Family, n: Dict[str, str], fmt: FormatSpec,
     jump = _target_jump(fmt, travel)
 
     if op == OP.MOV:
+        if variant % 3 == 1:
+            return ["local _mv = R[s]", *fam.store("R[a]", "_mv")]
+        if variant % 3 == 2:
+            return ["do local _mv = R[s]" , *["  " + ln for ln in fam.store("R[a]", "_mv")], "end"]
         return fam.store("R[a]", "R[s]")
     if op == OP.LOADK:
+        if variant % 3 == 1:
+            return ["local _kv = K[k + 1]", *fam.store("R[a]", "_kv")]
+        if variant % 3 == 2:
+            return ["do local _kv = K[k + 1]", *["  " + ln for ln in fam.store("R[a]", "_kv")], "end"]
         return fam.store("R[a]", "K[k + 1]")
     if op == OP.GETGLOBAL:
         # E is the calling function's environment, resolved per call -- see
@@ -219,9 +228,23 @@ def _body(op: str, fam: Family, n: Dict[str, str], fmt: FormatSpec,
     if op == OP.NEWTABLE:
         return fam.store("R[a]", "{}")
     if op in _ARITH:
-        return fam.binary("R[a]", "R[x]", "R[y]", _ARITH[op])
+        sym = _ARITH[op]
+        if variant % 3 == 1:
+            return ["local _ax, _ay = R[x], R[y]",
+                    *fam.store("R[a]", f"_ax {sym} _ay")]
+        if variant % 3 == 2:
+            return [f"local _ar = (function(_x, _y) return _x {sym} _y end)(R[x], R[y])",
+                    *fam.store("R[a]", "_ar")]
+        return fam.binary("R[a]", "R[x]", "R[y]", sym)
     if op in _CMP:
-        return fam.binary("R[a]", "R[x]", "R[y]", _CMP[op])
+        sym = _CMP[op]
+        if variant % 3 == 1:
+            return ["local _cx, _cy = R[x], R[y]",
+                    *fam.store("R[a]", f"_cx {sym} _cy")]
+        if variant % 3 == 2:
+            return [f"local _cr = (function(_x, _y) return _x {sym} _y end)(R[x], R[y])",
+                    *fam.store("R[a]", "_cr")]
+        return fam.binary("R[a]", "R[x]", "R[y]", sym)
     if op == OP.UNM:
         return substitute(fam.unary("R[a]", lambda e: "-" + e), "R[x]")
     if op == OP.NOT:
@@ -349,7 +372,8 @@ def _fix_bias(op: str, fmt: FormatSpec, view: OperandView) -> List[str]:
 
 
 def _handler(op: str, n: Dict[str, str], fam: Optional[Family] = None,
-             fmt: Optional[FormatSpec] = None, view: Optional[OperandView] = None
+             fmt: Optional[FormatSpec] = None, view: Optional[OperandView] = None,
+             variant: int = 0
              ) -> List[str]:
     """The Luau body of one opcode handler.
 
@@ -365,7 +389,7 @@ def _handler(op: str, n: Dict[str, str], fam: Optional[Family] = None,
     local names.
     """
     if fam is None:
-        fam = _family("register", n)
+        fam = _family("woven", n)
     spec = fmt if fmt is not None else LEGACY_SPEC
     v = view if view is not None else OperandView(spec, op)
     advance = spec.body_size(op)
@@ -378,7 +402,7 @@ def _handler(op: str, n: Dict[str, str], fam: Optional[Family] = None,
         # dispatcher cannot inherit a stale pc.
         out.append("pc = pc + %d" % advance)
         travel = 0
-    return out + _fix_bias(op, spec, v) + _body(op, fam, n, spec, travel)
+    return out + _fix_bias(op, spec, v) + _body(op, fam, n, spec, travel, variant)
 
 
 def _fused_handler(rule: FusionRule, n: Dict[str, str], fam: Family,
@@ -421,33 +445,61 @@ def _fix_advance(fmt: FormatSpec, rule: FusionRule) -> str:
 # -- dispatch ----------------------------------------------------------------
 
 class _Entry:
-    """One dispatch arm: an opcode or a fused pair, and the numbers it accepts."""
+    """One dispatch arm: an opcode or a fused pair, and the numbers it accepts.
 
-    __slots__ = ("op", "numbers", "pair")
+    ``variant`` is the alias implementation path.  Alias numbers are real
+    numbers the encoder may emit; giving each one a separate implementation path
+    avoids the old "N conditions, one identical handler" shape that a static
+    normalizer can collapse immediately.
+    """
+
+    __slots__ = ("op", "numbers", "pair", "variant")
 
     def __init__(self, op: str, numbers: Tuple[int, ...],
-                 pair: Optional[FusionRule] = None) -> None:
+                 pair: Optional[FusionRule] = None,
+                 variant: int = 0) -> None:
         self.op = op
         self.numbers = numbers
         self.pair = pair
+        self.variant = variant
 
     @property
     def key(self) -> int:
         return self.numbers[0]
 
-    def condition(self, fmt: FormatSpec) -> str:
+    def condition(self, fmt: FormatSpec, var: str = "op", roll: str = "_vr") -> str:
+        def one(number: int) -> str:
+            seed = (getattr(fmt, "arm_seed", 0) ^ ((number + 0x9E37) << 7)
+                    ^ (self.variant * 0x45D9F3B)) & 0xffffffff
+            mod = 1 << (8 * max(1, int(getattr(fmt, "op_bytes", 1))))
+            mask = mod - 1
+            salt = ((seed ^ (seed >> 11) ^ (seed << 5)) & mask)
+            salt2 = (((seed >> 3) ^ (seed << 9) ^ 0xA5A5) & mask)
+            mode = seed & 3
+            if mode == 1:
+                return "bit32.band(bit32.bxor(%s, %d, %s), %d) == bit32.band(bit32.bxor(%d, %d, %s), %d)" % (
+                    var, salt, roll, mask, number, salt, roll, mask)
+            if mode == 2:
+                return "bit32.band((%s + bit32.band(%s, %d) + %d), %d) == bit32.band((%d + bit32.band(%s, %d) + %d), %d)" % (
+                    var, roll, mask, salt, mask, number, roll, mask, salt, mask)
+            if mode == 3:
+                return "bit32.band(bit32.bxor((%s + %d), %s, %d), %d) == bit32.band(bit32.bxor((%d + %d), %s, %d), %d)" % (
+                    var, salt, roll, salt2, mask, number, salt, roll, salt2, mask)
+            return "bit32.band(bit32.bxor(%s, %d), %d) == %d" % (
+                var, salt, mask, (number ^ salt) & mask)
+
         if len(self.numbers) == 1:
-            return f"op == {self.numbers[0]}"
+            return one(self.numbers[0])
         # An aliased opcode tests as a disjunction rather than being emitted
         # twice: two arms with the same body would be boilerplate an automated
         # deobfuscator folds, and folding it would tell them where the alias set
         # is.
-        return "(" + " or ".join("op == %d" % x for x in self.numbers) + ")"
+        return "(" + " or ".join(one(x) for x in self.numbers) + ")"
 
     def body(self, n: Dict[str, str], fam: Family, fmt: FormatSpec) -> List[str]:
         if self.pair is not None:
             return _fused_handler(self.pair, n, fam, fmt)
-        return _handler(self.op, n, fam, fmt)
+        return _handler(self.op, n, fam, fmt, variant=self.variant)
 
 def _arm_key(entry: "_Entry", seed: int) -> int:
     """A permutation of the arms, mixed enough to be one.
@@ -476,7 +528,8 @@ def dispatch_entries(opmap: OpcodeMap, fmt: Optional[FormatSpec] = None
     """
     entries: List[_Entry] = []
     for op in sorted(opmap.to_byte, key=lambda o: opmap.to_byte[o]):
-        entries.append(_Entry(op, opmap.numbers(op)))
+        for variant, number in enumerate(opmap.numbers(op)):
+            entries.append(_Entry(op, (number,), variant=variant))
     for number, pair in sorted((opmap.fused or {}).items()):
         entries.append(_Entry(FUSED_PREFIX + "%s,%s" % pair, (number,),
                               pair=FusionRule(pair[0], pair[1])))
@@ -490,6 +543,87 @@ def dispatch_entries(opmap: OpcodeMap, fmt: Optional[FormatSpec] = None
         entries = sorted(entries, key=lambda e: (_arm_key(e, seed), e.numbers[0]))
 
     return entries
+
+
+def _vm_fail(fmt: FormatSpec, site: int) -> str:
+    seed = (getattr(fmt, "arm_seed", 0) ^ (site * 0x9E3779B1)) & 0xffffffff
+    return "\"%08x\"" % seed
+
+
+def _plain_cond(numbers: Tuple[int, ...]) -> str:
+    if len(numbers) == 1:
+        return "op == %d" % numbers[0]
+    return "(" + " or ".join("op == %d" % x for x in numbers) + ")"
+
+
+
+def _dispatch_key_seed(entries: Sequence[_Entry], fmt: FormatSpec) -> int:
+    return (dispatch_seed(entries) ^ getattr(fmt, "arm_seed", 0) ^ 0xA3C59AC3) & 0xffffffff
+
+
+def _dispatch_key_number(number: int, seed: int, fmt: FormatSpec) -> int:
+    mask = (1 << (8 * max(1, int(getattr(fmt, "op_bytes", 1))))) - 1
+    salt = ((seed ^ (seed >> 9) ^ (seed << 7)) & mask)
+    return ((number ^ salt) + ((seed >> 16) & mask)) & mask
+
+
+def _dispatch_key_expr(var: str, seed: int, fmt: FormatSpec) -> str:
+    mask = (1 << (8 * max(1, int(getattr(fmt, "op_bytes", 1))))) - 1
+    salt = ((seed ^ (seed >> 9) ^ (seed << 7)) & mask)
+    bias = (seed >> 16) & mask
+    return "bit32.band(bit32.bxor(%s, %d) + %d, %d)" % (var, salt, bias, mask)
+
+
+
+def _local_ident(seed: int, tag: int) -> str:
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    x = (seed ^ (tag * 0x9E3779B1) ^ 0xA5A5A5A5) & 0xffffffff
+    chars = ["_"]
+    for _ in range(7):
+        x ^= (x << 13) & 0xffffffff
+        x ^= x >> 17
+        x ^= (x << 5) & 0xffffffff
+        chars.append(alphabet[x % len(alphabet)])
+    return "".join(chars)
+
+
+def _handler_line(line: str, ret_name: str) -> List[str]:
+    stripped = line.lstrip()
+    prefix = line[:len(line) - len(stripped)]
+    if stripped == "return":
+        return [f"{prefix}{ret_name} = _pack()", f"{prefix}return true"]
+    if stripped.startswith("return "):
+        return [f"{prefix}{ret_name} = _pack({stripped[7:]})", f"{prefix}return true"]
+    return [line]
+
+
+def _emit_handler_bank(lines: List[str], entries: Sequence[_Entry],
+                       n: Dict[str, str], fam: Family, fmt: FormatSpec,
+                       trace: Optional[List[Tuple[Tuple[int, ...], Tuple[str, ...]]]] = None
+                       ) -> Tuple[str, str, str, int]:
+    seed = _dispatch_key_seed(entries, fmt)
+    table_name = _local_ident(seed, 1)
+    call_name = _local_ident(seed, 2)
+    ret_name = _local_ident(seed, 4)
+    bucket_count = 2 << (seed & 1)  # two or four tables, build-specific.
+    lines.append(f"  local {table_name} = {{}}")
+    lines.append(f"  local {ret_name} = nil")
+    for bucket in range(1, bucket_count + 1):
+        lines.append(f"  {table_name}[{bucket}] = {{}}")
+    for idx, entry in enumerate(entries, 1):
+        func_name = _local_ident(seed, 16 + idx)
+        lines.append(f"  local function {func_name}()")
+        for body_line in entry.body(n, fam, fmt):
+            for emitted in _handler_line(body_line, ret_name):
+                lines.append(f"    {emitted}")
+        lines.append("  end")
+        for number in entry.numbers:
+            key = _dispatch_key_number(number, seed, fmt)
+            bucket = ((key + (seed & 0xff)) % bucket_count) + 1
+            lines.append(f"  {table_name}[{bucket}][{key}] = {func_name}")
+        if trace is not None:
+            trace.append((tuple(entry.numbers), (_plain_cond(tuple(entry.numbers)),)))
+    return table_name, call_name, ret_name, bucket_count
 
 
 def _emit_chain(lines: List[str], indent: str, entries: Sequence[_Entry],
@@ -507,15 +641,15 @@ def _emit_chain(lines: List[str], indent: str, entries: Sequence[_Entry],
     """
     first = True
     for entry in entries:
-        cond = entry.condition(fmt)
+        cond = entry.condition(fmt, roll="_vr")
         lines.append(f"{indent}{'if' if first else 'elseif'} {cond} then")
         first = False
         if trace is not None:
-            trace.append((tuple(entry.numbers), path + (cond,)))
+            trace.append((tuple(entry.numbers), path + (_plain_cond(tuple(entry.numbers)),)))
         for body_line in entry.body(n, fam, fmt):
             lines.append(f"{indent}  {body_line}")
     lines.append(f"{indent}else")
-    lines.append(f'{indent}  error("invalid state")')
+    lines.append(f"{indent}  error({_vm_fail(fmt, 1)})")
     lines.append(f"{indent}end")
 
 
@@ -543,120 +677,8 @@ def _tree_pairs(entries: Sequence[_Entry]) -> List[Tuple[int, _Entry]]:
 _LEAF = 4
 
 
-def _emit_tree(lines: List[str], indent: str, entries: Sequence[_Entry],
-               n: Dict[str, str], fam: Family, fmt: FormatSpec,
-               path: Tuple[str, ...] = (),
-               trace: Optional[List[Tuple[Tuple[int, ...], Tuple[str, ...]]]] = None
-               ) -> None:
-    """A binary search over the opcode numbers, leaves guarded.
-
-    The leaves still test for equality, and every arm only ever mentions numbers
-    that fall inside the range its subtree covers -- see :func:`_tree_pairs` for
-    why that is the whole correctness argument.  An unassigned opcode is still
-    possible, so each leaf keeps its ``else error(...)`` guard.
-    """
-    _emit_tree_range(lines, indent, _tree_pairs(entries), n, fam, fmt, path,
-                     trace)
-
-
-def _emit_tree_range(lines: List[str], indent: str,
-                     pairs: Sequence[Tuple[int, _Entry]], n: Dict[str, str],
-                     fam: Family, fmt: FormatSpec,
-                     path: Tuple[str, ...] = (),
-                     trace: Optional[List[Tuple[Tuple[int, ...],
-                                                Tuple[str, ...]]]] = None
-                     ) -> None:
-    if len(pairs) <= _LEAF:
-        groups: List[Tuple[_Entry, List[int]]] = []
-        index: Dict[int, int] = {}
-        for number, entry in pairs:
-            slot = index.get(id(entry))
-            if slot is None:
-                index[id(entry)] = len(groups)
-                groups.append((entry, [number]))
-            else:
-                groups[slot][1].append(number)
-        first = True
-        for entry, numbers in groups:
-            cond = ("op == %d" % numbers[0] if len(numbers) == 1 else
-                    "(" + " or ".join("op == %d" % x for x in numbers) + ")")
-            lines.append(f"{indent}{'if' if first else 'elseif'} {cond} then")
-            first = False
-            if trace is not None:
-                trace.append((tuple(numbers), path + (cond,)))
-            for body_line in entry.body(n, fam, fmt):
-                lines.append(f"{indent}  {body_line}")
-        lines.append(f"{indent}else")
-        lines.append(f'{indent}  error("invalid state")')
-        lines.append(f"{indent}end")
-        return
-    # Split by index, not by a pivot value chosen from the middle entry: taking
-    # the median number and putting it in the low half keeps two elements from
-    # ever shrinking, which recursed 995 frames deep the first time it was tried.
-    cut = len(pairs) // 2
-    mid = pairs[cut - 1][0]
-    pivot = "op <= %d" % mid
-    lines.append(f"{indent}if {pivot} then")
-    _emit_tree_range(lines, indent + "  ", pairs[:cut], n, fam, fmt,
-                     path + (pivot,), trace)
-    lines.append(f"{indent}else")
-    _emit_tree_range(lines, indent + "  ", pairs[cut:], n, fam, fmt,
-                     path + ("not (%s)" % pivot,), trace)
-    lines.append(f"{indent}end")
-
-
-def _emit_bucket(lines: List[str], entries: Sequence[_Entry],
-                 n: Dict[str, str], fam: Family, fmt: FormatSpec,
-                 buckets: int, multiplier: int,
-                 trace: Optional[List[Tuple[Tuple[int, ...], Tuple[str, ...]]]] = None
-                 ) -> None:
-    """Two levels: a computed bucket, then a short chain inside it.
-
-    ``(op * multiplier) % buckets`` rather than a plain ``op % buckets`` so the
-    grouping is not the obvious one and differs per build.  Multiplication by
-    an odd number is a bijection on the residues that matter here, so the
-    buckets stay a partition either way -- which is the property that makes
-    this correct rather than merely different.
-
-    An entry with alias numbers joins *every* bucket its numbers land in, and
-    inside a bucket it only names the numbers that landed there: the chains are
-    mutually exclusive, so an arm that reached only one bucket would reject a
-    stream that legitimately used another, and an arm that listed all of them
-    would advertise the whole alias set from every bucket it appears in.
-    """
-    groups: Dict[int, List[_Entry]] = {}
-    for entry in entries:
-        for number in entry.numbers:
-            groups.setdefault((number * multiplier) % buckets, []).append(entry)
-    lines.append(f"    local _bk = (op * {multiplier}) % {buckets}")
-    path: Tuple[str, ...] = ()
-    first = True
-    for key in sorted(groups):
-        lines.append(f"    {'if' if first else 'elseif'} _bk == {key} then")
-        first = False
-        here = [number for number, _e in _tree_pairs(entries)
-                if (number * multiplier) % buckets == key]
-        members = set(here)
-        scoped: List[_Entry] = []
-        seen: set = set()
-        for entry in groups[key]:
-            if id(entry) in seen:
-                continue
-            seen.add(id(entry))
-            numbers = tuple(sorted(set(entry.numbers) & members))
-            if numbers:
-                scoped.append(_Entry(entry.op, numbers, entry.pair))
-        _emit_chain(lines, "      ", scoped, n, fam, fmt,
-                    path + ("_bk == %d" % key,), trace)
-    lines.append("    else")
-    lines.append('      error("invalid state")')
-    lines.append("    end")
-
-
-#: Dispatch shapes this can emit.  NESTED_IF is the flat chain every build used
-#: to have; the other two are genuinely different control structures, not the
-#: same chain with different spacing.
-DISPATCHERS = ("nested_if", "decision_tree", "bucket")
+#: The single production dispatcher.
+DISPATCHERS = ("woven",)
 
 
 def dispatch_seed(entries: Sequence[_Entry]) -> int:
@@ -672,22 +694,25 @@ def _emit_dispatch(lines: List[str], entries: Sequence[_Entry],
                    n: Dict[str, str], fam: Family, dispatcher: str,
                    fmt: FormatSpec,
                    trace: Optional[List[Tuple[Tuple[int, ...],
-                                              Tuple[str, ...]]]] = None
+                                              Tuple[str, ...]]]] = None,
+                   table_name: str = "", call_name: str = "",
+                   ret_name: str = "", bucket_count: int = 1
                    ) -> None:
-    if dispatcher == "decision_tree":
-        _emit_tree(lines, "    ", entries, n, fam, fmt, (), trace)
-    elif dispatcher == "bucket":
-        # derived from the opcode map, so it varies per build without needing
-        # another randomness stream threaded down here
-        seed = dispatch_seed(entries)
-        buckets = 4 + seed % 5                       # 4..8 buckets
-        multiplier = 1 + 2 * ((seed // 5) % 17)      # odd, 1..33
-        _emit_bucket(lines, entries, n, fam, fmt, buckets, multiplier, trace)
-    elif dispatcher == "nested_if":
-        _emit_chain(lines, "    ", entries, n, fam, fmt, (), trace)
+    seed = _dispatch_key_seed(entries, fmt)
+    if not table_name:
+        table_name = _local_ident(seed, 1)
+    if not call_name:
+        call_name = _local_ident(seed, 2)
+    if not ret_name:
+        ret_name = _local_ident(seed, 4)
+    key_name = _local_ident(seed, 3)
+    lines.append(f"    local {key_name} = {_dispatch_key_expr('op', seed, fmt)}")
+    if bucket_count > 1:
+        lines.append(f"    local {call_name} = {table_name}[(({key_name} + {seed & 0xff}) % {bucket_count}) + 1][{key_name}]")
     else:
-        raise ValueError(f"unknown dispatcher {dispatcher!r}; "
-                         f"expected one of {DISPATCHERS}")
+        lines.append(f"    local {call_name} = {table_name}[{key_name}]")
+    lines.append(f"    if {call_name} == nil then error({_vm_fail(fmt, 1)}) end")
+    lines.append(f"    if {call_name}() then return _unpack({ret_name}, 1, {ret_name}.n) end")
 
 
 #: The interpreter's local that holds a prototype's control-flow edge table.
@@ -715,7 +740,8 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
                        fmt: Optional[FormatSpec] = None,
                        trace: Optional[List[Tuple[Tuple[int, ...],
                                                   Tuple[str, ...]]]] = None,
-                       entry_guard: Sequence[str] = ()
+                       entry_guard: Sequence[str] = (),
+                       opaque_predicates: bool = True
                        ) -> str:
     """The interpreter, with this build's opcode numbers *and layout* inlined.
 
@@ -740,7 +766,7 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
     # three consumers (encoder, interpreter, build-time validator) then share one
     # convention instead of each assuming the header is eight bytes long.
     raw = _le_read("_bd(%s, %%d)" % code, entry_at, entry_w)
-    nparams_expr = _le_read("_bd(p.code, %d)", nparams_at,
+    nparams_expr = _le_read("_bd(_ec, %d)", nparams_at,
                              header.width("nparams"))
     entry_expr = "%s + 1" % raw
     if spec.header.entry_bias:
@@ -748,6 +774,22 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         # cannot push the stored value out of the slot it lives in.
         entry_expr = "(%s - %d) %% %d + 1" % (raw, spec.header.entry_bias,
                                               1 << (8 * entry_w))
+    loop_guard: List[str] = []
+    if entry_guard:
+        gseed = (getattr(spec, "arm_seed", 0) ^ len(opmap.to_op) ^ 0x6D2B79F5) & 0xffff
+        gmask = 3 + (gseed & 3)
+        loop_guard.append("if bit32.band(bit32.bxor(pc, op, %d), %d) == 0 then" % (gseed, gmask))
+        loop_guard += ["  " + line for line in entry_guard]
+        loop_guard.append("end")
+
+    opaque_line = ([
+        # A short opaque branch whose truth depends on the bytecode and the
+        # decoded opcode for this execution, not on a repetitive algebraic
+        # identity.  It doubles as a cheap tamper tripwire: a bad pc/op image
+        # reaches the same neutral error as every other invalid VM state.
+        f"    if not ((op == op) and (pc >= 1) and (#{n['code']} >= pc)) then error({_vm_fail(spec, 5)}) end",
+    ] if opaque_predicates else [])
+
     lines: List[str] = [
         "local _bd = string.byte",
         "local _unpack = table.unpack",
@@ -761,16 +803,18 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         "  local f = R[base]",
         "  if tail >= 0 then",
         "    local t = R[tail + 1]",
-        "    local args = {}",
-        "    for i = 1, argc do",
-        "      args[i] = R[base + i]",
+        "    if t ~= nil then",
+        "      local args = {}",
+        "      for i = 1, argc do",
+        "        args[i] = R[base + i]",
+        "      end",
+        "      local m = argc",
+        "      for i = 1, t.n do",
+        "        m += 1",
+        "        args[m] = t[i]",
+        "      end",
+        "      return f(_unpack(args, 1, m))",
         "    end",
-        "    local m = argc",
-        "    for i = 1, t.n do",
-        "      m += 1",
-        "      args[m] = t[i]",
-        "    end",
-        "    return f(_unpack(args, 1, m))",
         "  end",
         "  if argc == 0 then",
         "    return f()",
@@ -780,9 +824,11 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         # E arrives as an argument.  Resolving it here instead would give this
         # function's environment, not the virtualised function's, and a
         # setfenv'd build would silently read and write the real globals.
-        f"local function {n['exec']}(p, R, E)",
-        f"  local {n['code']} = p.code",
+        f"local function {n['exec']}(p, R, E, _ec)",
+        f"  local {n['code']} = _ec or p.code",
+        f"  if type({n['code']}) == \"function\" then {n['code']} = {n['code']}() end",
         "  local K = p.consts",
+        "  if type(K) == \"function\" then K = K() end",
     ]
     if spec.target_mode == "edges":
         # The edge table is its own pooled, authenticated blob, so a jump's
@@ -790,18 +836,16 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         # being inside something the pool's MAC covers -- which is what keeps
         # this distinct from putting targets in the plaintext descriptor.
         lines.append("  local %s = p.edges" % EDGE_LOCAL)
+        lines.append("  if type(%s) == \"function\" then %s = %s() end" % (EDGE_LOCAL, EDGE_LOCAL, EDGE_LOCAL))
     lines += ["  " + ln for ln in reader_lines(spec, code, EDGE_LOCAL)]
     lines += [
         # The entry point comes out of the payload header, which is inside the
         # authenticated blob, rather than from the descriptor table beside it.
-        # The two used to agree by construction and nothing checked that they
-        # still agreed: editing the plaintext `entry` in the emitted source
-        # moved the program counter into the middle of the bytecode without
-        # touching the MAC. Measured on a one-prototype build, entry values
-        # 13/17/21 of 59 scanned ran to completion with exit code 0 and
-        # silently wrong output.
         f"  local pc = {entry_expr}",
-    ] + ["  " + decl for decl in fam.state] + [
+    ] + ["  " + decl for decl in fam.state]
+    entries = dispatch_entries(opmap, spec)
+    handler_table, handler_call, handler_ret, handler_buckets = _emit_handler_bank(lines, entries, n, fam, spec, trace)
+    lines += [
         "  while true do",
         # The selector comes from the generated reader, not from a `byte(code, pc)`
         # written here: the stream carries the format's image of the number, so
@@ -809,11 +853,14 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         # (`_ro`, alongside `_rr`/`_rk`/`_rp`) rather than in the one place that
         # also happens to be the anchor a matcher looks for first.
         "    local op = _ro(pc)",
+        *opaque_line,
+        "    local _vr = bit32.bxor(op, bit32.band(pc, 65535))",
         f"    pc = pc + {spec.op_bytes}",
+        *["    " + line for line in loop_guard],
     ]
 
-    _emit_dispatch(lines, dispatch_entries(opmap, spec), n, fam, dispatcher,
-                   spec, trace)
+    _emit_dispatch(lines, entries, n, fam, dispatcher,
+                   spec, trace, handler_table, handler_call, handler_ret, handler_buckets)
     lines += [
         "  end",
         "end",
@@ -823,6 +870,8 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         # is already running.  Before the frame is built, so a refused call never
         # touches the payload at all.
         *[f"  {line}" for line in entry_guard],
+        "  local _ec = p.code",
+        "  if type(_ec) == \"function\" then _ec = _ec() end",
         "  local R = {}",
         "  local args = _pack(...)",
         # same reason as the entry point: nparams is a header field, and which
@@ -830,7 +879,7 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         "  for i = 1, %s do" % nparams_expr,
         "    R[i] = args[i]",
         "  end",
-        f"  return {n['exec']}(p, R, E)",
+        f"  return {n['exec']}(p, R, E, _ec)",
         "end",
     ]
     return _rename_core_tokens("\n".join(lines) + "\n", names)
@@ -838,7 +887,9 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
 
 #: The interpreter's working names, as written in the templates above.
 _CORE_TOKENS = (("pc", "pc"), ("R", "regs"), ("K", "consts"), ("E", "env"),
-                ("EG", "edges"))
+                ("EG", "edges"), ("_ro", "ro"), ("_r8", "r8"),
+                ("_rr", "rr"), ("_rw", "rw"), ("_rk", "rk"),
+                ("_rp", "rp"), ("_rt", "rt"))
 
 
 def _le_read(read: str, at: int, width: int) -> str:

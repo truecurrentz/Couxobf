@@ -35,25 +35,16 @@ const SPEC = [
        "frame costs more than it hides."],
       ["max_vm_functions", "Max virtualized functions", "int",
        "A cap, not a target. 0 means no limit."],
-      ["vm_variety", "VMs per artifact", "int",
-       "Distinct interpreters in one artifact. Each group gets its own family, " +
-       "dispatcher and instruction format, so 2 means two VMs."],
-      ["vm_family", "VM family", "select",
-       "The register discipline the interpreter uses. Group 0 keeps this; extra " +
-       "groups rotate through the rest when state distribution is on."],
-      ["dispatcher_family", "Dispatcher", "select",
-       "How the interpreter picks the next handler. `mixed` draws one per group, " +
-       "which is what makes the dispatcher part of the per-build shape."],
+      ["vm_polymorphism", "Woven VM", "bool",
+       "Uses the single hardened VM: mixed operand data paths inside one shared " +
+       "interpreter and one guarded dispatch loop, avoiding multiple attack surfaces."],
+      ["vm_variety", "VM compatibility", "int",
+       "Legacy compatibility field. Builds now normalize to one shared VM per artifact."],
       ["vm_isa_subset", "Per-VM instruction set", "bool",
        "Each interpreter carries only the opcodes the functions on it need, so the " +
        "handler count follows the code instead of being the whole ISA in every " +
        "build. It also shrinks the artifact; a VM running three numeric helpers " +
        "does not need forty arms."],
-      ["state_distribution", "Spread VM state", "bool",
-       "Rotate the extra groups through the other families instead of repeating one " +
-       "discipline for the whole build."],
-      ["dispatcher_splitting", "Split dispatchers", "bool",
-       "Give each VM its own dispatch shape. Needs more than one group."],
     ],
   },
   {
@@ -85,15 +76,17 @@ const SPEC = [
        "How many numbers can reach one instruction: 0 one number per opcode, 1 " +
        "some opcodes get a second alias, 2 widens both the alias set and the " +
        "numbering space."],
-      ["instruction_fusion", "Fuse pairs", "bool",
-       "Fuse independent instruction pairs into super-instructions."],
-      ["super_instructions", "Super-instructions", "bool",
-       "Offer fused pairs as distinct opcodes, growing the handler set."],
       ["register_randomization", "Register numbering", "bool",
        "Register fields are widened and masked. A full permutation is not " +
        "implemented: FORLOOP, CALL and SETLIST address base+1..+3."],
       ["control_flow_level", "Control flow", "select",
        "How far blocks are rearranged, from reordering up to flattening."],
+      ["opaque_predicates", "Opaque predicates", "bool",
+       "Add short validity predicates whose truth depends on the current decoded " +
+       "VM state, not repeated arithmetic identities a simplifier can delete."],
+      ["branch_inversion", "Invert branches", "bool",
+       "Randomly flip eligible if/else branches and their conditions before lowering, " +
+       "without adding dummy blocks or changing evaluation order."],
       ["block_permutation", "Permute blocks", "bool",
        "Emit basic blocks in an order that is not the source order."],
     ],
@@ -105,8 +98,17 @@ const SPEC = [
           "value -- precision, signed zero and NaN included -- but not their shape.",
     fields: [
       ["string_protection_level", "Strings", "select",
-       "0 off, 1 encoded, 2 fragmented and ticketed through the string bank. 3 is " +
-       "currently the same as 2; there is no third tier yet."],
+       "0 off, 1 encoded, 2/3 fragmented, ChaCha20 encrypted, HMAC-SHA256 checked, " +
+       "lazy, ticketed and indirectly referenced through randomized string IDs."],
+      ["constant_protection_level", "Constant pool", "select",
+       "0 disables the pool, 1 uses the verified encrypted pool. Higher experimental " +
+       "modes are withheld until differential execution is clean across runtimes."],
+      ["numeric_protection_level", "Numbers", "select",
+       "Masks IEEE-754 double bytes inside the encrypted pool so number materializing " +
+       "is generated dynamically while preserving exact Luau float semantics."],
+      ["table_key_protection", "Table keys", "bool",
+       "Assemble syntactic property names from protected fragments so field access " +
+       "does not expose a stable GETTABLEK/SETTABLEK key vocabulary."],
       ["cache_policy", "Decoded-string cache", "select",
        "How much plaintext sits in the heap: `none` re-materialises on every read, " +
        "`full` keeps everything, `bounded` keeps a rolling window."],
@@ -137,25 +139,14 @@ const SPEC = [
        "own library lookups become chunk locals, so an __index logger does not see " +
        "them at all."],
       ["dump_guard", "Anti dump", "select",
-       "Checks the surfaces a dumper replaces -- string.dump, getbytecode, " +
-       "getscriptbytecode, debug.getinfo -- and, at 2, the hook state."],
+       "Checks portable Luau dump/introspection surfaces such as debug.info, " +
+       "debug.getinfo, debug.traceback, debug.gethook and string.dump, then " +
+       "refuses before plaintext access at level 2."],
       ["guard_policy", "When a guard fires", "select",
        "`fail` refuses the same way a corrupt payload does, so the trip is not a " +
        "message that names the check. `ignore` keeps running, which is how you " +
        "measure the checks on a machine that legitimately has a hooked " +
        "environment."],
-    ],
-  },
-  {
-    id: "noise",
-    title: "Padding and integrity",
-    help: "Dead-but-valid code, bounded on purpose: padding that dominates the " +
-          "artifact is a fingerprint of its own. Integrity checking always runs -- " +
-          "each payload authenticates its own header, opcode map and instruction " +
-          "count -- but the fields that would let you choose how far to take it " +
-          "(integrity_level, self_test, encoded_pc) are declared and not applied, " +
-          "and this page lists them as such after a build.",
-    fields: [
     ],
   },
   {
@@ -440,9 +431,9 @@ function buildForm() {
 }
 
 function unknownFields() {
-  const accepted = new Set([...Object.keys(surface), ...Object.keys(SYNTH)]);
+  const visible = new Set(FIELD_NAMES);
   return Object.keys(surface)
-    .filter((n) => n !== "reproducible_seed" && !accepted.has(n));
+    .filter((n) => n !== "reproducible_seed" && !visible.has(n));
 }
 
 function buildRow(name, label, kind, help) {
@@ -578,6 +569,9 @@ function syncGates() {
 }
 
 function applyProfile(name) {
+  document.querySelectorAll("#presetBar button[data-profile]").forEach((btn) => {
+    btn.setAttribute("aria-pressed", String(btn.dataset.profile === name));
+  });
   const values = profileValues[name];
   if (!values) return;
   for (const [field, value] of Object.entries(values)) {
@@ -641,9 +635,9 @@ function renderMetrics(data) {
   $("metrics").hidden = false;
 }
 
-/* The interpreters, as the build made them.  The preset says "vm_family: stack"
-   and the artifact can hold a stack machine, a register machine and an accumulator
-   in the same file; a panel that repeated the request would be decoration. */
+/* The interpreters, as the build made them.  The site exposes one polymorphism
+   switch, but the artifact can hold stack/register/hybrid/accumulator machines
+   with different dispatchers in the same file; this panel reports the result. */
 function renderVms(groups) {
   const box = $("vmBox");
   if (!groups || !groups.length) { box.hidden = true; return; }
@@ -654,7 +648,8 @@ function renderVms(groups) {
     `<td>${g.family} · ${g.dispatcher} · ${g.prototypes} ` +
     `${g.prototypes === 1 ? "prototype" : "prototypes"} · ${g.opcodes} opcodes · ` +
     `${g.op_bytes}B op + ${g.reg_bytes}B reg + ${g.wide_bytes}B wide · ` +
-    `targets ${g.target_mode} · opcode cipher ${g.opCipher}` +
+    `targets ${g.target_mode} · opcode cipher ${opCipher}` +
+    `${g.arm_seed ? " · shuffled arms" : ""}` +
     `${g.fused ? ` · ${g.fused} fused` : ""}</td></tr>`;
   }).join("");
   $("vmBody").innerHTML = head + rows;
@@ -842,15 +837,18 @@ async function loadSurface() {
    `option_surface()`, so an update to one has to update the other. */
 const FALLBACK = {
   virtualization_level: { kind: "enum", choices: ["none", "light", "medium", "heavy", "maximum"], default: "heavy" },
-  vm_family: { kind: "enum", choices: ["register", "stack", "accumulator", "hybrid"], default: "register" },
-  dispatcher_family: { kind: "enum", choices: ["none", "nested_if", "decision_tree", "bucket", "mixed"], default: "mixed" },
+  vm_polymorphism: { kind: "bool", default: true },
   cache_policy: { kind: "enum", choices: ["none", "bounded", "full"], default: "none" },
   guard_policy: { kind: "choice", choices: ["fail", "ignore"], default: "fail" },
   hash_comments: { kind: "choice", choices: ["auto", "strip", "strict"], default: "auto" },
   instruction_formats: { kind: "int", min: 0, max: 2, default: 1 },
   opcode_aliases: { kind: "int", min: 0, max: 4, default: 1 },
   string_protection_level: { kind: "int", min: 0, max: 3, default: 2 },
+  constant_protection_level: { kind: "int", min: 0, max: 1, default: 1 },
+  numeric_protection_level: { kind: "int", min: 0, max: 2, default: 1 },
+  table_key_protection: { kind: "bool", default: true },
   control_flow_level: { kind: "int", min: 0, max: 3, default: 2 },
+  branch_inversion: { kind: "bool", default: true },
   env_guard: { kind: "int", min: 0, max: 2, default: 1 },
   dump_guard: { kind: "int", min: 0, max: 2, default: 1 },
   decoy_constants: { kind: "int", min: 0, max: 256, default: 12 },

@@ -44,11 +44,13 @@ from typing import Dict
 
 from ..crypto.chacha20 import COLUMN_ROUNDS, DIAGONAL_ROUNDS
 from ..crypto.sha256 import H_INIT, K
+from ..crypto.protected import ENC_DOMAIN, MAC_DOMAIN
 
 # Sigma constants: little-endian 32-bit words of "expand 32-byte k".
 SIGMA = (1634760805, 857760878, 2036477234, 1797285236)
 
-MAC_DOMAIN = "couxobf-mac-v1\\000"  # matches crypto.protected.MAC_DOMAIN
+def _byte_literal(data: bytes) -> str:
+    return '"' + ''.join('\\x%02x' % b for b in data) + '"'
 
 
 def _k_table() -> str:
@@ -58,7 +60,8 @@ def _k_table() -> str:
     return "\n".join(rows)
 
 
-def crypto_runtime(names: Dict[str, str]) -> str:
+def crypto_runtime(names: Dict[str, str], enc_domain: bytes = None,
+                   mac_domain: bytes = None) -> str:
     """Emit the crypto runtime.
 
     ``names`` maps logical roles to generated identifiers: ``xor`` (ChaCha20),
@@ -66,6 +69,8 @@ def crypto_runtime(names: Dict[str, str]) -> str:
     ``seal`` (encrypt + tag).
     """
     n = names
+    enc_dom = _byte_literal(enc_domain if enc_domain is not None else ENC_DOMAIN)
+    mac_dom = _byte_literal(mac_domain if mac_domain is not None else MAC_DOMAIN)
     return f"""local band, bor, bxor, bnot = bit32.band, bit32.bor, bit32.bxor, bit32.bnot
 local lshift, rshift = bit32.lshift, bit32.rshift
 local byte, char, rep, sub = string.byte, string.char, string.rep, string.sub
@@ -298,13 +303,17 @@ local function le64(n)
   return table.concat(t)
 end
 
-local function mac_key(keystr, noncestr)
-  return {n["sha"]}("{MAC_DOMAIN}" .. keystr .. noncestr)
+local function enc_key(keystr, noncestr, aad)
+  return {n["sha"]}({enc_dom} .. keystr .. noncestr .. aad .. le64(#aad))
+end
+
+local function mac_key(keystr, noncestr, aad)
+  return {n["sha"]}({mac_dom} .. keystr .. noncestr .. aad .. le64(#aad))
 end
 
 local function compute_tag(keystr, noncestr, ct, aad)
   local covered = {{noncestr, aad, le64(#aad), ct, le64(#ct)}}
-  return {n["mac"]}(mac_key(keystr, noncestr), table.concat(covered))
+  return {n["mac"]}(mac_key(keystr, noncestr, aad), table.concat(covered))
 end
 
 local function const_eq(a, b)
@@ -321,12 +330,12 @@ local function {n["open"]}(keystr, noncestr, ct, tag, aad)
   if not const_eq(compute_tag(keystr, noncestr, ct, aad), tag) then
     return nil
   end
-  return {n["xor"]}(keystr, noncestr, ct, 1)
+  return {n["xor"]}(enc_key(keystr, noncestr, aad), noncestr, ct, 1)
 end
 
 local function {n["seal"]}(keystr, noncestr, plain, aad)
   aad = aad or ""
-  local ct = {n["xor"]}(keystr, noncestr, plain, 1)
+  local ct = {n["xor"]}(enc_key(keystr, noncestr, aad), noncestr, plain, 1)
   return ct, compute_tag(keystr, noncestr, ct, aad)
 end
 

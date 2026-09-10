@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from couxobf.crypto.chacha20 import chacha20_block, chacha20_xor
 from couxobf.crypto.kdf import KeyMaterial, derive_key, hkdf_expand, hkdf_extract
-from couxobf.crypto.protected import compute_tag, open_, open_blob, seal, sealed_blob
+from couxobf.crypto.protected import compute_tag, enc_key, mac_key, open_, open_blob, seal, sealed_blob
 from couxobf.crypto.sha256 import H_INIT, K, hmac_sha256, sha256
 
 SEQ_KEY = bytes(range(32))
@@ -128,6 +128,20 @@ def test_payload_seal_open_roundtrip_and_tamper_detection():
         open_blob(key, blob, b"build-2")
     with pytest.raises(ValueError):
         open_blob(os.urandom(32), blob, b"build-1")
+
+
+def test_payload_uses_context_bound_subkeys_not_raw_chacha_key():
+    key = bytes(range(32))
+    nonce = bytes(range(12))
+    aad = b"build-context"
+    plain = b"protected payload"
+    _nonce, ct, tag = seal(key, plain, aad, nonce=nonce)
+
+    assert enc_key(key, nonce, aad) != key
+    assert mac_key(key, nonce, aad) != key
+    assert enc_key(key, nonce, aad) != mac_key(key, nonce, aad)
+    assert chacha20_xor(key, nonce, plain, counter=1) != ct
+    assert open_(key, nonce, ct, tag, aad) == plain
 
 
 def test_tag_covers_nonce_and_lengths():

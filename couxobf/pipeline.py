@@ -36,16 +36,19 @@ from typing import Any, Dict, List, Optional, Set
 
 from . import classify as _classify
 from . import comments as _comments
+from . import controlflow as _controlflow
 from .vm import format as _vm_format
 from .vm import runtime as _vm_runtime
 from . import ir as _ir
 from . import lower_back as _lower_back
 from . import parser as _parser
 from . import sema as _sema
-from .config import Config, VirtualizationLevel, VMFamily
+from .config import Config, DispatcherFamily, VirtualizationLevel, VMFamily
 from .crypto.kdf import KeyMaterial
 from .rng import make_domains
-from .verify.output import ValidationReport, validate_or_raise, validate_output
+from .verify.difftest import run_pair
+from .verify.output import (OutputValidationError, ValidationReport,
+                            validate_or_raise, validate_output)
 
 #: How many bytes of seed material a build uses.
 SEED_BYTES = 16
@@ -342,6 +345,10 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         raise BuildError(f"{name} does not parse: {_parse_hint(source, exc)}"
                          ) from None
 
+    domains = make_domains(seed)
+    if config.branch_inversion and int(config.control_flow_level) > 0:
+        _controlflow.invert_branches(ast, domains.get("cfg"), enabled=True)
+
     # Semantic analysis runs for its own sake: it is what the identifier
     # renamer and the classifier read, and running it here means a source file
     # that breaks it fails now, at the front, with the file name attached.
@@ -351,8 +358,10 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         raise BuildError(f"{name} failed semantic analysis: {exc}") from None
 
     # -- IR ---------------------------------------------------------------
-    module = _ir.Lowerer().lower(ast)
-    domains = make_domains(seed)
+    module = _ir.Lowerer(
+        table_key_protection=bool(config.table_key_protection),
+        rng=domains.get("table-keys"),
+    ).lower(ast)
 
     # -- selection --------------------------------------------------------
     # The classifier runs before reconstruction so its decisions can be passed
@@ -375,17 +384,20 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         # Decoys are the pool's, so the count is too: `decoys` is the switch and
         # `decoy_constants` the budget, and both are read nowhere else.
         pool_decoys=(int(config.decoy_constants) if config.decoys else 0),
+        constant_level=int(config.constant_protection_level),
+        numeric_level=int(config.numeric_protection_level),
         fingerprint=bool(config.fingerprint),
         metadata_fragmentation=bool(config.metadata_fragmentation),
         minify=config.minify,
         vm_level=config.virtualization_level,
         vm_rng=domains.get("vm"),
         vm_protos=selected,
-        vm_family=config.vm_family,
+        vm_family=VMFamily.WOVEN,
         block_permutation=config.block_permutation,
+        opaque_predicates=bool(config.opaque_predicates),
         isa_subset=bool(config.vm_isa_subset),
         layout_rng=domains.get("cfg"),
-        dispatcher_family=config.dispatcher_family,
+        dispatcher_family=DispatcherFamily.MIXED,
         opcode_randomization=config.opcode_randomization,
         fmt_prefs=_vm_format.FormatPrefs.from_config(config),
         string_level=config.string_protection_level,
@@ -395,21 +407,13 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         string_rng=domains.get("strings"),
         string_cache_policy=str(getattr(config.cache_policy, "value",
                                         config.cache_policy)),
-        # One VM per build is the historical behaviour.  Asking for more groups
-        # is what makes "several VM families per artifact" true, and
-        # `state_distribution` is the config's name for exactly that spread.
-        vm_variety=(max(1, int(config.vm_variety))
-                    if (config.state_distribution or config.vm_variety > 1)
-                    else 1),
-        # Spread, but starting where the user pointed: a build that pinned
-        # ``vm_family`` and turned state distribution on still gets that family
-        # for group 0, with the rest rotated behind it.  Ignoring the pin would
-        # make the config's own field unobservable, which is the one thing a
-        # knob is not allowed to be.
-        families=(_family_rotation(config.vm_family)
-                  if config.state_distribution else None),
-        dispatchers=(_dispatcher_rotation(config.dispatcher_family)
-                     if config.dispatcher_splitting else None),
+        # One VM per build: cloning interpreter families creates more fingerprint
+        # surface than it removes.
+        vm_variety=(1 if int(config.vm_variety) >= 0 else 1),
+        # Legacy family/dispatcher settings normalize to the single woven VM and
+        # its guarded dispatcher.
+        families=("woven",),
+        dispatchers=("woven",),
         fusion_level=(1 if config.instruction_fusion
                       and config.super_instructions else 0),
         alias_ratio=_alias_ratio(config),
@@ -439,6 +443,17 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
                      or _lower_back.DEFAULT_HELPERS).values())
     validation = (validate_or_raise(out, source, toolchain, helpers) if verify
                   else validate_output(out, source, toolchain, helpers))
+    if verify and bool(getattr(config, "self_test", False)) and toolchain is not None \
+            and getattr(toolchain, "can_execute", False):
+        diff = run_pair(toolchain, source, out, timeout=30.0)
+        validation.differential = True
+        validation.differential_reason = diff.reason
+        if not diff.ok:
+            detail = diff.reason
+            if diff.details:
+                detail += ": " + repr(diff.details)[:500]
+            validation.problems.append("differential execution failed: " + detail)
+            raise OutputValidationError(validation.problems[-1])
 
     return BuildResult(source=out, seed=seed, config=config, stats=stats,
                        validation=validation, runtime_names=runtime_names)
@@ -546,6 +561,7 @@ def cost_report(result: BuildResult) -> str:
     # The config's answer, labelled as such: with more than one group the artifact
     # carries families the request never named, and the group lines below are the
     # ones that describe the file.
+    lines.append("vm polymorphism     : %s" % ("on" if c.vm_polymorphism else "off"))
     lines.append(f"vm family (config)  : {getattr(c.vm_family, 'value', c.vm_family)}")
     for group in s.vm_groups:
         fmt = group.get("format") or {}

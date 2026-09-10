@@ -276,7 +276,7 @@ def test_no_plaintext_entry_or_nparams():
     src = "local function f() return 1, 2, 3 end\nprint(f())\n"
     config = Config(reproducible_seed=7, min_virtualize_body_nodes=1)
     out = build(src, config, verify=False).source
-    descriptor = re.search(r"\{\s*code\s*=\s*[^,]+,\s*consts\s*=\s*\{[^}]*\}[^}]*\}",
+    descriptor = re.search(r"\{\s*code\s*=\s*[^,]+,\s*consts\s*=\s*[^,}]+[^}]*\}",
                            out)
     assert descriptor, "no descriptor table in the output"
     body = descriptor.group(0)
