@@ -407,9 +407,15 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         string_rng=domains.get("strings"),
         string_cache_policy=str(getattr(config.cache_policy, "value",
                                         config.cache_policy)),
-        # One VM per build: cloning interpreter families creates more fingerprint
-        # surface than it removes.
-        vm_variety=(1 if int(config.vm_variety) >= 0 else 1),
+        # The config's variety, honored: one interpreter family (woven -- the
+        # consolidation argument against cloning *engines* still holds), but N
+        # groups whose formats, opcode maps, ciphers, readers and dispatch
+        # keys are drawn independently, so a devirtualizer recovered from one
+        # group reads none of the others.  The size budget ladder already
+        # prices extra groups (`_BUDGET_TRIMS`), so the cost is not silent.
+        # Capped at the selection: an empty group would still emit a whole
+        # interpreter, buying nothing but kilobytes.
+        vm_variety=max(1, min(int(config.vm_variety), len(selected) or 1)),
         # Legacy family/dispatcher settings normalize to the single woven VM and
         # its guarded dispatcher.
         families=("woven",),

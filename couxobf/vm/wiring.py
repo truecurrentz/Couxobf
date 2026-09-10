@@ -319,7 +319,11 @@ def _make_groups(rng: Rng, proto_ids: List[int], names: Dict[str, str], *,
     with each other, and round-robin guarantees they get equal populations
     instead of 63 prototypes in one VM and one in the other.
     """
-    count = 1
+    # ``variety`` is honored again: every group draws its own format, opcode
+    # map, cipher and dispatch key, so a devirtualizer recovered from one
+    # group does not read the others.  Capped at the population -- a group
+    # with no prototype would still emit a whole interpreter for nothing.
+    count = max(1, min(int(variety), len(proto_ids) or 1))
     family_pool = ["woven"]
     dispatcher_pool = ["woven"]
     if len(family_pool) < count:

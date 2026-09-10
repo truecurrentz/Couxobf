@@ -191,7 +191,10 @@ def test_the_response_shows_every_interpreter_the_build_actually_made():
         "reproducible_seed": 7}})
     assert status == 200, body
     groups = body["vm_groups"]
-    assert len(groups) == 1, groups
+    # R1 made vm_variety > 1 ship one group per populated VM, so a variety-3
+    # request over a file with several virtualizable prototypes lands as
+    # several rows -- one per interpreter the build actually carries.
+    assert 1 <= len(groups) <= 3, groups
     assert {g["family"] for g in groups} == {"woven"}, groups
     assert {g["dispatcher"] for g in groups} == {"woven"}, groups
     for group in groups:

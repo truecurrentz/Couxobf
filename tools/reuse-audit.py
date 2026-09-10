@@ -89,7 +89,8 @@ CASES: Tuple[Tuple[str, Dict[str, Any]], ...] = (
 )
 
 SHAPE_FIELDS = ("op_bytes", "reg_bytes", "wide_bytes", "pad", "wides_first",
-                "reg_mask", "wide_mask", "target_mode", "op_cipher")
+                "reg_mask", "wide_mask", "target_mode", "op_cipher",
+                "dispatch_shape", "inline_reads")
 
 
 def _sweep(code: bytes, fmt: FormatSpec, reader: Any,

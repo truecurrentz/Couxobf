@@ -37,11 +37,22 @@ NAMES = {
 }
 
 #: The layouts worth crossing with the shapes: the historical one, a padded
-#: two-byte opcode, and wide registers with relative jumps.
+#: two-byte opcode, wide registers with relative jumps, and both dispatch
+#: shapes -- the closure bank and the inlined chain, whose ladder must route
+#: every assigned number through its scramble exactly like the bank does.
 FORMATS = (
     FormatSpec(),
     FormatSpec(op_bytes=2, pad=2),
     FormatSpec(reg_bytes=2, wide_bytes=3, reg_mask=0x5A, target_mode="rel"),
+    FormatSpec(dispatch_shape="chain", dispatch_salt=0x39, arm_seed=7),
+    FormatSpec(op_bytes=2, dispatch_shape="chain", dispatch_salt=0x7F1,
+               arm_seed=41, pad=1),
+    # Inline operand reads: the field arithmetic is spelled at the read site
+    # instead of calling the generated readers, so routing must hold without
+    # the reader functions being the decode path.
+    FormatSpec(inline_reads=True, arm_seed=19),
+    FormatSpec(dispatch_shape="chain", dispatch_salt=0x55, arm_seed=5,
+               inline_reads=True),
 )
 
 _CASES = [(seed, sparse, ratio, variant)

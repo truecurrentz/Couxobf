@@ -280,6 +280,27 @@ class FormatSpec:
     #: The group index, written into the payload header so the descriptor never
     #: carries a plaintext copy of which interpreter owns it.
     group: int = 0
+    #: How the loop picks a handler.  ``bank`` keeps every handler in a
+    #: closure and dispatches through hashed bucket tables -- compact, and the
+    #: historical shape.  ``chain`` inlines the handler bodies into a permuted
+    #: ``if/elseif`` ladder keyed by a per-format scramble of the opcode
+    #: number: no closure call per instruction, which is several times faster
+    #: on hot loops, and one more per-build surface a devirtualizer has to
+    #: tell apart.  Which shape a group gets is drawn, so one artifact can
+    #: hold both.
+    dispatch_shape: str = "bank"
+    #: The scramble salt of the ``chain`` shape: the loop tests
+    #: ``band(bxor(op, salt), mask)`` once per instruction and compares the
+    #: result against one constant per arm.  ``bxor`` is a bijection, so
+    #: distinct opcode numbers always map to distinct keys and an unassigned
+    #: number can never collide with a real arm.
+    dispatch_salt: int = 0
+    #: Read operands with the field arithmetic spelled inline at each read
+    #: site instead of calling the generated readers.  Each reader call costs
+    #: a Luau function call on the interpreter's hottest path; inlining turns
+    #: it into straight arithmetic.  The readers stay generated and per-build
+    #: either way -- this only moves where their text lives.
+    inline_reads: bool = False
 
     # -- field geometry ---------------------------------------------------
     def fields(self, op: str) -> Tuple[FieldKey, ...]:
@@ -548,6 +569,8 @@ class FormatSpec:
             "arm_seed": self.arm_seed,
             "op_pos_mult": self.op_pos_mult,
             "field_order_seed": self.field_order_seed,
+            "dispatch_shape": self.dispatch_shape,
+            "inline_reads": self.inline_reads,
         }
 
 
@@ -584,37 +607,83 @@ def reader_source(fmt: FormatSpec, code_var: str,
     else:
         lines.append("local function _ro(a) return %s end"
                      % fmt.op_decode_expr(fetch, "a"))
+    # With inline reads the operand arithmetic lives at the read sites, so
+    # the only readers left are the opcode fetch and the jump-target decode:
+    # emitting the rest would ship dead functions for a matcher to enjoy.
+    if getattr(fmt, "inline_reads", False):
+        lines.append(_rt_source(fmt, code_var, edge_var))
+        return lines
+    # Field readers are flat: one call per field read, byte fetches spelled
+    # inline.  A nested reader (_rr -> _r8 -> _bd) turns every operand into
+    # three function calls, and operands are the hot path of the whole
+    # interpreter -- flattening them is a constant-factor win with no change
+    # to what a reader is: one generated function per group per field class,
+    # derived from this build's parameters and nothing else.
     if fmt.reg_bytes == 1:
-        lines.append(f"local function _r8(a) return _bd({code_var}, a) end")
+        r_raw = "_bd(%s, a)" % code_var
     else:
-        lines.append(f"local function _r8(a) return _bd({code_var}, a) + "
-                     f"_bd({code_var}, a + 1) * 256 end")
-    lines.append("local function _rr(a) return (_r8(a) - %d) %% %d + 1 end"
-                 % (fmt.reg_mask, 1 << (8 * fmt.reg_bytes)))
+        r_raw = ("_bd(%s, a) + _bd(%s, a + 1) * 256"
+                 % (code_var, code_var))
+    lines.append("local function _r8(a) return %s end" % r_raw)
+    lines.append("local function _rr(a) return (%s - %d) %% %d + 1 end"
+                 % (r_raw, fmt.reg_mask, 1 << (8 * fmt.reg_bytes)))
     if fmt.wide_bytes == 2:
-        lines.append("local function _rw(a) return _bd(%s, a) + _bd(%s, a + 1) "
-                     "* 256 end" % (code_var, code_var))
+        w_raw = ("_bd(%s, a) + _bd(%s, a + 1) * 256"
+                 % (code_var, code_var))
     elif fmt.wide_bytes == 3:
-        lines.append("local function _rw(a) return _bd(%s, a) + _bd(%s, a + 1) "
-                     "* 256 + _bd(%s, a + 2) * 65536 end"
-                     % (code_var, code_var, code_var))
+        w_raw = ("_bd(%s, a) + _bd(%s, a + 1) * 256 "
+                 "+ _bd(%s, a + 2) * 65536"
+                 % (code_var, code_var, code_var))
     else:  # pragma: no cover - draw() only produces 2 and 3
-        lines.append("local function _rw(a) return _bd(%s, a) end" % code_var)
-    lines.append("local function _rk(a) return (_rw(a) - %d) %% %d end"
-                 % (fmt.wide_mask, 1 << (8 * fmt.wide_bytes)))
+        w_raw = "_bd(%s, a)" % code_var
+    lines.append("local function _rw(a) return %s end" % w_raw)
+    lines.append("local function _rk(a) return (%s - %d) %% %d end"
+                 % (w_raw, fmt.wide_mask, 1 << (8 * fmt.wide_bytes)))
     # Register index in a wide slot: the wide field's *size* and the register
     # field's mask and one-based bias, so the handler can use it as an index
     # exactly as if it had been a byte-wide ``r`` field.
-    lines.append("local function _rp(a) return (_rw(a) - %d) %% %d + 1 end"
-                 % (fmt.reg_mask, 1 << (8 * fmt.wide_bytes)))
+    lines.append("local function _rp(a) return (%s - %d) %% %d + 1 end"
+                 % (w_raw, fmt.reg_mask, 1 << (8 * fmt.wide_bytes)))
+    lines.append(_rt_source(fmt, code_var, edge_var))
+    return lines
+
+
+def _wide_raw(fmt: FormatSpec, code_var: str, at: str = "a") -> str:
+    """The raw little-endian read of one wide field, as Luau text."""
+    if fmt.wide_bytes == 2:
+        return ("_bd(%s, %s) + _bd(%s, %s + 1) * 256"
+                % (code_var, at, code_var, at))
+    if fmt.wide_bytes == 3:
+        return ("_bd(%s, %s) + _bd(%s, %s + 1) * 256 + _bd(%s, %s + 2) * 65536"
+                % (code_var, at, code_var, at, code_var, at))
+    return "_bd(%s, %s)" % (code_var, at)
+
+
+def _reg_raw(fmt: FormatSpec, code_var: str, at: str = "a") -> str:
+    if fmt.reg_bytes == 1:
+        return "_bd(%s, %s)" % (code_var, at)
+    return ("_bd(%s, %s) + _bd(%s, %s + 1) * 256"
+            % (code_var, at, code_var, at))
+
+
+def _rt_source(fmt: FormatSpec, code_var: str, edge_var: str) -> str:
+    """The jump-target reader, shared by the reader and inline-read paths.
+
+    Targets are the one field class that stays a function even when operand
+    reads are inlined: they are read once per jump rather than once per
+    instruction, and the edges variant is long enough that spelling it out at
+    every site would pay its size cost for almost no speed.
+    """
+    w_raw = _wide_raw(fmt, code_var)
+    mod = 1 << (8 * fmt.wide_bytes)
     if fmt.target_mode == "rel":
         # Two's-complement-free signed decoding: the modulus is a power of two,
         # so the high bit says "negative" and subtracting the modulus once is
         # exact for every value a real offset can take.
-        mod = 1 << (8 * fmt.wide_bytes)
-        lines.append("local function _rt(a) local v = _rk(a) if v >= %d then "
-                     "v = v - %d end return v end" % (mod // 2, mod))
-    elif fmt.target_mode == "edges":
+        return ("local function _rt(a) local v = (%s - %d) %% %d "
+                "if v >= %d then v = v - %d end return v end"
+                % (w_raw, fmt.wide_mask, mod, mod // 2, mod))
+    if fmt.target_mode == "edges":
         # Targets live in their own authenticated region, four bytes per edge,
         # and the instruction carries only the *ordinal* -- so the field is read
         # like any other wide (same mask, same width) and the result indexes the
@@ -624,20 +693,41 @@ def reader_source(fmt: FormatSpec, code_var: str,
         # from the ordinal side.  Costs one indirection per jump and buys the
         # property that a lift of the instruction stream alone does not reveal
         # where control goes (#18).
-        lines.append(
-            "local function _rt(a) local q = 1 + _rk(a) * 4 return "
-            "_bd(%s, q) + _bd(%s, q + 1) * 256 + _bd(%s, q + 2) * 65536 "
-            "+ _bd(%s, q + 3) * 16777216 end"
-            % ((edge_var,) * 4))
-    else:
-        bias = fmt.target_bias if fmt.target_mode == "biased" else 0
-        if bias:
-            lines.append("local function _rt(a) local v = _rk(a) - %d "
-                         "if v < 0 then v = v + %d end return v end"
-                         % (bias, 1 << (8 * fmt.wide_bytes)))
-        else:
-            lines.append("local function _rt(a) return _rk(a) end")
-    return lines
+        return ("local function _rt(a) local q = 1 + ((%s - %d) %% %d) * 4 "
+                "return _bd(%s, q) + _bd(%s, q + 1) * 256 + _bd(%s, q + 2) "
+                "* 65536 + _bd(%s, q + 3) * 16777216 end"
+                % (w_raw, fmt.wide_mask, mod,
+                   edge_var, edge_var, edge_var, edge_var))
+    bias = fmt.target_bias if fmt.target_mode == "biased" else 0
+    if bias:
+        return ("local function _rt(a) local v = (%s - %d) %% %d - %d "
+                "if v < 0 then v = v + %d end return v end"
+                % (w_raw, fmt.wide_mask, mod, bias, mod))
+    return ("local function _rt(a) return (%s - %d) %% %d end"
+            % (w_raw, fmt.wide_mask, mod))
+
+
+def inline_read(fmt: FormatSpec, kind: str, code_var: str, at: str) -> str:
+    """The inline expression one read site uses instead of a reader call.
+
+    ``kind`` is ``r`` for a register field, ``p`` for a register index stored
+    in a wide slot, and ``w`` for an ordinary wide field.  ``at`` is the
+    Luau expression naming the byte position.  The arithmetic is exactly the
+    readers': same masks, same moduli, same one-based bias -- the reader
+    functions and this expression are two spellings of one contract, and the
+    interpreter tests execute both.
+    """
+    if kind == "r":
+        return ("((%s) - %d) %% %d + 1"
+                % (_reg_raw(fmt, code_var, at), fmt.reg_mask,
+                   1 << (8 * fmt.reg_bytes)))
+    if kind == "p":
+        return ("((%s) - %d) %% %d + 1"
+                % (_wide_raw(fmt, code_var, at), fmt.reg_mask,
+                   1 << (8 * fmt.wide_bytes)))
+    return ("((%s) - %d) %% %d"
+            % (_wide_raw(fmt, code_var, at), fmt.wide_mask,
+               1 << (8 * fmt.wide_bytes)))
 
 
 def read_reg(fmt: FormatSpec, off: int) -> str:
@@ -831,6 +921,17 @@ def draw(rng: Optional[Rng], prefs: Optional[FormatPrefs] = None, *,
     # tested first is free, and sorting by number is what let "the third arm is
     # LOADK" be a fact about the tool.
     arm_seed = (rng.randint(1, 0x7FFFFFFF) if prefs.allow_arm_permutation else 0)
+    # Dispatch shape.  Both shapes run the same handlers over the same stream;
+    # the draw makes "which one" a per-group fact instead of a fact about the
+    # tool.  The chain's salt lives in the opcode field's number space, so it
+    # widens with ``op_bytes`` like everything else that touches that field.
+    dispatch_shape = rng.choice(("bank", "chain"))
+    dispatch_salt = (rng.randint(1, (1 << (8 * op_bytes)) - 1)
+                     if dispatch_shape == "chain" else 0)
+    # Inline operand reads in half of drawn formats: the speed/size trade is
+    # real in both directions, so the artifact carries both variants and the
+    # draw decides per group.
+    inline_reads = bool(rng.chance(0.5))
     chosen: Tuple[FusionRule, ...] = ()
     if fusion_rules:
         # A random subset, not the whole menu.  Which pairs a build fuses is
@@ -862,6 +963,9 @@ def draw(rng: Optional[Rng], prefs: Optional[FormatPrefs] = None, *,
         fused=tuple(chosen),
         reorder=on(prefs.allow_instruction_reorder, 0.6),
         group=group,
+        dispatch_shape=dispatch_shape,
+        dispatch_salt=dispatch_salt,
+        inline_reads=inline_reads,
     )
 
 

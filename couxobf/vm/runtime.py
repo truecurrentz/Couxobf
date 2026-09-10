@@ -142,20 +142,34 @@ class OperandView:
         return {k: v + self.shift - back
                 for k, v in self.fmt.offsets(self.op).items()}
 
-    def reads(self) -> List[str]:
-        """The operand reads, in wire order, all before ``pc`` moves."""
+    def reads(self, code_var: Optional[str] = None) -> List[str]:
+        """The operand reads, in wire order, all before ``pc`` moves.
+
+        ``code_var`` enables the format's inline-read mode: the field
+        arithmetic is spelled at the read site instead of calling the
+        generated readers, trading artifact bytes for the function-call
+        cost on the interpreter's hottest path.  Jump targets stay a reader
+        call either way (see ``_rt_source`` for why).
+        """
+        from .format import inline_read
+        inline = bool(getattr(self.fmt, "inline_reads", False)) and code_var
         names = self.names()
         lines: List[str] = []
         for key, at in sorted(self.offsets().items(), key=lambda kv: kv[1]):
             var = names[key]
             pos = _pos(at)
-            if key[0] == "r":
+            if key == ("w", "target"):
+                lines.append(_target_read(self.fmt, pos))
+            elif inline:
+                kind = "r" if key[0] == "r" else (
+                    "p" if self.fmt.reg_in_wide(key) else "w")
+                lines.append("local %s = %s"
+                             % (var, inline_read(self.fmt, kind, code_var, pos)))
+            elif key[0] == "r":
                 lines.append(f"local {var} = _rr({pos})")
             elif self.fmt.reg_in_wide(key):
                 # register semantics, wide storage -- see ``isa.REGISTER_IN_WIDE``
                 lines.append(f"local {var} = _rp({pos})")
-            elif key == ("w", "target"):
-                lines.append(_target_read(self.fmt, pos))
             else:
                 lines.append(f"local {var} = _rk({pos})")
         return lines
@@ -393,7 +407,7 @@ def _handler(op: str, n: Dict[str, str], fam: Optional[Family] = None,
     spec = fmt if fmt is not None else LEGACY_SPEC
     v = view if view is not None else OperandView(spec, op)
     advance = spec.body_size(op)
-    out = v.reads()
+    out = v.reads(code_var=n.get("code"))
     travel = advance
     if advance and op not in _NO_ADVANCE:
         # Advancing before doing the work is what lets every format -- padded,
@@ -426,7 +440,7 @@ def _fused_handler(rule: FusionRule, n: Dict[str, str], fam: Family,
     for op, base in ((rule.first, 0), (rule.second, shift)):
         view = OperandView(fmt, op, base)
         lines.append("do")
-        lines += ["  " + ln for ln in view.reads()]
+        lines += ["  " + ln for ln in view.reads(code_var=n.get("code"))]
         lines += ["  " + ln for ln in _fix_bias(op, fmt, view)]
         lines += ["  " + ln for ln in _body(op, fam, n, fmt)]
         lines.append("end")
@@ -690,6 +704,51 @@ def dispatch_seed(entries: Sequence[_Entry]) -> int:
     return total
 
 
+def _emit_chain_ladder(lines: List[str], entries: Sequence[_Entry],
+                       n: Dict[str, str], fam: Family, fmt: FormatSpec,
+                       trace: Optional[List[Tuple[Tuple[int, ...],
+                                                  Tuple[str, ...]]]] = None
+                       ) -> None:
+    """The ``chain`` dispatch shape: handler bodies inlined in an if ladder.
+
+    One scramble per instruction -- ``band(bxor(op, salt), mask)`` -- and then
+    plain integer comparisons, one per arm, in this build's drawn order.  No
+    closure call, no bucket table, no pack-of-results protocol on return:
+    a RETURN arm's ``return ...`` leaves the interpreter directly, which is
+    several times cheaper per instruction than the bank shape on hot loops.
+
+    The scramble is the protection half: ``bxor`` with the format's salt is a
+    bijection over the opcode field, so distinct numbers always map to
+    distinct keys, an unassigned number can never collide with a real arm,
+    and the keys in the ladder are a per-build image of the numbering rather
+    than the numbering itself.
+    """
+    mask = (1 << (8 * max(1, fmt.op_bytes))) - 1
+    salt = getattr(fmt, "dispatch_salt", 0) & mask
+    dk = _local_ident((getattr(fmt, "arm_seed", 0) ^ salt ^ 0xC417), 7)
+    lines.append("    local %s = bit32.band(bit32.bxor(op, %d), %d)"
+                 % (dk, salt, mask))
+    first = True
+    for entry in entries:
+        number = entry.numbers[0]
+        key = (number ^ salt) & mask
+        cond = "%s == %d" % (dk, key)
+        lines.append("    %s %s then" % ("if" if first else "elseif", cond))
+        first = False
+        if trace is not None:
+            # Routing truth is recorded as the plain number the arm accepts:
+            # the scramble is bijective, so "which value reaches which arm"
+            # is the same fact stated without it, and the harness evaluates
+            # these conditions with only ``op`` in scope.
+            trace.append((tuple(entry.numbers),
+                          (_plain_cond(tuple(entry.numbers)),)))
+        for body_line in entry.body(n, fam, fmt):
+            lines.append("      " + body_line)
+    lines.append("    else")
+    lines.append("      error(%s)" % _vm_fail(fmt, 1))
+    lines.append("    end")
+
+
 def _emit_dispatch(lines: List[str], entries: Sequence[_Entry],
                    n: Dict[str, str], fam: Family, dispatcher: str,
                    fmt: FormatSpec,
@@ -782,12 +841,14 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         loop_guard += ["  " + line for line in entry_guard]
         loop_guard.append("end")
 
+    # The loop's tripwire: a pc driven off the payload reaches the same
+    # neutral error as every other invalid VM state.  The payload's length is
+    # hoisted to a local -- computing `#code` per instruction made the
+    # tripwire cost several percent of a hot loop for nothing, because the
+    # length cannot change while the loop runs.
+    code_len = _local_ident((getattr(spec, "arm_seed", 0) ^ 0x1E4F), 9)
     opaque_line = ([
-        # A short opaque branch whose truth depends on the bytecode and the
-        # decoded opcode for this execution, not on a repetitive algebraic
-        # identity.  It doubles as a cheap tamper tripwire: a bad pc/op image
-        # reaches the same neutral error as every other invalid VM state.
-        f"    if not ((op == op) and (pc >= 1) and (#{n['code']} >= pc)) then error({_vm_fail(spec, 5)}) end",
+        f"    if {code_len} < pc or pc < 1 then error({_vm_fail(spec, 5)}) end",
     ] if opaque_predicates else [])
 
     lines: List[str] = [
@@ -839,12 +900,20 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         lines.append("  if type(%s) == \"function\" then %s = %s() end" % (EDGE_LOCAL, EDGE_LOCAL, EDGE_LOCAL))
     lines += ["  " + ln for ln in reader_lines(spec, code, EDGE_LOCAL)]
     lines += [
+        f"  local {code_len} = #{n['code']}",
         # The entry point comes out of the payload header, which is inside the
         # authenticated blob, rather than from the descriptor table beside it.
         f"  local pc = {entry_expr}",
     ] + ["  " + decl for decl in fam.state]
     entries = dispatch_entries(opmap, spec)
-    handler_table, handler_call, handler_ret, handler_buckets = _emit_handler_bank(lines, entries, n, fam, spec, trace)
+    shape = getattr(spec, "dispatch_shape", "bank")
+    if shape == "chain":
+        # No bank: the arms' bodies go into the ladder below, so nothing here
+        # declares the closure table or its pack-of-results protocol.
+        handler_table = handler_call = handler_ret = ""
+        handler_buckets = 1
+    else:
+        handler_table, handler_call, handler_ret, handler_buckets = _emit_handler_bank(lines, entries, n, fam, spec, trace)
     lines += [
         "  while true do",
         # The selector comes from the generated reader, not from a `byte(code, pc)`
@@ -859,17 +928,20 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         *["    " + line for line in loop_guard],
     ]
 
-    _emit_dispatch(lines, entries, n, fam, dispatcher,
-                   spec, trace, handler_table, handler_call, handler_ret, handler_buckets)
+    if shape == "chain":
+        _emit_chain_ladder(lines, entries, n, fam, spec, trace)
+    else:
+        _emit_dispatch(lines, entries, n, fam, dispatcher,
+                       spec, trace, handler_table, handler_call, handler_ret, handler_buckets)
     lines += [
         "  end",
         "end",
         f"local function {n['enter']}(p, E, ...)",
-        # The environment guard, when this build has one: checking on entry is
-        # what catches a runner that swaps the dump surfaces while the artifact
-        # is already running.  Before the frame is built, so a refused call never
-        # touches the payload at all.
-        *[f"  {line}" for line in entry_guard],
+        # The environment guard rides the dispatch loop (see ``loop_guard``),
+        # masked like any other opaque check, rather than sitting at the head
+        # of this function: an entry point that opens with the check is a
+        # signature for it, and the loop already re-checks often enough that a
+        # mid-run swap is caught within a handful of instructions.
         "  local _ec = p.code",
         "  if type(_ec) == \"function\" then _ec = _ec() end",
         "  local R = {}",

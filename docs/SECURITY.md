@@ -65,16 +65,22 @@ none of which the build controls.
 ### Virtualization and dispatch (implemented)
 
 A selected prototype is lowered to a register file driven by a generated
-interpreter, with no lexical blocks and no visible loop structure. Four state
-models (`register`, `accumulator`, `stack`, `hybrid`) and three dispatch shapes
-(`nested_if`, `decision_tree`, `bucket`) are drawn per VM group, and `vm_variety`
-means one artifact can hold two or three of them at once, each with its own opcode
-map, field widths, jump-target mode and handler fusion. Two more axes are per group
-as well: `vm_isa_subset` gives a VM only the operations its own protos were lowered
-to, and `opcode_cipher` stores a bijective image of the dispatcher's number in the
-bytecode, with the order of the dispatch arms drawn alongside it. The report prints
-one line per group so the claim is checkable rather than asserted, and the web
-result panel shows the same table, cipher included.
+interpreter, with no lexical blocks and no visible loop structure. The
+interpreter itself is one deliberately consolidated design -- a single register
+discipline with a guarded, table-indexed dispatch -- because shipping four
+parallel interpreter shapes put four recognizable surfaces in every artifact and
+gave a deobfuscator four times the targets. What varies is everything *around*
+that one shape, and it varies per VM group: `vm_variety` lets one artifact hold
+several interpreters at once, and each group draws its own opcode numbering,
+instruction format (field widths, operand masks, padding, field order,
+jump-target mode and opcode cipher), instruction subset and dispatch-key
+mixing. Two more axes are per group as well: `vm_isa_subset` gives a VM only
+the operations its own protos were lowered to, and `opcode_cipher` stores a
+bijective image of the dispatcher's number in the bytecode, with the order of
+the dispatch arms drawn alongside it. The report prints one line per group so
+the claim is checkable rather than asserted, and the web result panel shows the
+same table, cipher included. The earlier multi-family/multi-dispatcher names
+still load for saved configs, but they normalize to this one interpreter.
 
 (The heading used to read "control-flow flattening". It was a misnomer: what is
 implemented is dispatch, not flattening -- there is no threaded code and no
@@ -83,13 +89,14 @@ instruction reordering, which is real; graph flattening is not claimed.)
 
 **Cost added:** an analyst must reconstruct a CFG per group, under a numbering
 and an instruction geometry that exist only in this file, before they can reason
-about the program at all. A tool written against `nested_if` with 1-byte operands
-and absolute jump targets does not read a group that chose `decision_tree`, 2-byte
-operands and an edge table. A group that narrowed its instruction set also has
-fewer arms than the tool expects, and its payload numbers have to pass through
-that build's reader before they mean anything. This is the single largest cost
-multiplier in the current build, because it attacks *structure*, which is what a
-human reads first.
+about the program at all. A tool written against one group's 1-byte operands,
+biased jump targets and additive register mask does not read a sibling group
+with 2-byte operands, an edge table and a different mask -- the recovered
+format is per group, not per artifact. A group that narrowed its instruction
+set also has fewer arms than the tool expects, and its payload numbers have to
+pass through that build's reader before they mean anything. This is the single
+largest cost multiplier in the current build, because it attacks *structure*,
+which is what a human reads first.
 
 **What that cost is, measured.** `tools/reuse-audit.py` builds the same program
 under several configurations, learns a "stored value means operation" table from
@@ -206,10 +213,13 @@ position in the file is decided by the emitter rather than by the build seed.
 Diversifying the implementations is on the roadmap and is not done (#23, #24).
 
 **The environment guard raises cost and prevents nothing.** `env_guard` and
-`dump_guard` capture the interesting library names at load and re-check five
-surfaces (`string.dump`, `getbytecode`, `getscriptbytecode`, `debug.getinfo`,
-`debug.gethook`) at every VM entry; at level 2 the build can neutralize a logging
-`__index` or refuse once a surface has been swapped. None of that is a boundary.
+`dump_guard` capture the interesting library names at load and re-check the
+watched surfaces (`string.dump`, `getbytecode`, `getscriptbytecode`,
+`debug.getinfo`, `debug.gethook`) from inside the dispatch loop, masked the
+way an opaque predicate is -- a mid-run swap of a surface is caught within a
+handful of instructions rather than at a greppable entry point; at level 2
+the build refuses with the dispatcher's own fallthrough wording, assembled at
+runtime so the phrase never appears in the artifact. None of that is a boundary.
 A dumper that patches the in-memory proto never calls any of those functions; a
 hook installed before the artifact loads sees the capture happen; and a debugger
 runs the same language the guard is written in. The artifact's own report states

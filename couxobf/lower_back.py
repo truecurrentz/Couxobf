@@ -1102,7 +1102,7 @@ def reconstruct_protected(module: IRModule,
         pooled = lambda value: "%s(%d)" % (names["get"], pool_ticket(pool.slot(value)))
         vm_src = _wiring.prelude_source(plan, rec.vm_encoded, pooled, pooled,
                                         edges_expr=pooled,
-                                        entry_guard=(),
+                                        entry_guard=guard.entry_lines(),
                                         opaque_predicates=bool(opaque_predicates))
 
     # A program with no constants at all needs no pool: emitting the runtime
@@ -1250,10 +1250,20 @@ def reconstruct_protected(module: IRModule,
         for need in ("pool", "helpers"):
             if need in deps:
                 deps["vm"].add(need)
+        # The interpreter's per-entry re-check calls the guard's own checker,
+        # so the guard block (which defines it) must land first; with no
+        # constraint the bootstrap shuffle could emit the VM before it.
+        if "guard" in deps:
+            deps["vm"].add("guard")
     order: List[str] = []
     pending_components = set(deps)
     while pending_components:
-        ready = [k for k in pending_components if deps[k] <= set(order)]
+        # Sorted before the shuffle: iterating the pending *set* follows the
+        # process hash seed, and a shuffle of a differently ordered list draws
+        # the same random values but lands on a different permutation -- which
+        # is how two processes with one seed produced two artifacts.  The
+        # canonical order makes the shuffle a function of the build stream only.
+        ready = sorted(k for k in pending_components if deps[k] <= set(order))
         try:
             rng.shuffle(ready)
         except AttributeError:

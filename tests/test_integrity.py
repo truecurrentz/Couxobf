@@ -34,7 +34,9 @@ from couxobf.vm import encode, isa
 
 TOOLCHAIN = find_toolchain()
 
-CORPUS = sorted(glob.glob("/tmp/luau-src-0.700/tests/conformance/*.luau"))
+# Repo-local corpus first, external Luau checkout when present: the suite must
+# be green in a clean checkout, not merely in one where setup-luau.sh ran.
+from tests.corpus import CORPUS  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -294,22 +296,44 @@ def result_pool_names(config):
 def test_editing_the_pool_blob_fails_authentication(tmp_path):
     """Entry now lives inside the MAC'd blob, so editing it cannot be silent.
 
-    The plaintext field is gone; this is what covers it instead.  Single
-    character edits to the pool ciphertext must fail the tag check rather than
-    produce output.  Measured over 100 edits on a real build: 99 ended in
-    "constant pool failed authentication", the hundredth was a parse error
-    introduced by the edit itself, and none produced output.
+    The plaintext field is gone; this is what covers it instead.  The sealed
+    material (key image, nonce, tag, ciphertext, AAD) ships inside one meta
+    table as masked literal fragments, so the tamper surface is any byte of
+    any fragment inside that table: a single-character edit there must fail
+    the tag check (or the unwrap that precedes it) rather than produce
+    output.  A parse error introduced by the edit itself also counts as
+    "produced no output" -- the property under test is that no edit yields
+    the original program's behaviour.
     """
     src = "local function f() return 1, 2, 3 end\nprint(f())\n"
     config = Config(reproducible_seed=7, min_virtualize_body_nodes=1)
-    out = build(src, config, verify=False).source
+    result = build(src, config, verify=False)
+    out = result.source
 
-    # The pool prefix is per-build now, so the ciphertext name has to come from
+    # The pool prefix is per-build, so the meta-table name has to come from
     # the build rather than from default_names() -- which would silently find
     # nothing and make this test assert on a name that is not in the output.
-    blob, blob_quote = _string_literal(out, result_pool_names(config)["ct"])
-    assert blob is not None, "pool ciphertext not found in the output"
-    assert len(blob) > 40, "pool ciphertext implausibly short"
+    meta = result.runtime_names["pool"]["meta"]
+    m = re.search(r"local\s+" + re.escape(meta) + r"\s*=\s*\{", out)
+    assert m is not None, "pool meta table not found in the output"
+    start = m.start()
+    depth, i = 0, out.find("{", start)
+    while i < len(out):
+        if out[i] == '"':
+            i += 1
+            while i < len(out) and out[i] != '"':
+                i += 2 if out[i] == "\\" else 1
+        elif out[i] == "{":
+            depth += 1
+        elif out[i] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    region = out[start:i + 1]
+    literals = re.findall(r'"((?:[^"\\]|\\.)*)"', region)
+    assert literals and sum(len(s) for s in literals) > 40, \
+        "pool meta table carries no sealed material"
 
     baseline_path = tmp_path / "clean.luau"
     baseline_path.write_text(out)
@@ -318,19 +342,30 @@ def test_editing_the_pool_blob_fails_authentication(tmp_path):
     assert clean.returncode == 0, clean.stderr[:300]
     baseline = clean.stdout
 
-    positions = [i for i in range(2, min(len(blob), 400))
-                 if 33 <= ord(blob[i]) <= 126
-                 and blob[i - 1] != "\\" and blob[i - 2] != "\\"]
+    # Edit one printable character inside the masked fragments.  Positions are
+    # offset into the whole output so the splice needs no re-scanning.
+    positions = []
+    base = out.find(region)
+    for lit in re.finditer(r'"((?:[^"\\]|\\.)*)"', region):
+        body = lit.group(1)
+        for j in range(2, min(len(body), 200)):
+            if 33 <= ord(body[j]) <= 126 \
+                    and body[j - 1] != "\\" and body[j - 2] != "\\":
+                positions.append(base + lit.start(1) + j)
     assert len(positions) >= 20, "too few safely editable positions"
 
     produced_output = 0
-    for i in positions[:25]:
-        new = blob[:i] + ("A" if blob[i] != "A" else "B") + blob[i + 1:]
+    for pos in positions[:25]:
+        ch = out[pos]
+        tampered = out[:pos] + ("A" if ch != "A" else "B") + out[pos + 1:]
         path = tmp_path / "t.luau"
-        path.write_text(out[:blob_quote] + '"' + new + '"' + out[blob_quote + len(blob) + 1:])
+        path.write_text(tampered)
         r = subprocess.run([TOOLCHAIN.luau, str(path)], capture_output=True,
-                           text=True, timeout=30)
-        if r.returncode == 0 and r.stdout == baseline:
+                           timeout=30)
+        # stdout/stderr can carry raw bytes when the failure message echoes
+        # part of a binary literal; decode leniently rather than crash here.
+        if r.returncode == 0 \
+                and r.stdout.decode("utf-8", "replace") == baseline:
             produced_output += 1
     assert produced_output == 0, (
         f"{produced_output} tampered builds still produced the original "
