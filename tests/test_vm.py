@@ -343,7 +343,14 @@ def test_identity_map_starts_at_one():
 # ---------------------------------------------------------------------------
 
 def _corpus():
+    from tests.corpus import REPO_CORPUS
     files = sorted(glob.glob(os.path.join(MICRO_DIR, "*.luau")))
+    # The repo-local corpus always runs, exactly as in the pipeline suite:
+    # it is written and versioned here, so a checkout with no upstream Luau
+    # source tree still walks enough real programs for the coverage floors
+    # below to mean something (R0).
+    files += [p for p in REPO_CORPUS
+              if os.path.basename(p) not in {os.path.basename(f) for f in files}]
     conf = _conformance_dir()
     if conf:
         files += sorted(glob.glob(os.path.join(conf, "*.luau")))
@@ -1171,3 +1178,53 @@ def test_a_jump_leaves_pc_where_its_own_mode_measures_from(fmt):
         elif op in runtime._NO_ADVANCE:
             assert "pc = tgt + 1" in lines, (
                 f"{op} transfers control without setting pc from the target")
+
+
+def test_fresh_names_share_one_history():
+    """Two draws from one build must not be able to hand out the same name.
+
+    ``used`` is the shared history: it is reserved against and updated, so a
+    later draw cannot repeat an earlier one.  This pins the threading itself,
+    deterministically.
+    """
+    rng = rngmod.Rng(bytes(range(16)))
+    used = set()
+    first = wiring._fresh_names(rng, 8, used=used)
+    second = wiring._fresh_names(rng, 8, used=used)
+    assert len(set(first)) == 8
+    assert len(set(second)) == 8
+    assert not set(first) & set(second), (first, second)
+    assert used == set(first) | set(second)
+
+
+def test_plan_names_are_unique_across_every_draw():
+    """A plan's tables, roles and per-group entry points must all differ.
+
+    `make_plan` draws them in four separate calls, and each call used to build
+    its own :class:`NameGenerator` with an empty history -- so nothing stopped
+    two of them from handing out the same identifier.  The second declaration
+    shadows the first wherever both are in scope, and the artifact then raises
+    at the first call instead of running.  It took roughly one build in three
+    thousand to hit, which is often enough to ship and rare enough that no
+    test caught it: the sweep that found it was a `pcall` fixture printing
+    `attempt to index function with number` because a prototype table and an
+    entry point had both been named the same thing.
+
+    Unthreaded, about 2% of plans collide -- 39 of the 2000 below -- so this
+    loop is not a needle in a haystack.  The check reads the drawn names
+    directly rather than executing anything, because the failure is a
+    collision of *names*, not of semantics.
+    """
+    for seed in range(400):
+        rng = rngmod.Rng(bytes([(seed * 13 + i * 5) & 0xFF for i in range(16)]))
+        plan = wiring.make_plan(rng, [0, 1, 2], variety=2)
+        drawn = [plan.table, plan.consts_table, plan.edges_table,
+                 plan.rows_table]
+        drawn += [value for key, value in plan.names.items()
+                  if key not in ("append", "iter", "iterpack", "itercheck")]
+        for group in plan.groups:
+            drawn += [group.names["exec"], group.names["enter"]]
+        dupes = sorted({name for name in drawn if drawn.count(name) > 1})
+        assert not dupes, (
+            "seed %d drew the same VM identifier twice (%s): the second "
+            "declaration shadows the first" % (seed, ", ".join(dupes)))

@@ -122,6 +122,11 @@ class BuildStats:
     #: Split arms emitted into flattened native drivers (R2 native side):
     #: opaque ``elseif`` arms whose encoded state the build proves unreachable.
     split_arms: int = 0
+    #: How the flattened native drivers were shaped: one count per drawn state,
+    #: loop skeleton and dispatch form.  The report prints it because the shape
+    #: is the signature -- a build whose drivers all look alike is a build with
+    #: one fingerprint, whatever constants each drew.
+    driver_shapes: Dict[str, Any] = field(default_factory=dict)
     #: One entry per VM group this artifact carries: family, dispatcher, opcode
     #: count, instruction format and how many prototypes it runs.  Read out of the
     #: plan rather than derived from the config, because with `vm_variety` above 1
@@ -455,6 +460,7 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
     stats.fingerprint_bound = bool(runtime_names.get("fingerprint_bound"))
     stats.pool_decoys = int(runtime_names.get("pool_decoys") or 0)
     stats.split_arms = int(runtime_names.get("split_arms") or 0)
+    stats.driver_shapes = dict(runtime_names.get("driver_shapes") or {})
     stats.vm_groups = list(runtime_names.get("vm_plan") or [])
     stats.elapsed_ms = (time.perf_counter() - started) * 1000.0
 
@@ -617,6 +623,27 @@ def _collect_stats(module, classification, out: str, source_size: int,
     return stats
 
 
+def _driver_shape_summary(shapes: Dict[str, Any]) -> str:
+    """One line describing the driver shapes a build actually emitted.
+
+    Counts, not claims: the point of printing them is that a reader can see
+    whether the shapes moved or whether every flattened function was handed
+    the same driver.
+    """
+    def _part(label: str, key: str, order: Tuple[str, ...]) -> str:
+        counts = shapes.get(key) or {}
+        parts = ["%d %s" % (counts[name], name) for name in order
+                 if counts.get(name)]
+        return "%s %s" % (label, " / ".join(parts)) if parts else ""
+
+    parts = [_part("counter", "state", ("encoded", "raw")),
+             _part("loop", "skeleton", ("repeat", "while_break", "while")),
+             _part("dispatch", "dispatch", ("binary", "chain"))]
+    if shapes.get("shuffled"):
+        parts.append("%d shuffled arm order" % shapes["shuffled"])
+    return "; ".join(part for part in parts if part)
+
+
 def cost_report(result: BuildResult) -> str:
     """A deobfuscation cost model, in words.
 
@@ -716,6 +743,16 @@ def cost_report(result: BuildResult) -> str:
             "                        without solving the control flow." % s.split_arms)
     else:
         lines.append("split arms            : none in this build.")
+    shapes = s.driver_shapes.get("total")
+    if shapes:
+        body = ("%d flattened function(s), the driver shape drawn per function: "
+                "%s.  The counter, the loop and the dispatch are drawn "
+                "separately, so two functions in one artifact need not share a "
+                "driver shape at all." % (shapes, _driver_shape_summary(s.driver_shapes)))
+        wrapped = textwrap.wrap(body, width=54) or [""]
+        lines.append("native drivers        : %s" % wrapped[0])
+        for line in wrapped[1:]:
+            lines.append("                        %s" % line)
     if s.directives:
         kept = {k: v for k, v in sorted(s.directives.items()) if k != "ignored"}
         ignored = s.directives.get("ignored", 0)

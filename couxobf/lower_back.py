@@ -377,6 +377,13 @@ class Reconstructor:
         #: exactly-one-satisfiable invariant symbolically; production never
         #: looks at it.
         self.split_log: List[Dict[str, Any]] = []
+        # State fold per counter variable, for the drivers that keep the
+        # counter encoded.  Keyed by the counter's own name rather than held
+        # as one field because a nested prototype is lowered in the middle of
+        # its parent's arms: a single slot would come back from the child
+        # cleared, and the parent's remaining transitions would then write raw
+        # block ids into a counter whose arms compare images of them.
+        self._pc_enc: Dict[str, Any] = {}
         if (pool is None) != (accessor is None):
             raise ReconstructionError("pool and accessor must be given together")
 
@@ -497,6 +504,32 @@ class Reconstructor:
     def _pc_name(self, proto_id: int) -> str:
         return f"{self.native_prefix}c{proto_id}"
 
+    def driver_shape_counts(self) -> Dict[str, Any]:
+        """How many flattened drivers this build emitted, by the shape they drew.
+
+        The driver's shape is drawn per function, so the count exists to show
+        that it varied: a build whose drivers are all one shape carries one
+        signature, however the constants were drawn.
+        """
+        out: Dict[str, Any] = {"total": 0, "state": {}, "skeleton": {},
+                              "dispatch": {}, "shuffled": 0}
+        for log in self.split_log:
+            out["total"] += 1
+            for key in ("state", "skeleton", "dispatch"):
+                value = log[key]
+                out[key][value] = out[key].get(value, 0) + 1
+            if log["shuffled"]:
+                out["shuffled"] += 1
+        return out
+
+    def _sel_name(self, proto_id: int) -> str:
+        """The hoisted dispatch selector of a prototype's flattened driver.
+
+        Only the binary-search driver uses one; it needs somewhere to keep the
+        encoded state instead of recomputing it at every node.
+        """
+        return f"{self.native_prefix}s{proto_id}"
+
     def _param_name(self, proto_id: int, i: int) -> str:
         return f"{self.native_prefix}p{proto_id}_{i}"
 
@@ -599,34 +632,67 @@ class Reconstructor:
             stmts.append(A.Assign(targets=[self._reg(proto, i)],
                                   values=[_name(self._param_name(pid, i))]))
         pc = self._pc_name(pid)
-        stmts.append(A.Local(names=[_local_name(pc)], values=[_num(proto.entry)]))
+        pc_local = A.Local(names=[_local_name(pc)], values=[_num(proto.entry)])
+        stmts.append(pc_local)
         if len(proto.blocks) == 1:
             stmts.extend(self._block_body(proto, proto.blocks[0], pc))
             return stmts
 
-        # The native flattened driver varies per function: some blocks use an
-        # affine image of the state, some a shifted image, and single-block
-        # functions above bypass the driver entirely.  That keeps reconstructed
-        # native code from becoming one giant repeated state-machine signature.
+        # The native flattened driver varies per function, and not only in its
+        # constants.  A single shape -- `while pc do if (pc*mul+salt)%65536 ==
+        # ... end end` -- repeated on every flattened function is one enormous
+        # signature no matter how the numbers are drawn, so four independent
+        # choices are drawn here:
+        #
+        #   state     raw     the counter holds the block id and every arm
+        #                     recomputes an affine image of it
+        #             encoded the counter holds the image directly, so the
+        #                     dispatcher compares a plain local and no
+        #                     encoding expression is ever emitted
+        #   skeleton  the loop that drives it: a condition on the counter, an
+        #             infinite loop exited by `break`, or a repeat/until
+        #   dispatch  a flat equality chain or a binary search over the
+        #             encoded states
+        #   order     the arms in block order or shuffled
+        #
+        # All of them are semantically identical: the encoding is a bijection
+        # of the block ids, so exactly one arm can match any counter the
+        # driver can hold, which is the same invariant the decoy arms below
+        # trade on.
+        enc_modes = 5
         salt = 0
         mul = 1
         modulus = 65536
         mode = 0
-        if self.vm_layout_rng is not None:
+        state = "raw"
+        skeleton = "while"
+        dispatch = "chain"
+        shuffled = False
+        lay = self.vm_layout_rng
+        if lay is not None:
             try:
-                salt = 17 + self.vm_layout_rng.randbelow(60000)
-                mul = 3 + 2 * self.vm_layout_rng.randbelow(20000)
-                mode = self.vm_layout_rng.randbelow(3)
+                salt = 17 + lay.randbelow(60000)
+                mul = 3 + 2 * lay.randbelow(20000)
+                mode = lay.randbelow(enc_modes)
+                state = ("raw", "encoded")[lay.randbelow(2)]
+                skeleton = ("while", "while_break", "repeat")[lay.randbelow(3)]
+                dispatch = ("chain", "binary")[lay.randbelow(2)]
+                shuffled = lay.randbelow(2) == 1
             except AttributeError:
                 salt = 0
                 mul = 1
                 mode = 0
+                state = "raw"
+                skeleton = "while"
+                dispatch = "chain"
+                shuffled = False
+                lay = None
 
         # The state encoding, split into its two halves so the real arms and
         # the split-arm decoys cannot drift apart: ``enc_of`` is the value a
         # block's id maps to, ``enc_expr`` a fresh copy of the left-hand
-        # side (two arms must never share an AST node).  All three forms are
-        # bijections of the state -- mul is drawn odd against a power-of-two
+        # side (two arms must never share an AST node).  Every form is a
+        # bijection of the state -- mul is drawn odd against a power-of-two
         # modulus -- so a value outside the image of the block ids is
         # provably unreachable, which is what the decoy arms below trade on.
         def enc_of(block_id: int) -> int:
@@ -634,6 +700,10 @@ class Reconstructor:
                 return (block_id - salt) % modulus
             if mode == 2:
                 return (((block_id + salt) * mul) + (salt % 251)) % modulus
+            if mode == 3:
+                return ((block_id * mul) % modulus) + salt
+            if mode == 4:
+                return ((block_id + salt) * mul) % modulus
             return ((block_id * mul) + salt) % modulus
 
         def enc_expr() -> A.Expr:
@@ -647,6 +717,16 @@ class Reconstructor:
                                         left=A.Bin(op="*", left=A.Bin(op="+", left=_name(pc), right=_num(salt)), right=_num(mul)),
                                         right=_num(salt % 251)),
                              right=_num(modulus))
+            if mode == 3:
+                return A.Bin(op="+",
+                             left=A.Bin(op="%",
+                                        left=A.Bin(op="*", left=_name(pc), right=_num(mul)),
+                                        right=_num(modulus)),
+                             right=_num(salt))
+            if mode == 4:
+                return A.Bin(op="%",
+                             left=A.Bin(op="*", left=A.Bin(op="+", left=_name(pc), right=_num(salt)), right=_num(mul)),
+                             right=_num(modulus))
             return A.Bin(
                 op="%",
                 left=A.Bin(op="+",
@@ -655,18 +735,45 @@ class Reconstructor:
                 right=_num(modulus),
             )
 
+        # Encoded state writes the image into the counter itself, so every
+        # transition -- jumps, fallthrough, loop back-edges -- has to go
+        # through the same fold the arms were built with.
+        if state == "encoded":
+            self._pc_enc[pc] = enc_of
+            pc_local.values = [_num(enc_of(proto.entry))]
+        else:
+            self._pc_enc.pop(pc, None)
+
+        # What the arms select on.  Encoded state compares the counter
+        # directly; raw state compares an image of it, hoisted into a local
+        # when the binary search would otherwise recompute it at every node.
+        sel_name = self._sel_name(pid)
+        pre: List[A.Stmt] = []
+        if state == "encoded":
+            selector = lambda: _name(pc)  # noqa: E731
+        elif dispatch == "binary":
+            # Hoisted, but *inside* the driver: the counter moves on every
+            # iteration, so a selector computed once before the loop would
+            # dispatch the first block forever.
+            pre.append(A.Local(names=[_local_name(sel_name)],
+                               values=[enc_expr()]))
+            selector = lambda: _name(sel_name)  # noqa: E731
+        else:
+            selector = enc_expr
+
         encoded = {enc_of(b.id) for b in proto.blocks}
         rate = float(self.split_arms_rate)
-        draw = self.vm_layout_rng if (rate > 0 and self.vm_layout_rng is not None) else None
-        arms: List[Tuple[A.Expr, A.Block]] = []
+        draw = lay if (rate > 0 and lay is not None) else None
+        # (encoded state, body) pairs.  Decoy arms are entries like any other
+        # -- they sort into the dispatcher by value and simply never match.
+        entries: List[Tuple[int, List[A.Stmt]]] = []
         decoys: List[Tuple[int, int, int]] = []
         for b in proto.blocks:
             body = self._block_body(proto, b, pc)
-            cond = A.Bin(op="==", left=enc_expr(), right=_num(enc_of(b.id)))
-            arms.append((cond, A.Block(body=body)))
-            # R2's native-side split arm: an ``elseif`` whose encoded state
-            # no reachable pc can take (pc is only ever set to a block id,
-            # and the decoy value is outside the encoding's image of them),
+            entries.append((enc_of(b.id), body))
+            # R2's native-side split arm: an arm whose encoded state no
+            # reachable pc can take (pc is only ever set to a block id, and
+            # the decoy value is outside the encoding's image of them),
             # carrying a copy of the real block's tail assignments.  There is
             # no dead branch -- only a branch the build can prove unreachable
             # but a reader cannot without solving the flattened CFG.  The
@@ -682,30 +789,96 @@ class Reconstructor:
                     continue            # a pathological block table; skip
                 tail_n = min(len(body), 1 + draw.randbelow(3))
                 tail = copy.deepcopy(body[-tail_n:])
-                arms.append((A.Bin(op="==", left=enc_expr(), right=_num(v)),
-                             A.Block(body=tail)))
+                entries.append((v, tail))
                 decoys.append((b.id, v, tail_n))
                 self.split_arms_emitted += 1
+        if shuffled and lay is not None and len(entries) > 1:
+            for i in range(len(entries) - 1, 0, -1):
+                j = lay.randbelow(i + 1)
+                entries[i], entries[j] = entries[j], entries[i]
         self.split_log.append({
             "proto": proto.proto_id,
             "mode": mode,
             "salt": salt,
             "mul": mul,
             "modulus": modulus,
+            "state": state,
+            "skeleton": skeleton,
+            "dispatch": dispatch,
+            "shuffled": shuffled,
             "block_ids": [b.id for b in proto.blocks],
             "encoded": [enc_of(b.id) for b in proto.blocks],
             "decoys": decoys,
         })
-        stmts.append(A.While(
-            cond=_name(pc),
-            body=A.Block(body=[A.If(arms=arms,
-                                    otherwise=A.Block(body=[
-                                        A.Assign(targets=[_name(pc)],
-                                                 values=[A.Nil()])]))])))
+
+        # How the driver stops: by clearing the counter, or by leaving an
+        # infinite loop.  Reached only by states outside the image, which the
+        # build can prove unreachable and a reader cannot.
+        if skeleton == "while_break":
+            stop: A.Stmt = A.Break()
+        else:
+            stop = A.Assign(targets=[_name(pc)], values=[A.Nil()])
+
+        if dispatch == "binary":
+            ordered = sorted(entries, key=lambda e: e[0])
+
+            def node(items: List[Tuple[int, List[A.Stmt]]],
+                     tail: Optional[A.Stmt] = None) -> A.Stmt:
+                """A balanced search over the encoded states.
+
+                ``tail`` is threaded down the right-hand spine, where it
+                lands as the outermost ``else``: states above every encoded
+                value, which the build knows are unreachable.
+                """
+                if len(items) == 1:
+                    v, body = items[0]
+                    return A.If(arms=[(A.Bin(op="==", left=selector(),
+                                             right=_num(v)),
+                                       A.Block(body=body))],
+                                otherwise=(A.Block(body=[tail])
+                                           if tail is not None else None))
+                if len(items) == 2:
+                    return A.If(
+                        arms=[(A.Bin(op="==", left=selector(),
+                                     right=_num(items[0][0])),
+                               A.Block(body=items[0][1])),
+                              (A.Bin(op="==", left=selector(),
+                                     right=_num(items[1][0])),
+                               A.Block(body=items[1][1]))],
+                        otherwise=(A.Block(body=[tail])
+                                   if tail is not None else None))
+                mid = len(items) // 2
+                return A.If(
+                    arms=[(A.Bin(op="<", left=selector(),
+                                 right=_num(items[mid][0])),
+                           A.Block(body=[node(items[:mid])]))],
+                    otherwise=A.Block(body=[node(items[mid:], tail)]))
+
+            driver = node(ordered, stop)
+        else:
+            driver = A.If(
+                arms=[(A.Bin(op="==", left=selector(), right=_num(v)),
+                       A.Block(body=body)) for v, body in entries],
+                otherwise=A.Block(body=[stop]))
+
+        if skeleton == "repeat":
+            stmts.append(A.Repeat(body=A.Block(body=pre + [driver]),
+                                  cond=A.Bin(op="==", left=_name(pc),
+                                             right=A.Nil())))
+        elif skeleton == "while_break":
+            stmts.append(A.While(cond=A.Bool(value=True),
+                                 body=A.Block(body=pre + [driver])))
+        else:
+            stmts.append(A.While(cond=_name(pc),
+                                 body=A.Block(body=pre + [driver])))
         return stmts
 
     def _set_pc(self, pc: str, target: int) -> A.Assign:
-        return A.Assign(targets=[_name(pc)], values=[_num(target)])
+        # Encoded-state drivers hold an image of the block id, so the fold is
+        # applied here and the counter never carries a bare block id at all.
+        fold = self._pc_enc.get(pc)
+        value = target if fold is None else fold(target)
+        return A.Assign(targets=[_name(pc)], values=[_num(value)])
 
     def _block_body(self, proto: FuncIR, b, pc: str) -> List[A.Stmt]:
         out: List[A.Stmt] = []
@@ -1045,13 +1218,23 @@ def reconstruct_protected(module: IRModule,
         _optimize.optimize_module(module)
     crypto_enc_domain = rng.bytes(24)
     crypto_mac_domain = rng.bytes(24)
+    # Which stream cipher this build uses, and the stream its emitted shape is
+    # drawn from.  Forked rather than taken off the main stream so adding or
+    # removing a draw elsewhere cannot move every later decision in the build.
+    from .crypto import cipher as _cipher_mod
+    cipher_rng = rng.fork("cipher") if hasattr(rng, "fork") else rng
+    shape_rng = rng.fork("crypto-shape") if hasattr(rng, "fork") else rng
+    cipher_spec = _cipher_mod.draw(cipher_rng)
+    if names_out is not None:
+        names_out["cipher"] = cipher_spec.summary()
     pool = ConstantPool(keys, rng, context,
                         cache_policy=cache_policy, cache_bound=cache_bound,
                         decoys=pool_decoys,
                         constant_level=constant_level,
                         numeric_level=numeric_level,
                         enc_domain=crypto_enc_domain,
-                        mac_domain=crypto_mac_domain)
+                        mac_domain=crypto_mac_domain,
+                        cipher=cipher_spec)
 
     # Selected after optimization, so prototypes the optimizer shrank below the
     # size floor are not virtualized on the strength of code that no longer
@@ -1151,7 +1334,8 @@ def reconstruct_protected(module: IRModule,
                           context, page_size=string_page_size,
                           randomized_ids=True,
                           enc_domain=crypto_enc_domain,
-                          mac_domain=crypto_mac_domain)
+                          mac_domain=crypto_mac_domain,
+                          cipher=cipher_spec)
         # Its own prefix, drawn from the string stream: sharing the constant
         # pool's prefix would make the two runtimes recognisable as a pair.
         bank_names = bank_default_names(
@@ -1195,6 +1379,7 @@ def reconstruct_protected(module: IRModule,
     # off, which the report then says.
     if names_out is not None:
         names_out["split_arms"] = rec.split_arms_emitted
+        names_out["driver_shapes"] = rec.driver_shape_counts()
 
     # The VM's bytecode and constants are interned here, before the pool is
     # sealed below.  Doing it after would hand out slot numbers the encrypted
@@ -1238,7 +1423,8 @@ def reconstruct_protected(module: IRModule,
                             "mac": names["c_mac"], "open": names["c_open"],
                             "seal": names["c_seal"]},
                            enc_domain=crypto_enc_domain,
-                           mac_domain=crypto_mac_domain)))
+                           mac_domain=crypto_mac_domain,
+                           cipher=cipher_spec, rng=shape_rng)))
 
     runtime_guard_check = ""
 
@@ -1282,7 +1468,8 @@ def reconstruct_protected(module: IRModule,
                                 ticket_mask=pool_ticket_mask,
                                 enc_domain=sealed.enc_domain,
                                 mac_domain=sealed.mac_domain,
-                                dense=dense_codec)
+                                dense=dense_codec,
+                                cipher=cipher_spec, shape_rng=shape_rng)
 
     bank_src = ""
     if need_bank:
@@ -1309,10 +1496,13 @@ def reconstruct_protected(module: IRModule,
                             "mac": bn["c_mac"], "open": bn["c_open"],
                             "seal": bn["c_seal"]},
                            enc_domain=crypto_enc_domain,
-                           mac_domain=crypto_mac_domain) if not crypto_src else "",
+                           mac_domain=crypto_mac_domain,
+                           cipher=cipher_spec, rng=shape_rng) if not crypto_src else "",
             guard_check=runtime_guard_check,
             ticket_mask=bank_ticket_mask,
-            dense=dense_codec)
+            dense=dense_codec,
+            block_size=cipher_spec.block_size,
+            cipher=cipher_spec, shape_rng=shape_rng)
 
     dense_src = dense_codec.source(rng) if dense_codec is not None else ""
     if names_out is not None:

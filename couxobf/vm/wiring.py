@@ -194,15 +194,28 @@ def structural_fingerprint(plan: "VMPlan") -> bytes:
     return h.digest()[:8]
 
 
-def _fresh_names(rng: Rng, count: int, reserved: Iterable[str] = ()) -> List[str]:
-    """Unique names outside the ``_k`` space the rest of the output uses."""
-    gen = make_name_generator(rng, reserved=set(_SHARED) | set(reserved))
+def _fresh_names(rng: Rng, count: int, reserved: Iterable[str] = (),
+                 used: Optional[Set[str]] = None) -> List[str]:
+    """Unique names outside the ``_k`` space the rest of the output uses.
+
+    ``used`` accumulates across the calls one build makes and is reserved
+    against as well as updated.  Without it every call starts a generator
+    with an empty history, and two calls are free to draw the same name --
+    which is not a cosmetic clash: the second declaration shadows the first
+    wherever both are in scope, so a payload table and an entry point that
+    happen to collide produce an artifact that raises at the first call
+    instead of running.
+    """
+    gen = make_name_generator(
+        rng, reserved=set(_SHARED) | set(reserved) | set(used or ()))
     out: List[str] = []
     while len(out) < count:
         name = gen.fresh()
         if name.startswith(_INTERNAL_PREFIX):
             continue
         out.append(name)
+    if used is not None:
+        used.update(out)
     return out
 
 
@@ -271,13 +284,16 @@ def make_plan(rng: Rng, protos: Iterable[int],
     proto_ids = sorted(set(protos))
     family = _family_name(family)
     dispatcher = _dispatcher_name(dispatcher, rng)
-    tables = tuple(tables or _fresh_names(rng, 4))
+    # One history for every name this plan draws.  Successive generators would
+    # each start from nothing and could hand out the same identifier twice.
+    used: Set[str] = set(tables or ()) | set(name for name in (names or {}).values())
+    tables = tuple(tables or _fresh_names(rng, 4, used=used))
     if names is None:
         # Exactly one name per role: historically this drew one extra and threw
         # it away, and the draw count is part of the vm stream's fingerprint --
         # keeping it constant is what lets a new role (R5's ``uvs``) join the
         # roster without shifting every name drawn afterwards.
-        drawn = _fresh_names(rng, len(_ROLES))
+        drawn = _fresh_names(rng, len(_ROLES), used=used)
         names = dict(zip(_ROLES, drawn))
     else:
         # A caller-supplied name set: the test harness pins these so a failure
@@ -300,7 +316,7 @@ def make_plan(rng: Rng, protos: Iterable[int],
                           fusion=fusion, alias_ratio=alias_ratio,
                           alias_chance=alias_chance, prefs=fmt_prefs,
                           protos_by_id=protos_by_id, isa_subset=isa_subset,
-                          permute_blocks=permute_blocks)
+                          permute_blocks=permute_blocks, used=used)
     # A stable opcode numbering is a real option, not a placeholder: it makes
     # two builds of the same source comparable byte for byte apart from the
     # names, which is what you want when you are checking that a change did
@@ -333,8 +349,12 @@ def _make_groups(rng: Rng, proto_ids: List[int], names: Dict[str, str], *,
                  prefs: Optional[FormatPrefs] = None,
                  protos_by_id: Optional[Dict[int, Any]] = None,
                  isa_subset: bool = False,
-                 permute_blocks: bool = False) -> List[VMGroup]:
+                 permute_blocks: bool = False,
+                 used: Optional[Set[str]] = None) -> List[VMGroup]:
     """Partition the selection into VMs, one per group.
+
+    ``used`` carries the names the plan has already drawn, so the per-group
+    entry points drawn below cannot collide with them -- or with each other.
 
     Assignment is round-robin over the sorted prototype ids rather than random.
     A random split would make the *grouping* another thing to recover, which
@@ -344,6 +364,8 @@ def _make_groups(rng: Rng, proto_ids: List[int], names: Dict[str, str], *,
     with each other, and round-robin guarantees they get equal populations
     instead of 63 prototypes in one VM and one in the other.
     """
+    used = set(used or ()) | set(str(v) for v in names.values())
+
     # ``variety`` is honored again: every group draws its own format, opcode
     # map, cipher and dispatch key, so a devirtualizer recovered from one
     # group does not read the others.  Capped at the population -- a group
@@ -418,7 +440,7 @@ def _make_groups(rng: Rng, proto_ids: List[int], names: Dict[str, str], *,
         if count > 1:
             # Each group's own entry point name, so a build with two VMs does
             # not declare ``enter`` twice and quietly shadow one of them.
-            extra = _fresh_names(rng, 2)
+            extra = _fresh_names(rng, 2, used=used)
             own["exec"] = extra[0]
             own["enter"] = extra[1]
         # The opcode map is the budget: a one-byte field cannot carry more arms

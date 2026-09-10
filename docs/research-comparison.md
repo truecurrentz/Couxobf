@@ -246,9 +246,15 @@ crypto, text-level hacks).
   ISA subset from `required_ops`. Block permutation + in-block reorder.
   Build-time `integrity.payload` walk validates every payload against its own
   group's format.
-- **Native reconstruction.** Multi-block prototypes are *always* emitted as a
-  `while pc do if/elseif ...` state machine with one of three affine state
-  encodings drawn per function; single-block bodies stay straight-line.
+- **Native reconstruction.** Multi-block prototypes are emitted as a flattened
+  state machine whose *shape* is drawn per function, not only its constants:
+  the counter holds either a raw block id -- and arms compare one of five
+  arithmetic images of it -- or an encoded image, in which case no encoding
+  expression is emitted at all and arms compare the counter directly;
+  dispatch is either a flat equality chain or a balanced binary search over
+  the image; the driver loop is a `while` on the counter, an infinite loop
+  exited with `break`, or a `repeat/until`. Arm order is shuffled on some
+  functions. Single-block bodies stay straight-line.
 - **Honest gaps (config-declared, not wired).** `opaque_predicates` emits one
   boundary tautology only; `vm_variety` is pinned to 1 in `pipeline.py` (the
   maximum profile's `vm_variety=3` is silently ignored — a real defect);
