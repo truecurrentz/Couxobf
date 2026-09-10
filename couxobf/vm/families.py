@@ -198,27 +198,20 @@ def _woven(acc: str, stack: str, sp: str, salt: str) -> Family:
 
 
 def family(name: str, names: Dict[str, str]) -> Family:
-    """Build a family, using the build's own identifier names.
+    """Build the single production VM family.
 
-    The state locals are named by the build rather than fixed, so the
-    interpreter's shape does not advertise which family it is.
+    Legacy names are accepted as aliases for configuration compatibility, but all
+    protected output now uses one parameterized woven VM so one artifact does not
+    expose several interpreter shapes at once.
     """
     key = str(name).strip().lower()
-    if key == "register":
-        return _register()
-    if key == "accumulator":
-        return _accumulator(names["acc"])
-    if key == "stack":
-        return _stack(names["stack"], names["sp"])
-    if key == "hybrid":
-        return _hybrid(names["acc"], names["stack"], names["sp"])
-    if key == "woven":
+    if key in {"register", "accumulator", "stack", "hybrid", "woven"}:
         return _woven(names["acc"], names["stack"], names["sp"],
                       names.get("code", "woven"))
-    raise ValueError(f"unknown VM family {name!r}")
+    raise ValueError(f"unknown VM family {name!r}; expected woven")
 
 
-FAMILIES = ("register", "accumulator", "stack", "hybrid", "woven")
+FAMILIES = ("woven",)
 
 
 def substitute(lines: List[str], source_expr: str) -> List[str]:

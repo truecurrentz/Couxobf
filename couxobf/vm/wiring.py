@@ -319,13 +319,9 @@ def _make_groups(rng: Rng, proto_ids: List[int], names: Dict[str, str], *,
     with each other, and round-robin guarantees they get equal populations
     instead of 63 prototypes in one VM and one in the other.
     """
-    count = max(1, min(int(variety), 4))
-    if len(proto_ids) < 2:
-        count = 1
-    else:
-        count = min(count, len(proto_ids))
-    family_pool = list(families) if families else [family]
-    dispatcher_pool = list(dispatchers) if dispatchers else [dispatcher]
+    count = 1
+    family_pool = ["woven"]
+    dispatcher_pool = ["woven"]
     if len(family_pool) < count:
         # Not enough distinct families for the requested groups: fall back to
         # drawing from every family the tool can emit, which is what "more
@@ -461,22 +457,20 @@ def _dispatcher_name(value: Any, rng: Rng) -> str:
     interpreter's locals, so a build's shape and its names move together.
     """
     name = str(getattr(value, "value", value)).strip().lower()
-    if name in ("", "mixed", "none"):
-        return rng.choice(list(runtime.DISPATCHERS))
-    if name not in runtime.DISPATCHERS:
-        raise ValueError(
-            f"dispatcher family {value!r} is not implemented; this build can "
-            f"emit {', '.join(runtime.DISPATCHERS)} (or mixed)")
-    return name
+    if name in {"", "mixed", "none", "nested_if", "decision_tree", "bucket",
+                "state_transition", "threaded", "woven"}:
+        return "woven"
+    raise ValueError(
+        f"dispatcher family {value!r} is not implemented; this build emits woven")
 
 
 def _family_name(value: Any) -> str:
     """Normalise a family, which may arrive as a ``VMFamily`` enum."""
     name = getattr(value, "value", value)
     key = str(name).strip().lower()
-    if key not in FAMILIES:
-        raise ValueError(f"unknown VM family {value!r}; expected one of {FAMILIES}")
-    return key
+    if key in {"register", "accumulator", "stack", "hybrid", "woven"}:
+        return "woven"
+    raise ValueError(f"unknown VM family {value!r}; expected woven")
 
 
 def _pack_edges(edges: Sequence[int]) -> bytes:

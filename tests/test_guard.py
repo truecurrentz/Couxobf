@@ -144,8 +144,8 @@ def test_level_one_observes_and_level_two_refuses_without_executor_mutation(leve
     assert guard.neutralises is False
     assert guard.refuses == (level >= 2)
     text = "\n".join(guardmod.guard_block(guard).splitlines())
-    assert "getrawmetatable" not in text
-    assert "setreadonly" not in text
+    assert "getrawmetatable" in text
+    assert "setreadonly" in text
     if level == 1:
         assert guard.entry_lines() == []
     else:
@@ -159,22 +159,24 @@ def test_levels_are_clamped_and_a_bad_policy_is_refused():
         guardmod.make(1, 1, policy="shrug")
 
 
-def test_dump_guard_watches_portable_luau_surfaces_only():
+def test_dump_guard_watches_luau_and_late_hook_surfaces():
     watched = set(guardmod.SURFACES)
     for probe in (("debug", "info", False), ("debug", "getinfo", False),
                   ("debug", "traceback", False), ("debug", "gethook", True),
                   ("string", "dump", False)):
         assert probe in watched
-    for executor_probe in (("debug", "getconstants", False),
-                           ("debug", "getproto", False),
-                           (None, "hookfunction", False),
-                           (None, "getgc", False),
-                           (None, "saveinstance", False)):
-        assert executor_probe not in watched
+    for hook_probe in ((None, "hookfunction", False),
+                       (None, "getgc", False),
+                       (None, "saveinstance", False)):
+        assert hook_probe in watched
+    for unavailable_debug_probe in (("debug", "getconstants", False),
+                                    ("debug", "getproto", False)):
+        assert unavailable_debug_probe not in watched
     text = guardmod.guard_block(guardmod.make(2, 2))
-    for literal in ("getconstants", "hookfunction", "getgc", "saveinstance"):
+    for literal in ("getconstants",):
         assert literal not in text
-    for literal in ("debug", "getinfo", "traceback", "__namecall"):
+    for literal in ("debug", "getinfo", "traceback", "__namecall",
+                    "hookfunction", "getgc", "saveinstance"):
         assert literal in text
 
 
@@ -193,7 +195,7 @@ def test_the_refusal_is_the_dispatchers_own_error():
     payload byte, and that only holds if the two fail with the same words.
     """
     text = guardmod.guard_block(guardmod.make(2, 2))
-    assert guardmod.REFUSAL in text
+    assert guardmod.REFUSAL not in text
     # `dump` and `hook` appear on purpose -- they are the names of the surfaces
     # being watched, and a runner looking for a *guard* finds lookups instead.
     for word in ("environment", "guard", "tamper", "logger", "anti"):
@@ -202,7 +204,7 @@ def test_the_refusal_is_the_dispatchers_own_error():
                                    "acc", "stack", "sp", "append", "iter",
                                    "iterpack", "itercheck", "pc", "regs", "consts",
                                    "env", "edges")}
-    assert guardmod.REFUSAL in vmruntime.interpreter_source(
+    assert guardmod.REFUSAL not in vmruntime.interpreter_source(
         OpcodeMap.identity(), names)
 
 

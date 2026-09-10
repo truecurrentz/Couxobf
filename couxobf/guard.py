@@ -43,6 +43,7 @@ found by grepping for a marker string.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
@@ -59,20 +60,31 @@ CAPTURED: Tuple[str, ...] = (
     "pairs", "unpack", "gcinfo", "debug", "print", "warn",
 )
 
-#: Dump and inspection surfaces the guard watches, as ``(table, field, call_it)``.
-#: Only ordinary Lua/Luau surfaces are watched.  Executor-specific globals are
-#: intentionally excluded: this obfuscator is meant to run for everyone, and it
-#: should not punish the environment the user chooses to execute in.
+#: Dump, inspection and late-injected hook surfaces the guard watches, as
+#: ``(table, field, call_it)``.  Every lookup is nil-safe: normal sandboxes that
+#: do not expose executor globals snapshot ``nil`` and keep running, while a host
+#: that injects or swaps them after load trips the same generic refusal path.
 SURFACES: Tuple[Tuple[Optional[str], str, bool], ...] = (
-    # ``debug.gethook`` is called because the interesting value is the current
-    # hook, not the function object.  Each lookup is nil-safe; absence is normal
-    # on sandboxed Luau and is not a violation.
     ("string", "dump", False),
     ("debug", "info", False),
     ("debug", "getinfo", False),
     ("debug", "traceback", False),
     ("debug", "gethook", True),
     ("debug", "sethook", False),
+    (None, "hookfunction", False),
+    (None, "replaceclosure", False),
+    (None, "getbytecode", False),
+    (None, "getscriptbytecode", False),
+    (None, "getgc", False),
+    (None, "getreg", False),
+    (None, "getregistry", False),
+    (None, "getconnections", False),
+    (None, "saveinstance", False),
+    (None, "getsenv", False),
+    (None, "getrenv", False),
+    (None, "getrawmetatable", False),
+    (None, "setrawmetatable", False),
+    (None, "setreadonly", False),
 )
 
 #: Metatable fields that matter for logging/proxying.  ``__index`` and
@@ -288,6 +300,10 @@ class Guard:
         except KeyError as exc:
             raise KeyError(f"guard has no local for role {role!r}") from exc
 
+    def fail_literal(self, site: str) -> str:
+        token = hashlib.sha256((self.n("check") + ":" + site).encode()).digest()[:8]
+        return '"' + ''.join('\\x%02x' % b for b in token) + '"'
+
     def cap(self, name: str) -> str:
         """The local holding a library global, or the global itself.
 
@@ -406,8 +422,8 @@ class Guard:
             lines.append(f"  {self.n('flag')} = {check}()")
             lines.append("end")
         if self.refuses:
-            lines.append("if not %s then %s(\"%s\") end"
-                         % (self.n("flag"), self.cap("error"), REFUSAL))
+            lines.append("if not %s then %s(%s) end"
+                         % (self.n("flag"), self.cap("error"), self.fail_literal("load")))
         return lines
 
     def neutralise_lines(self) -> List[str]:
@@ -427,8 +443,8 @@ class Guard:
         """
         if not self.refuses:
             return []
-        return ["if not %s() then %s(\"%s\") end"
-                % (self.n("check"), self.cap("error"), REFUSAL)]
+        return ["if not %s() then %s(%s) end"
+                % (self.n("check"), self.cap("error"), self.fail_literal("entry"))]
 
     # -- reporting ---------------------------------------------------------
     def summary(self) -> Dict[str, Any]:

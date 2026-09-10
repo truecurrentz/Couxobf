@@ -390,12 +390,12 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         vm_level=config.virtualization_level,
         vm_rng=domains.get("vm"),
         vm_protos=selected,
-        vm_family=(VMFamily.HYBRID if config.vm_polymorphism else config.vm_family),
+        vm_family=VMFamily.WOVEN,
         block_permutation=config.block_permutation,
         opaque_predicates=bool(config.opaque_predicates),
         isa_subset=bool(config.vm_isa_subset),
         layout_rng=domains.get("cfg"),
-        dispatcher_family=(DispatcherFamily.MIXED if config.vm_polymorphism else config.dispatcher_family),
+        dispatcher_family=DispatcherFamily.MIXED,
         opcode_randomization=config.opcode_randomization,
         fmt_prefs=_vm_format.FormatPrefs.from_config(config),
         string_level=config.string_protection_level,
@@ -405,19 +405,13 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         string_rng=domains.get("strings"),
         string_cache_policy=str(getattr(config.cache_policy, "value",
                                         config.cache_policy)),
-        # One VM per build is the historical fallback.  In polymorphic mode the
-        # single public switch enables that spread automatically instead of making
-        # the user juggle separate family and dispatcher choices.
-        vm_variety=((max(2, int(config.vm_variety)))
-                    if config.vm_polymorphism else max(1, int(config.vm_variety))),
-        # The site exposes one "polymorphic VM" switch rather than separate
-        # family/dispatcher menus.  On means use a best-of blend: hybrid first,
-        # then the other state machines, with every dispatcher shape available
-        # to split across groups.  Off keeps the pinned values for debugging.
-        families=(("woven", "hybrid", "stack", "accumulator", "register")
-                  if config.vm_polymorphism else (getattr(config.vm_family, "value", config.vm_family),)),
-        dispatchers=(tuple(_vm_runtime.DISPATCHERS)
-                     if config.vm_polymorphism else _dispatcher_rotation(config.dispatcher_family)),
+        # One VM per build: cloning interpreter families creates more fingerprint
+        # surface than it removes.
+        vm_variety=(1 if int(config.vm_variety) >= 0 else 1),
+        # Legacy family/dispatcher settings normalize to the single woven VM and
+        # its guarded dispatcher.
+        families=("woven",),
+        dispatchers=("woven",),
         fusion_level=(1 if config.instruction_fusion
                       and config.super_instructions else 0),
         alias_ratio=_alias_ratio(config),

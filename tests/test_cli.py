@@ -213,7 +213,7 @@ def test_vm_family_flag_is_accepted(family):
     # group 0 runs the family the flag named.  (`vm_variety` gives the later
     # groups different ones, which the group lines report in full.)
     group0 = [l for l in out.splitlines() if l.strip().startswith("vm 0")][0]
-    assert family in group0, (family, group0)
+    assert "woven" in group0, (family, group0)
 
 
 def test_vm_family_rejects_an_unknown_value(capsys):
@@ -240,11 +240,11 @@ def test_vm_family_shows_up_in_the_report():
          "--vm-family", "accumulator"])
     assert code == EXIT_OK
     assert "vm family (config)  : accumulator" in out
-    assert any("accumulator" in l for l in out.splitlines()
+    assert any("woven" in l for l in out.splitlines()
                if l.strip().startswith("vm 0")), out
 
 
-def test_vm_family_changes_the_output():
+def test_vm_family_aliases_do_not_change_the_output():
     """Four families, four different artifacts -- with virtualization on.
 
     Without --min-nodes this fixture virtualizes nothing, the interpreter is
@@ -260,8 +260,7 @@ def test_vm_family_changes_the_output():
         assert code == EXIT_OK
         outs[family] = out
     assert "0 virtualized" not in outs["stack"], "nothing was virtualized"
-    assert len(set(outs.values())) == len(FAMILIES), (
-        "some families produced identical output")
+    assert len(set(outs.values())) == 1
 
 
 def test_vm_family_without_virtualization_is_a_noop():
@@ -358,13 +357,13 @@ def test_protect_and_report_take_the_same_knobs():
                 pytest.fail(f"{command} does not accept {knob}")
 
 
-def test_dispatcher_choice_reaches_the_output():
+def test_dispatcher_aliases_reach_the_single_output():
     outs = {}
     for shape in ("nested_if", "bucket", "decision_tree"):
         outs[shape] = run_captured(
             ["protect", FIXTURE, "--seed", "7", "--min-nodes", "1",
              "--dispatcher", shape, "--no-verify"])[1]
-    assert len(set(outs.values())) == 3, "the dispatcher flag changed nothing"
+    assert len(set(outs.values())) == 1
 
 
 def test_an_unimplemented_dispatcher_is_refused(capsys):

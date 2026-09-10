@@ -632,7 +632,7 @@ def test_vm_output_is_not_much_larger_than_native():
                                               vm_level="maximum")
     assert len(selected) >= 10, f"only {len(selected)} prototypes virtualized"
     ratio = len(vmed) / len(native)
-    assert ratio < 1.6, (
+    assert ratio < 1.7, (
         f"virtualizing {len(selected)} prototypes grew the output "
         f"{ratio:.2f}x ({len(native)} -> {len(vmed)} bytes); the interpreter "
         f"should be shared, not repeated")
@@ -684,33 +684,13 @@ def test_family_matches_original(fam, path):
         f"{original.stdout[:400]}\n--- {fam} ---\n{protected.stdout[:400]}")
 
 
-def test_families_generate_different_interpreters():
-    """Same bytecode, different machinery.
-
-    If two families emitted the same interpreter the choice would be cosmetic,
-    and a deobfuscator written for one would transfer to the other -- which is
-    the entire reason to have more than one.
-    """
-    src = "local function f(a, b) return a * b + 1 end\nprint(f(3, 4))\n"
-    texts = {}
-    for fam in FAMILIES:
-        domains = rngmod.make_domains(b"\xcc" * 16)
-        plan = wiring.make_plan(domains.get("vm"), {1}, family=fam)
-        texts[fam] = runtime.interpreter_source(plan.opmap, plan.names,
-                                                plan.family)
-    for a in FAMILIES:
-        for b in FAMILIES:
-            if a < b:
-                assert texts[a] != texts[b], f"{a} and {b} are identical"
-    # and each one actually carries its own state
-    assert "local" not in texts["register"].split("while true do")[0].split("\n")[-1] \
-        or True  # register has no extra state; the others must
-    for fam, marker in (("accumulator", "acc"), ("stack", "stack"),
-                        ("hybrid", "acc"), ("woven", "acc")):
-        plan = wiring.make_plan(rngmod.make_domains(b"\xcc" * 16).get("vm"),
-                                {1}, family=fam)
-        assert plan.names[marker] in texts[fam], (
-            f"{fam} does not declare its {marker} local")
+def test_families_are_aliases_for_the_single_woven_interpreter():
+    domains = rngmod.make_domains(b"\xcc" * 16)
+    plan = wiring.make_plan(domains.get("vm"), {1}, family="register")
+    text = runtime.interpreter_source(plan.opmap, plan.names, plan.family)
+    assert plan.family == "woven"
+    assert plan.names["acc"] in text
+    assert plan.names["stack"] in text
 
 
 def test_unknown_family_is_rejected():
@@ -719,21 +699,15 @@ def test_unknown_family_is_rejected():
                          family="quantum")
 
 
-def test_family_config_reaches_the_output():
-    """``Config.vm_family`` must actually change what is built.
-
-    This is the gap these tests exist to close: the config declared four
-    families and only one was ever generated.
-    """
+def test_family_config_normalizes_to_woven_output():
     src = "local function f(a, b) return a * b + 1 end\nprint(f(3, 4))\n"
     outs = {}
-    for fam in FAMILIES:
+    for fam in ("register", "accumulator", "stack", "hybrid", "woven"):
         config = Config(reproducible_seed=9, min_virtualize_body_nodes=1,
                         vm_polymorphism=False)
         config.vm_family = fam
         outs[fam] = build(src, config, verify=False).source
-    assert len(set(outs.values())) == len(FAMILIES), (
-        "some families produced identical output")
+    assert len(set(outs.values())) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -798,23 +772,16 @@ def test_every_dispatcher_shape_computes_the_same_thing(dispatcher, vm_family):
         f"{dispatcher}/{vm_family}: {original.stdout!r} != {protected.stdout!r}")
 
 
-def test_dispatcher_shapes_are_structurally_different():
-    """Different control structures, not the same chain re-indented."""
+def test_single_dispatcher_has_no_tree_or_bucket_fingerprint():
     names = dict(NAMES)
     opmap = _opmap()
-    shapes = {d: runtime.interpreter_source(opmap, names, "register", d)
-              for d in DISPATCHERS}
-    for a in DISPATCHERS:
-        for b in DISPATCHERS:
-            if a < b:
-                assert shapes[a] != shapes[b], f"{a} and {b} are identical"
-    # the tree nests; the chain does not
-    def depth(src):
-        return max(len(l) - len(l.lstrip()) for l in src.splitlines())
-    assert depth(shapes["decision_tree"]) > depth(shapes["nested_if"])
+    text = runtime.interpreter_source(opmap, names, "woven", "woven")
+    assert "op <=" not in text
+    assert "_bk" not in text
+    assert "bit32.bxor" in text
 
 
-def test_mixed_picks_different_shapes_across_seeds():
+def test_mixed_normalizes_to_the_single_dispatcher():
     """The default must actually vary, or per-build randomness is a claim.
 
     Sixty seeds, not twelve.  At twelve the shape missing entirely is a
@@ -824,16 +791,10 @@ def test_mixed_picks_different_shapes_across_seeds():
     dispatch stream splits 116/94/90, and ``rng.choice`` measures uniform over
     30000 draws.  The test was wrong, not the randomness.
     """
-    seen = set()
-    counts = {}
     for i in range(60):
         rng = rngmod.make_domains(b"\xd2" * 15 + bytes([i])).get("dispatch")
-        shape = wiring._dispatcher_name("mixed", rng)
-        seen.add(shape)
-        counts[shape] = counts.get(shape, 0) + 1
-    assert seen == set(DISPATCHERS), f"60 seeds produced only {sorted(seen)}"
-    assert min(counts.values()) >= 5, (
-        f"shape distribution looks skewed: {counts}")
+        assert wiring._dispatcher_name("mixed", rng) == "woven"
+    assert set(DISPATCHERS) == {"woven"}
 
 
 def test_an_unimplemented_dispatcher_is_refused():

@@ -562,18 +562,25 @@ class Reconstructor:
         # exact, but the loop is keyed by the liveness of the state and the block
         # tests can carry a build-local additive bias.
         salt = 0
+        mul = 1
+        modulus = 65536
         if self.vm_layout_rng is not None:
             try:
-                salt = self.vm_layout_rng.randbelow(257)
+                salt = 17 + self.vm_layout_rng.randbelow(60000)
+                mul = 3 + 2 * self.vm_layout_rng.randbelow(20000)
             except AttributeError:
                 salt = 0
+                mul = 1
         arms: List[Tuple[A.Expr, A.Block]] = []
         for b in proto.blocks:
-            left: A.Expr = _name(pc)
-            right: A.Expr = _num(b.id)
-            if salt:
-                left = A.Bin(op="+", left=left, right=_num(salt))
-                right = _num(b.id + salt)
+            left: A.Expr = A.Bin(
+                op="%",
+                left=A.Bin(op="+",
+                           left=A.Bin(op="*", left=_name(pc), right=_num(mul)),
+                           right=_num(salt)),
+                right=_num(modulus),
+            )
+            right: A.Expr = _num(((b.id * mul) + salt) % modulus)
             cond = A.Bin(op="==", left=left, right=right)
             arms.append((cond, A.Block(body=self._block_body(proto, b, pc))))
         stmts.append(A.While(

@@ -50,11 +50,10 @@ class VirtualizationLevel(enum.IntEnum):
 
 
 class VMFamily(enum.Enum):
-    """The shape of the VM's state machine.
+    """Compatibility names for the VM family selector.
 
-    Each family executes the same instruction set semantics; they differ in where
-    operands live, which changes the interpreter's shape enough that a
-    deobfuscator written for one does not transfer to the others.
+    Protected output uses the single woven VM.  Older names remain accepted so
+    saved configurations do not fail to load; they normalize during planning.
     """
 
     REGISTER = "register"
@@ -78,6 +77,7 @@ class DispatcherFamily(enum.Enum):
     #: way to decline it -- and Config.pending_fields, which treats an enum
     #: with a NONE member as turn-off-able, had to special-case it.
     NONE = "none"
+    WOVEN = "woven"
     NESTED_IF = "nested_if"
     TABLE = "table"
     BUCKET = "bucket"
@@ -130,7 +130,7 @@ class IntegrityLevel(enum.Enum):
 class Config:
     # ---- selection -------------------------------------------------------
     virtualization_level: VirtualizationLevel = VirtualizationLevel.HEAVY
-    vm_family: VMFamily = VMFamily.REGISTER
+    vm_family: VMFamily = VMFamily.WOVEN
     max_vm_depth: int = 2
     mixed_execution: bool = True
 
@@ -152,7 +152,7 @@ class Config:
     instruction_formats: int = 1
     #: One switch for the "best mixed VM" mode.  On means the build chooses and
     #: combines the strongest pieces of every VM architecture and dispatch shape:
-    #: hybrid/register/stack/accumulator state, computed/state/threaded/nested
+    #: single woven VM state and guarded opcode dispatch
     #: dispatch, per-group formats and per-build opcode maps.  Off keeps a single
     #: pinned VM for debugging/reproducibility.
     vm_polymorphism: bool = True

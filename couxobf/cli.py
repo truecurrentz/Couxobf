@@ -211,9 +211,9 @@ def _add_protection_knobs(sp) -> None:
     --vm-family was added to protect and forgotten on report, so `report`
     described a build the CLI could not produce.
     """
-    sp.add_argument("--vm-family", choices=list(FAMILIES), default=None,
+    sp.add_argument("--vm-family", choices=["woven", "register", "accumulator", "stack", "hybrid"], default=None,
                     help="operand discipline of the generated interpreter")
-    sp.add_argument("--dispatcher", choices=list(DISPATCHERS) + ["mixed"],
+    sp.add_argument("--dispatcher", choices=["woven", "mixed", "nested_if", "decision_tree", "bucket", "state_transition", "threaded"],
                     default=None,
                     help="shape of the opcode dispatch; mixed (the default) "
                          "picks one at random per build")

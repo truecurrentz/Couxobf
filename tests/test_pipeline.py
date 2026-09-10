@@ -589,9 +589,9 @@ def test_the_report_lists_every_vm_group_the_artifact_carries():
                                      dispatcher_family="mixed"),
                 name="maze.luau", verify=False)
     groups = out.stats.vm_groups
-    assert len(groups) >= 3, [g.get("family") for g in groups]
+    assert len(groups) == 1, [g.get("family") for g in groups]
     assert all(g.get("protos", 0) >= 1 for g in groups), groups
-    assert len({(g.get("family"), g.get("dispatcher")) for g in groups}) > 1
+    assert {(g.get("family"), g.get("dispatcher")) for g in groups} == {("woven", "woven")}
     # The group lines are the indented ones; "vm family (config)" is the request,
     # which is a different fact and is printed as such.
     lines = [l for l in out.report.splitlines() if l.startswith("  vm ")]
@@ -619,11 +619,9 @@ def test_the_fingerprint_is_a_digest_of_the_decisions_not_of_the_file():
     assert re.fullmatch(r"[0-9a-f]{16}", base), base
     assert fingerprint(reproducible_seed=7) == base, "not reproducible from the seed"
     assert fingerprint(reproducible_seed=7, instruction_formats=0) != base
-    # Turning off the best-of polymorphic VM and pinning one fallback family
-    # changes group 0's shape; `vm_variety` would too, but only once there are
-    # two prototypes to spread, and this program has one.
+    # Legacy family switches now normalize to the same single woven VM.
     assert fingerprint(reproducible_seed=7, vm_polymorphism=False,
-                       vm_family="stack") != base
+                       vm_family="stack") == base
     assert fingerprint(reproducible_seed=7, opcode_randomization=False) != base
     assert fingerprint(reproducible_seed=8) != base
 

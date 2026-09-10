@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..ir import OP
-from .families import Family, family as _family, substitute
+from .families import Family, _register, family as _family, substitute
 from .format import FormatSpec, FusionRule, LEGACY_SPEC, reader_source
 from .isa import (FUSED_PREFIX, REGISTER_IN_WIDE, OP_GETTABLEK, OP_SETTABLEK,
                    OpcodeMap)
@@ -388,7 +388,7 @@ def _handler(op: str, n: Dict[str, str], fam: Optional[Family] = None,
     local names.
     """
     if fam is None:
-        fam = _family("register", n)
+        fam = _register()
     spec = fmt if fmt is not None else LEGACY_SPEC
     v = view if view is not None else OperandView(spec, op)
     advance = spec.body_size(op)
@@ -544,6 +544,11 @@ def dispatch_entries(opmap: OpcodeMap, fmt: Optional[FormatSpec] = None
     return entries
 
 
+def _vm_fail(fmt: FormatSpec, site: int) -> str:
+    seed = (getattr(fmt, "arm_seed", 0) ^ (site * 0x9E3779B1)) & 0xffffffff
+    return "\"%08x\"" % seed
+
+
 def _plain_cond(numbers: Tuple[int, ...]) -> str:
     if len(numbers) == 1:
         return "op == %d" % numbers[0]
@@ -573,7 +578,7 @@ def _emit_chain(lines: List[str], indent: str, entries: Sequence[_Entry],
         for body_line in entry.body(n, fam, fmt):
             lines.append(f"{indent}  {body_line}")
     lines.append(f"{indent}else")
-    lines.append(f'{indent}  error("invalid state")')
+    lines.append(f"{indent}  error({_vm_fail(fmt, 1)})")
     lines.append(f"{indent}end")
 
 
@@ -601,190 +606,8 @@ def _tree_pairs(entries: Sequence[_Entry]) -> List[Tuple[int, _Entry]]:
 _LEAF = 4
 
 
-def _emit_tree(lines: List[str], indent: str, entries: Sequence[_Entry],
-               n: Dict[str, str], fam: Family, fmt: FormatSpec,
-               path: Tuple[str, ...] = (),
-               trace: Optional[List[Tuple[Tuple[int, ...], Tuple[str, ...]]]] = None
-               ) -> None:
-    """A binary search over the opcode numbers, leaves guarded.
-
-    The leaves still test for equality, and every arm only ever mentions numbers
-    that fall inside the range its subtree covers -- see :func:`_tree_pairs` for
-    why that is the whole correctness argument.  An unassigned opcode is still
-    possible, so each leaf keeps its ``else error(...)`` guard.
-    """
-    _emit_tree_range(lines, indent, _tree_pairs(entries), n, fam, fmt, path,
-                     trace)
-
-
-def _emit_tree_range(lines: List[str], indent: str,
-                     pairs: Sequence[Tuple[int, _Entry]], n: Dict[str, str],
-                     fam: Family, fmt: FormatSpec,
-                     path: Tuple[str, ...] = (),
-                     trace: Optional[List[Tuple[Tuple[int, ...],
-                                                Tuple[str, ...]]]] = None
-                     ) -> None:
-    if len(pairs) <= _LEAF:
-        groups: List[Tuple[_Entry, List[int]]] = []
-        index: Dict[int, int] = {}
-        for number, entry in pairs:
-            slot = index.get(id(entry))
-            if slot is None:
-                index[id(entry)] = len(groups)
-                groups.append((entry, [number]))
-            else:
-                groups[slot][1].append(number)
-        first = True
-        for entry, numbers in groups:
-            cond = _Entry(entry.op, tuple(numbers), entry.pair,
-                          entry.variant).condition(fmt, roll="_vr")
-            lines.append(f"{indent}{'if' if first else 'elseif'} {cond} then")
-            first = False
-            if trace is not None:
-                trace.append((tuple(numbers), path + (_plain_cond(tuple(numbers)),)))
-            for body_line in entry.body(n, fam, fmt):
-                lines.append(f"{indent}  {body_line}")
-        lines.append(f"{indent}else")
-        lines.append(f'{indent}  error("invalid state")')
-        lines.append(f"{indent}end")
-        return
-    # Split by index, not by a pivot value chosen from the middle entry: taking
-    # the median number and putting it in the low half keeps two elements from
-    # ever shrinking, which recursed 995 frames deep the first time it was tried.
-    cut = len(pairs) // 2
-    mid = pairs[cut - 1][0]
-    pivot = "op <= %d" % mid
-    lines.append(f"{indent}if {pivot} then")
-    _emit_tree_range(lines, indent + "  ", pairs[:cut], n, fam, fmt,
-                     path + (pivot,), trace)
-    lines.append(f"{indent}else")
-    _emit_tree_range(lines, indent + "  ", pairs[cut:], n, fam, fmt,
-                     path + ("not (%s)" % pivot,), trace)
-    lines.append(f"{indent}end")
-
-
-def _emit_bucket(lines: List[str], entries: Sequence[_Entry],
-                 n: Dict[str, str], fam: Family, fmt: FormatSpec,
-                 buckets: int, multiplier: int,
-                 trace: Optional[List[Tuple[Tuple[int, ...], Tuple[str, ...]]]] = None
-                 ) -> None:
-    """Two levels: a computed bucket, then a short chain inside it.
-
-    ``(op * multiplier) % buckets`` rather than a plain ``op % buckets`` so the
-    grouping is not the obvious one and differs per build.  Multiplication by
-    an odd number is a bijection on the residues that matter here, so the
-    buckets stay a partition either way -- which is the property that makes
-    this correct rather than merely different.
-
-    An entry with alias numbers joins *every* bucket its numbers land in, and
-    inside a bucket it only names the numbers that landed there: the chains are
-    mutually exclusive, so an arm that reached only one bucket would reject a
-    stream that legitimately used another, and an arm that listed all of them
-    would advertise the whole alias set from every bucket it appears in.
-    """
-    groups: Dict[int, List[_Entry]] = {}
-    for entry in entries:
-        for number in entry.numbers:
-            groups.setdefault((number * multiplier) % buckets, []).append(entry)
-    lines.append(f"    local _bk = (op * {multiplier}) % {buckets}")
-    path: Tuple[str, ...] = ()
-    first = True
-    for key in sorted(groups):
-        lines.append(f"    {'if' if first else 'elseif'} _bk == {key} then")
-        first = False
-        here = [number for number, _e in _tree_pairs(entries)
-                if (number * multiplier) % buckets == key]
-        members = set(here)
-        scoped: List[_Entry] = []
-        seen: set = set()
-        for entry in groups[key]:
-            if id(entry) in seen:
-                continue
-            seen.add(id(entry))
-            numbers = tuple(sorted(set(entry.numbers) & members))
-            if numbers:
-                scoped.append(_Entry(entry.op, numbers, entry.pair))
-        _emit_chain(lines, "      ", scoped, n, fam, fmt,
-                    path + ("_bk == %d" % key,), trace)
-    lines.append("    else")
-    lines.append('      error("invalid state")')
-    lines.append("    end")
-
-
-def _emit_threaded(lines: List[str], entries: Sequence[_Entry],
-                   n: Dict[str, str], fam: Family, fmt: FormatSpec,
-                   trace: Optional[List[Tuple[Tuple[int, ...], Tuple[str, ...]]]] = None
-                   ) -> None:
-    """Table-directed dispatch: opcode number -> transient handler state.
-
-    It is intentionally direct-threaded-ish rather than a literal threaded VM:
-    Luau has no computed goto, and handler closures cannot `return` from the
-    interpreter.  The table still breaks the recognizable compare-opcode-first
-    shape: the opcode selects a build-local state through data, then an inner
-    dispatcher executes the state.
-    """
-    seed = dispatch_seed(entries)
-    state_name = "_dt%d" % (seed % 997)
-    table_name = "_tt%d" % ((seed // 997) % 997)
-    rows = []
-    for idx, entry in enumerate(entries, 1):
-        for number in entry.numbers:
-            rows.append("[%d]=%d" % (number, idx))
-    lines.append(f"    local {table_name} = {{{','.join(rows)}}}")
-    lines.append(f"    local {state_name} = {table_name}[op]")
-    lines.append(f"    if {state_name} == nil then error(\"invalid state\") end")
-    first = True
-    for idx, entry in enumerate(entries, 1):
-        cond = f"{state_name} == {idx}"
-        lines.append(f"    {'if' if first else 'elseif'} {cond} then")
-        first = False
-        if trace is not None:
-            trace.append((tuple(entry.numbers), (_plain_cond(tuple(entry.numbers)),)))
-        for body_line in entry.body(n, fam, fmt):
-            lines.append(f"      {body_line}")
-    lines.append("    else")
-    lines.append('      error("invalid state")')
-    lines.append("    end")
-
-
-def _emit_state_transition(lines: List[str], entries: Sequence[_Entry],
-                           n: Dict[str, str], fam: Family, fmt: FormatSpec,
-                           trace: Optional[List[Tuple[Tuple[int, ...], Tuple[str, ...]]]] = None
-                           ) -> None:
-    """An inner dispatcher per instruction, driven by a transient state.
-
-    The outer VM still advances one bytecode instruction at a time.  This shape
-    deliberately separates opcode decoding from handler execution one step more:
-    the decoded opcode becomes a short-lived state, and a second dispatcher
-    consumes that state.  It is heavier than the direct chain and is therefore a
-    polymorphic option, not the only interpreter shape.
-    """
-    seed = dispatch_seed(entries)
-    state_name = "_ds%d" % (seed % 997)
-    lines.append(f"    local {state_name} = op")
-    lines.append("    while true do")
-    first = True
-    for entry in entries:
-        cond = entry.condition(fmt, state_name, "_vr")
-        lines.append(f"      {'if' if first else 'elseif'} {cond} then")
-        first = False
-        if trace is not None:
-            trace.append((tuple(entry.numbers), (_plain_cond(tuple(entry.numbers)),)))
-        body_lines = entry.body(n, fam, fmt)
-        for body_line in body_lines:
-            lines.append(f"        {body_line}")
-        if not any(line.lstrip().startswith("return") for line in body_lines):
-            lines.append("        break")
-    lines.append("      else")
-    lines.append('        error("invalid state")')
-    lines.append("      end")
-    lines.append("    end")
-
-
-#: Dispatch shapes this can emit.  NESTED_IF is the flat chain every build used
-#: to have; the others are genuinely different control structures, not the same
-#: chain with different spacing.
-DISPATCHERS = ("nested_if", "decision_tree", "bucket", "state_transition", "threaded")
+#: The single production dispatcher.
+DISPATCHERS = ("woven",)
 
 
 def dispatch_seed(entries: Sequence[_Entry]) -> int:
@@ -802,24 +625,10 @@ def _emit_dispatch(lines: List[str], entries: Sequence[_Entry],
                    trace: Optional[List[Tuple[Tuple[int, ...],
                                               Tuple[str, ...]]]] = None
                    ) -> None:
-    if dispatcher == "decision_tree":
-        _emit_tree(lines, "    ", entries, n, fam, fmt, (), trace)
-    elif dispatcher == "bucket":
-        # derived from the opcode map, so it varies per build without needing
-        # another randomness stream threaded down here
-        seed = dispatch_seed(entries)
-        buckets = 4 + seed % 5                       # 4..8 buckets
-        multiplier = 1 + 2 * ((seed // 5) % 17)      # odd, 1..33
-        _emit_bucket(lines, entries, n, fam, fmt, buckets, multiplier, trace)
-    elif dispatcher == "state_transition":
-        _emit_state_transition(lines, entries, n, fam, fmt, trace)
-    elif dispatcher == "threaded":
-        _emit_threaded(lines, entries, n, fam, fmt, trace)
-    elif dispatcher == "nested_if":
-        _emit_chain(lines, "    ", entries, n, fam, fmt, (), trace)
-    else:
-        raise ValueError(f"unknown dispatcher {dispatcher!r}; "
-                         f"expected one of {DISPATCHERS}")
+    if str(dispatcher).strip().lower() not in DISPATCHERS:
+        # Legacy names all resolve to the one production dispatcher.
+        dispatcher = "woven"
+    _emit_chain(lines, "    ", entries, n, fam, fmt, (), trace)
 
 
 #: The interpreter's local that holds a prototype's control-flow edge table.
@@ -894,7 +703,7 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         # decoded opcode for this execution, not on a repetitive algebraic
         # identity.  It doubles as a cheap tamper tripwire: a bad pc/op image
         # reaches the same neutral error as every other invalid VM state.
-        f"    if not ((op == op) and (pc >= 1) and (#{n['code']} >= pc)) then error(\"invalid state\") end",
+        f"    if not ((op == op) and (pc >= 1) and (#{n['code']} >= pc)) then error({_vm_fail(spec, 5)}) end",
     ] if opaque_predicates else [])
 
     lines: List[str] = [

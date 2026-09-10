@@ -20,6 +20,7 @@ seek reads plausible bytes from the wrong place instead of failing.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Dict
 
 from .constpool_runtime import byte_literal
@@ -91,9 +92,11 @@ class StringBankRuntime:
              ticket_mask: int = 0) -> str:
         n = self.n
         ticket_mask &= 0xffffffff
-        trip = (f"  if not {guard_check}() then error(\"invalid state\") end\n"
+        def fail(site: bytes) -> str:
+            return byte_literal(hashlib.sha256(sealed.ticket_key + sealed.ticket_nonce + sealed.ticket_tag + site).digest()[:8])
+        trip = (f"  if not {guard_check}() then error({fail(b'guard')}) end\n"
                 if guard_check else "")
-        ticket_expr = "bit32.bxor(%d, %d)" % (ticket_mask ^ 0x7F4A7C15, 0x7F4A7C15)
+        ticket_expr = 'string.unpack(">I4", %s, 1)' % byte_literal(ticket_mask.to_bytes(4, "big"))
         deticket = (f"  ticket = bit32.bxor(ticket, {ticket_expr})\n"
                     if ticket_mask else "")
         if self.emit_crypto:
@@ -179,18 +182,18 @@ local function {n['load']}()
   -- string to grep for.  "invalid state" is what an ordinary bad lookup says
   -- too, so the two are not distinguishable from the outside.
   if {n['crypto']}.{n['c_mac']}({n['bkey']}, {n['blob']}) ~= {n['btag']} then
-    error("invalid state")
+    error({fail(b'blob')})
   end
   local p = {n['crypto']}.{n['c_open']}({n['tkey']}, {n['tnonce']}, {n['tct']}, {n['ttag']}, {byte_literal(sealed.ticket_aad)})
   if p == nil then
-    error("invalid state")
+    error({fail(b'open')})
   end
   {n['plain']} = p
   local tickets, pages = string.unpack(">I4I4", p, 1)
   -- the page size is a constant here, so it is read back only to check it
   local psize = string.unpack(">I4", p, 9)
   if psize ~= {n['psize']} then
-    error("invalid state")
+    error({fail(b'psize')})
   end
   local pm = {{}}
   for i = 1, pages do
@@ -242,7 +245,7 @@ local function {n['resolve']}(ticket)
   local p = {n['plain']}
   local q = {n['index']}[ticket]
   if q == nil then
-    error("invalid state")
+    error({fail(b'lookup1')})
   end
   local count = string.unpack(">I2", p, q)
   q += 2
@@ -262,7 +265,7 @@ local function {n['resolve_alt']}(ticket)
   local p = {n['plain']}
   local q = {n['index']}[ticket]
   if q == nil then
-    error("invalid state")
+    error({fail(b'lookup2')})
   end
   local count = string.unpack(">I2", p, q)
   q += 2
@@ -280,7 +283,7 @@ local function {n['resolve_alt2']}(ticket)
   local p = {n['plain']}
   local q = {n['index']}[ticket]
   if q == nil then
-    error("invalid state")
+    error({fail(b'lookup3')})
   end
   local count = string.unpack(">I2", p, q)
   q += 2

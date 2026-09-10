@@ -35,13 +35,11 @@ const SPEC = [
        "frame costs more than it hides."],
       ["max_vm_functions", "Max virtualized functions", "int",
        "A cap, not a target. 0 means no limit."],
-      ["vm_polymorphism", "Polymorphic VM", "bool",
-       "One best-mode switch: blends woven/hybrid/register/stack/accumulator data " +
-       "paths with nested, bucket, decision-tree, computed-state and threaded " +
-       "dispatch. Turn it off only for debugging a simpler single-family VM."],
-      ["vm_variety", "VMs per artifact", "int",
-       "Distinct interpreters in one artifact. In polymorphic mode this is a floor; " +
-       "the build uses multiple architectures when enough functions are available."],
+      ["vm_polymorphism", "Woven VM", "bool",
+       "Uses the single hardened VM: mixed operand data paths inside one shared " +
+       "interpreter and one guarded dispatch loop, avoiding multiple attack surfaces."],
+      ["vm_variety", "VM compatibility", "int",
+       "Legacy compatibility field. Builds now normalize to one shared VM per artifact."],
       ["vm_isa_subset", "Per-VM instruction set", "bool",
        "Each interpreter carries only the opcodes the functions on it need, so the " +
        "handler count follows the code instead of being the whole ISA in every " +

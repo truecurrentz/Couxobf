@@ -103,9 +103,11 @@ class ConstantPoolRuntime:
         n = self.n
         ticket_mask &= 0xffffffff
         mask_mul, mask_add, mask_shift = mask_params(key + nonce + aad)
-        trip = (f"  if not {guard_check}() then error(\"invalid state\") end\n"
+        def fail(site: bytes) -> str:
+            return byte_literal(hashlib.sha256(key + nonce + tag + site).digest()[:8])
+        trip = (f"  if not {guard_check}() then error({fail(b'guard')}) end\n"
                 if guard_check else "")
-        ticket_expr = "bit32.bxor(%d, %d)" % (ticket_mask ^ 0xA5C31D2F, 0xA5C31D2F)
+        ticket_expr = 'string.unpack(">I4", %s, 1)' % byte_literal(ticket_mask.to_bytes(4, "big"))
         deticket = (f"  i = bit32.bxor(i, {ticket_expr})\n" if ticket_mask else "")
         literal_helper = f"""local function {n['lit']}(parts)
   local out = table.create(#parts)
@@ -190,7 +192,7 @@ local function {n['load']}()
   {n['loaded']} = true
   local p = {n['crypto']}.{n['c_open']}({n['key']}, {n['nonce']}, {n['ct']}, {n['tag']}, {byte_expr(aad, n['lit'])})
   if p == nil then
-    error("invalid state")
+    error({fail(b'open')})
   end
   {n['plain']} = p
   local o = {{}}
@@ -269,7 +271,7 @@ end
 #: Every failure in the emitted runtimes -- tag mismatch, wrong AAD, bad page
 #: size, unknown ticket -- raises this, so none of them is distinguishable from
 #: the others from outside.
-FAILURE_MESSAGE = "invalid state"
+FAILURE_MESSAGE = ""
 
 
 def default_names(prefix: str = "_kQ") -> Dict[str, str]:

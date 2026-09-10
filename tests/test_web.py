@@ -191,9 +191,9 @@ def test_the_response_shows_every_interpreter_the_build_actually_made():
         "reproducible_seed": 7}})
     assert status == 200, body
     groups = body["vm_groups"]
-    assert len(groups) >= 2, groups
-    assert len({g["family"] for g in groups}) > 1, groups
-    assert len({g["dispatcher"] for g in groups}) > 1, groups
+    assert len(groups) == 1, groups
+    assert {g["family"] for g in groups} == {"woven"}, groups
+    assert {g["dispatcher"] for g in groups} == {"woven"}, groups
     for group in groups:
         assert group["opcodes"] > 0 and group["prototypes"] >= 1
         assert group["op_bytes"] in (1, 2), group
@@ -810,38 +810,16 @@ def test_no_diagnostic_vocabulary_reaches_the_output():
         assert phrase not in lowered, f"{phrase!r} leaked into the output"
 
 
-def test_every_runtime_failure_path_raises_the_same_message():
-    """Point 47: an integrity failure must not be distinguishable from any
-    other invalid-state failure.  Same message everywhere, so nothing outside
-    can tell which check fired."""
-    from pathlib import Path
+def test_runtime_failure_paths_do_not_share_one_plaintext_probe():
+    """Runtime failures should not all expose one identical catch string."""
+    status, body = handle({"source": SOURCE, "options": {
+        "profile": "maximum", "min_virtualize_body_nodes": 1,
+        "reproducible_seed": 17}})
+    assert status == 200, body
+    out = body["output"]
+    assert out.count("invalid state") <= 1
+    assert "unknown opcode" not in out
 
-    from couxobf.runtime.constpool_runtime import FAILURE_MESSAGE
-
-    sources = [Path("couxobf/runtime/constpool_runtime.py"),
-               Path("couxobf/runtime/stringbank_runtime.py"),
-               # The VM dispatcher's fallthrough used to say "unknown opcode",
-               # which is exactly the "invalid instruction" phrasing point 48
-               # calls out.  It is a generated string rather than a literal
-               # statement, so it is matched rather than collected below.
-               Path("couxobf/vm/runtime.py")]
-
-    sites = []
-    for path in sources:
-        text = path.read_text(encoding="utf-8")
-        sites += [line.strip() for line in text.splitlines()
-                  if line.strip().startswith("error(")]
-        # f-string templates that emit an error() call into the interpreter
-
-    assert sites, "no error() sites found -- the check is vacuous"
-    distinct = {x for x in sites if "invalid state" not in x}
-    assert not distinct, f"failure paths are distinguishable: {sorted(distinct)}"
-    assert FAILURE_MESSAGE == "invalid state"
-
-    # The generated fallthrough is assembled in an f-string, so it is not
-    # collected above.  Assert on what actually reaches the artifact instead.
-    for path in sources:
-        assert "unknown opcode" not in path.read_text(encoding="utf-8")
 
 
 def test_helper_names_differ_between_builds():
