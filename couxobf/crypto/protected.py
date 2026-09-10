@@ -39,16 +39,30 @@ NONCE_BYTES = 12
 TAG_BYTES = 32  # HMAC-SHA256
 KEY_BYTES = 32
 
-MAC_DOMAIN = b"couxobf-mac-v1\x00"
+ENC_DOMAIN = b"couxobf-enc-v2\x00"
+MAC_DOMAIN = b"couxobf-mac-v2\x00"
 
 
-def mac_key(key: bytes, nonce: bytes) -> bytes:
-    """Derive the MAC key from the payload key and nonce.
+def enc_key(key: bytes, nonce: bytes, aad: bytes = b"") -> bytes:
+    """Derive the actual stream-cipher key for one payload.
+
+    The key stored beside a protected payload is now a wrapping input, not the
+    ChaCha20 key used directly on bytes.  Binding the derived cipher key to the
+    nonce and AAD means two regions under the same build key still use unrelated
+    keystream keys, and an analyst cannot test a guessed key by applying raw
+    ChaCha20 without first reproducing the KDF step.
+    """
+    return hashlib.sha256(ENC_DOMAIN + key + nonce + aad + struct.pack("<Q", len(aad))).digest()
+
+
+def mac_key(key: bytes, nonce: bytes, aad: bytes = b"") -> bytes:
+    """Derive the MAC key from the payload key, nonce and AAD.
 
     Separate keys for cipher and MAC (never the same value in both roles), and
-    the nonce in the derivation means the MAC key changes per message.
+    the nonce/AAD in the derivation means the MAC key changes per message and
+    per authenticated context.
     """
-    return hashlib.sha256(MAC_DOMAIN + key + nonce).digest()
+    return hashlib.sha256(MAC_DOMAIN + key + nonce + aad + struct.pack("<Q", len(aad))).digest()
 
 
 def compute_tag(key: bytes, nonce: bytes, ciphertext: bytes, aad: bytes) -> bytes:
@@ -60,7 +74,7 @@ def compute_tag(key: bytes, nonce: bytes, ciphertext: bytes, aad: bytes) -> byte
         + ciphertext
         + struct.pack("<Q", len(ciphertext))
     )
-    return _hmac.new(mac_key(key, nonce), covered, hashlib.sha256).digest()
+    return _hmac.new(mac_key(key, nonce, aad), covered, hashlib.sha256).digest()
 
 
 def seal(key: bytes, plaintext: bytes, aad: bytes = b"",
@@ -72,7 +86,7 @@ def seal(key: bytes, plaintext: bytes, aad: bytes = b"",
         nonce = os.urandom(NONCE_BYTES)
     if len(nonce) != NONCE_BYTES:
         raise ValueError("nonce must be 12 bytes")
-    ct = chacha20_xor(key, nonce, plaintext, counter=1)
+    ct = chacha20_xor(enc_key(key, nonce, aad), nonce, plaintext, counter=1)
     return nonce, ct, compute_tag(key, nonce, ct, aad)
 
 
@@ -82,7 +96,7 @@ def open_(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes,
     expected = compute_tag(key, nonce, ciphertext, aad)
     if not _hmac.compare_digest(expected, tag):
         raise ValueError("authentication tag mismatch")
-    return chacha20_xor(key, nonce, ciphertext, counter=1)
+    return chacha20_xor(enc_key(key, nonce, aad), nonce, ciphertext, counter=1)
 
 
 def sealed_blob(key: bytes, plaintext: bytes, aad: bytes = b"") -> bytes:

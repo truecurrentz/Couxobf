@@ -48,7 +48,8 @@ from ..crypto.sha256 import H_INIT, K
 # Sigma constants: little-endian 32-bit words of "expand 32-byte k".
 SIGMA = (1634760805, 857760878, 2036477234, 1797285236)
 
-MAC_DOMAIN = "couxobf-mac-v1\\000"  # matches crypto.protected.MAC_DOMAIN
+ENC_DOMAIN = "couxobf-enc-v2\\000"  # matches crypto.protected.ENC_DOMAIN
+MAC_DOMAIN = "couxobf-mac-v2\\000"  # matches crypto.protected.MAC_DOMAIN
 
 
 def _k_table() -> str:
@@ -298,13 +299,17 @@ local function le64(n)
   return table.concat(t)
 end
 
-local function mac_key(keystr, noncestr)
-  return {n["sha"]}("{MAC_DOMAIN}" .. keystr .. noncestr)
+local function enc_key(keystr, noncestr, aad)
+  return {n["sha"]}("{ENC_DOMAIN}" .. keystr .. noncestr .. aad .. le64(#aad))
+end
+
+local function mac_key(keystr, noncestr, aad)
+  return {n["sha"]}("{MAC_DOMAIN}" .. keystr .. noncestr .. aad .. le64(#aad))
 end
 
 local function compute_tag(keystr, noncestr, ct, aad)
   local covered = {{noncestr, aad, le64(#aad), ct, le64(#ct)}}
-  return {n["mac"]}(mac_key(keystr, noncestr), table.concat(covered))
+  return {n["mac"]}(mac_key(keystr, noncestr, aad), table.concat(covered))
 end
 
 local function const_eq(a, b)
@@ -321,12 +326,12 @@ local function {n["open"]}(keystr, noncestr, ct, tag, aad)
   if not const_eq(compute_tag(keystr, noncestr, ct, aad), tag) then
     return nil
   end
-  return {n["xor"]}(keystr, noncestr, ct, 1)
+  return {n["xor"]}(enc_key(keystr, noncestr, aad), noncestr, ct, 1)
 end
 
 local function {n["seal"]}(keystr, noncestr, plain, aad)
   aad = aad or ""
-  local ct = {n["xor"]}(keystr, noncestr, plain, 1)
+  local ct = {n["xor"]}(enc_key(keystr, noncestr, aad), noncestr, plain, 1)
   return ct, compute_tag(keystr, noncestr, ct, aad)
 end
 
