@@ -28,6 +28,14 @@ from typing import (Any, ClassVar, Dict, FrozenSet, List, Optional,
 
 VERSION = "0.1.0"
 
+#: Selector spellings an earlier design advertised.  They stay loadable (the
+#: selectors normalize them) but are no longer offered as choices anywhere:
+#: there is one VM family and one guarded dispatcher.
+_LEGACY_VM_FAMILIES = ("register", "stack", "accumulator", "hybrid")
+_LEGACY_DISPATCHERS = ("woven", "nested_if", "table", "bucket", "segmented",
+                       "decision_tree", "state_transition", "threaded",
+                       "indirect")
+
 
 class VirtualizationLevel(enum.IntEnum):
     """How much of a function's body runs inside the protection VM."""
@@ -50,49 +58,52 @@ class VirtualizationLevel(enum.IntEnum):
 
 
 class VMFamily(enum.Enum):
-    """Compatibility names for the VM family selector.
+    """The VM family selector.
 
-    Protected output uses the single woven VM.  Older names remain accepted so
-    saved configurations do not fail to load; they normalize during planning.
+    Production output is one woven VM (see :mod:`couxobf.vm.families`): the
+    older register/stack/accumulator/hybrid engines were consolidated because
+    cloning engines made artifacts larger and gave matchers several
+    recognizable interpreter surfaces at once.  The legacy names stay
+    loadable so saved configurations do not fail; they all normalize here.
     """
 
-    REGISTER = "register"
-    STACK = "stack"
-    ACCUMULATOR = "accumulator"
-    HYBRID = "hybrid"
     WOVEN = "woven"
 
     @classmethod
     def parse(cls, value: Any) -> "VMFamily":
         if isinstance(value, cls):
             return value
-        return cls(str(value).strip().lower())
+        key = str(value).strip().lower()
+        if key in _LEGACY_VM_FAMILIES:
+            return cls.WOVEN
+        return cls(key)
 
 
 class DispatcherFamily(enum.Enum):
-    """How the VM decides which handler runs next."""
+    """How the VM decides which handler runs next.
+
+    The tool emits one guarded woven dispatcher per group; the dispatch
+    *shape* variety lives inside the format (ladder vs bank), drawn per
+    build, not in this selector.  ``MIXED`` is the don't-care default.  The
+    older shape names stay loadable so saved configurations do not fail; they
+    all normalize to ``MIXED``.
+    """
 
     #: Leave the dispatcher alone.  Without this member the enum could not
     #: express "no dispatcher transform", so a config that wanted one had no
     #: way to decline it -- and Config.pending_fields, which treats an enum
     #: with a NONE member as turn-off-able, had to special-case it.
     NONE = "none"
-    WOVEN = "woven"
-    NESTED_IF = "nested_if"
-    TABLE = "table"
-    BUCKET = "bucket"
-    SEGMENTED = "segmented"
-    DECISION_TREE = "decision_tree"
-    STATE_TRANSITION = "state_transition"
-    THREADED = "threaded"
-    INDIRECT = "indirect"
     MIXED = "mixed"
 
     @classmethod
     def parse(cls, value: Any) -> "DispatcherFamily":
         if isinstance(value, cls):
             return value
-        return cls(str(value).strip().lower())
+        key = str(value).strip().lower()
+        if key in _LEGACY_DISPATCHERS:
+            return cls.MIXED
+        return cls(key)
 
 
 class CachePolicy(enum.Enum):
@@ -114,25 +125,13 @@ class CachePolicy(enum.Enum):
         return cls(str(value).strip().lower())
 
 
-class IntegrityLevel(enum.Enum):
-    NONE = "none"
-    TAG_ONLY = "tag_only"
-    TAG_AND_HASH = "tag_and_hash"
-
-    @classmethod
-    def parse(cls, value: Any) -> "IntegrityLevel":
-        if isinstance(value, cls):
-            return value
-        return cls[str(value).strip().upper()]
-
-
 @dataclass
 class Config:
     # ---- selection -------------------------------------------------------
     virtualization_level: VirtualizationLevel = VirtualizationLevel.HEAVY
+    #: Accepted and normalized to the single woven VM; kept so saved configs
+    #: naming an older family still load, not so a family can be chosen.
     vm_family: VMFamily = VMFamily.WOVEN
-    max_vm_depth: int = 2
-    mixed_execution: bool = True
 
     # ---- virtualization tuning ------------------------------------------
     #: Permute the opcode numbering.  Off means "the canonical numbers", which
@@ -173,11 +172,7 @@ class Config:
     #: Offer fused pairs as distinct opcodes, growing the handler set.
     #: Disabled by default for the same reason as instruction_fusion.
     super_instructions: bool = False
-    handler_splitting: bool = True
     dispatcher_family: DispatcherFamily = DispatcherFamily.MIXED
-    #: When several VMs are emitted, give each one a different dispatch shape
-    #: instead of drawing one shape for all of them.
-    dispatcher_splitting: bool = True
     #: Protect jump targets by biasing or by relative offsets rather than raw
     #: positions, so the numbers in the stream mean nothing without the format.
     pc_protection: bool = True
@@ -200,18 +195,12 @@ class Config:
     #: Keep control-flow edges out of the instruction stream: the payload
     #: carries an ordinal and the destinations live in their own blob.
     edge_indirection: bool = True
-    #: Spread VM state across the families (accumulator/stack/register) rather
-    #: than one discipline for the whole build.
-    state_distribution: bool = True
-    call_frame_obfuscation: bool = True
 
     # ---- control flow ----------------------------------------------------
     control_flow_level: int = 2
     opaque_predicates: bool = True
     branch_inversion: bool = True
     block_permutation: bool = True
-    encoded_pc: bool = True
-    epoch_masks: bool = True
 
     # ---- data protection -------------------------------------------------
     string_protection_level: int = 2
@@ -227,19 +216,14 @@ class Config:
     table_key_protection: bool = True
     cache_policy: CachePolicy = CachePolicy.NONE
     bounded_cache_size: int = 16
-    chunking_level: int = 2
-    lazy_decode: bool = True
-    chunk_size: int = 4096
 
     # ---- integrity -------------------------------------------------------
-    integrity_level: IntegrityLevel = IntegrityLevel.TAG_AND_HASH
+    #: The pool's AEAD tag is always verified; there is no dial for that.
+    #: ``self_test`` is the only remaining integrity knob (opt-in build-time
+    #: self checks).
     self_test: bool = False
 
     # ---- output shaping --------------------------------------------------
-    #: Dead-but-valid padding in the flattened dispatcher: 0 none, 1 a few
-    #: unreachable states, 2 more.  Bounded on purpose (#63) -- padding is a
-    #: fingerprint of its own once it dominates the artifact.
-    junk_level: int = 1
     #: Decoy constants in the pool and decoy opcodes in the dispatch chain.
     #: Both are real entries that the program never uses, deliberately without a
     #: recognisable pattern in which ones they are.
@@ -322,11 +306,9 @@ class Config:
         self.vm_family = VMFamily.parse(self.vm_family)
         self.dispatcher_family = DispatcherFamily.parse(self.dispatcher_family)
         self.cache_policy = CachePolicy.parse(self.cache_policy)
-        self.integrity_level = IntegrityLevel.parse(self.integrity_level)
-        self.max_vm_depth = max(0, min(3, int(self.max_vm_depth)))
         for name in ("control_flow_level", "string_protection_level",
                      "numeric_protection_level", "constant_protection_level",
-                     "chunking_level", "junk_level", "opcode_aliases",
+                     "opcode_aliases",
                      "instruction_formats", "env_guard", "dump_guard",
                      "decoy_constants"):
             setattr(self, name, max(0, min(3, int(getattr(self, name)))
@@ -339,7 +321,6 @@ class Config:
             raise ValueError("blob_encoding must be 'dense' or 'hex'")
         if self.hash_comments not in ("auto", "strip", "strict"):
             raise ValueError("hash_comments must be auto, strip or strict")
-        self.chunk_size = max(256, int(self.chunk_size))
         if self.reproducible_seed is not None:
             self.reproducible_seed = int(self.reproducible_seed)
 
@@ -357,14 +338,9 @@ class Config:
             string_protection_level=1,
             numeric_protection_level=0,
             constant_protection_level=1,
-            chunking_level=0,
-            lazy_decode=False,
-            integrity_level=IntegrityLevel.TAG_ONLY,
-            junk_level=0,
             decoys=False,
             super_instructions=False,
             instruction_fusion=False,
-            handler_splitting=False,
             opcode_cipher=False,
             vm_isa_subset=False,
             minify=True,
@@ -376,8 +352,6 @@ class Config:
             virtualization_level=VirtualizationLevel.MEDIUM,
             control_flow_level=1,
             string_protection_level=2,
-            chunking_level=1,
-            junk_level=1,
         )
 
     @classmethod
@@ -388,13 +362,10 @@ class Config:
     def maximum(cls) -> "Config":
         return cls(
             virtualization_level=VirtualizationLevel.MAXIMUM,
-            max_vm_depth=3,
             control_flow_level=3,
             string_protection_level=3,
             numeric_protection_level=2,
             constant_protection_level=1,
-            chunking_level=3,
-            junk_level=2,
             # One hardened VM, every format knob, aliases and indirect edges.
             # Fused super-ops are intentionally not enabled by default: they make
             # highly distinctive semantic signatures for a static matcher.
@@ -445,9 +416,9 @@ class Config:
     #
     # A config field that nothing reads is worse than a missing field: setting
     # it looks like a decision, and the build silently does something else.
-    # Thirty-five of the fields below were in that state.  They stay declared
-    # because they encode intent for work that is not done yet, but the build
-    # now reports them instead of implying they were applied.
+    # The fields that were in that state were removed outright (R12) rather
+    # than left as inert dials; what remains below are fields the build does
+    # not deliver yet, reported by pending_fields instead of implied.
     #
     #: Fields that are read by the compiler and change the output.
     IMPLEMENTED: ClassVar[FrozenSet[str]] = frozenset({
@@ -517,12 +488,6 @@ class Config:
         for f in dataclasses.fields(self):
             if f.name in self.IMPLEMENTED:
                 continue
-            # A field that only the pass it belongs to would read is not a request
-            # for that pass: `chunk_size = 4096` next to `chunking_level = 0` names
-            # no unmet capability, and because the size has a legal minimum equal to
-            # its default there is no value of it that could ever mean "off".
-            if f.name == "chunk_size" and self.chunking_level <= 0:
-                continue
             value = getattr(self, f.name)
             off = self._off_value(f)
             if off is not None and value == off:
@@ -537,13 +502,6 @@ class Config:
             problems.append("cache_policy is set but string_protection_level is 0")
         if self.cache_policy is CachePolicy.BOUNDED and self.bounded_cache_size < 1:
             problems.append("bounded_cache_size must be >= 1")
-        if self.max_vm_depth > 0 and self.virtualization_level is VirtualizationLevel.NONE:
-            problems.append("max_vm_depth > 0 has no effect with virtualization_level=none")
-        if self.integrity_level is not IntegrityLevel.NONE and self.chunking_level == 0 \
-                and self.string_protection_level == 0 and self.constant_protection_level == 0:
-            problems.append("integrity checking is enabled but nothing is protected")
-        if self.junk_level > 0 and self.minify:
-            problems.append("junk_level > 0 is partly undone by minify")
         if self.max_output_growth != 0 and self.max_output_growth < 1.0:
             problems.append("max_output_growth must be 0 (disabled) or >= 1.0")
         return problems

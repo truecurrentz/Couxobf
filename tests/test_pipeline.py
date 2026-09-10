@@ -645,8 +645,7 @@ def test_the_report_lists_every_vm_group_the_artifact_carries():
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     with open(os.path.join(repo, "examples", "maze.luau"), encoding="utf-8") as fh:
         source = fh.read()
-    out = build(source, _maze_config(vm_variety=3, state_distribution=True,
-                                     dispatcher_family="mixed"),
+    out = build(source, _maze_config(vm_variety=3, dispatcher_family="mixed"),
                 name="maze.luau", verify=False)
     groups = out.stats.vm_groups
     # The knob is honored: as many groups as the selection can populate, each

@@ -341,13 +341,20 @@ P3 = polish. Each item names the axes above.
 | R9 | Index-to-number pass for provably-static table keys (opt-in) | structural transform at zero runtime cost | **P3** |
 | R10 | Inline-small-helpers AST pass (opt-in, node cap) | glue-code reduction, Luaq parity | **P3** |
 | R11 | Dispatcher speed option: inlined-chain dispatch for small groups | 2 closure calls/instruction is slow | **P2 — done** |
-| R12 | Remove dead config surface; every remaining field either wired or gone (see G) | 15 pending fields erode trust in the report | **P1** |
+| R12 | Remove dead config surface; every remaining field either wired or gone (see G) | 15 pending fields erode trust in the report | **P1 — done** |
 
-Status: R0, R1, R3, R4 and R11 are implemented and measured (see
-`docs/benchmarks.md`): the fuzz battery is in
+Status: R0, R1, R3, R4, R11 and R12 are implemented and measured (see
+`docs/benchmarks.md`), and R2's VM-side predicate tap is implemented (the
+native-side split arms remain deferred); the fuzz battery is in
 `tests/test_fuzz_differential.py`, and the reuse-audit's verdict is pinned
-as a regression test in `tests/test_reuse_regression.py`; everything else is
-as listed.
+as a regression test in `tests/test_reuse_regression.py`.  Everything else
+is as listed.  R12 removed thirteen inert fields (`junk_level`, `encoded_pc`,
+`epoch_masks`, `max_vm_depth`, `mixed_execution`, `handler_splitting`,
+`call_frame_obfuscation`, `dispatcher_splitting`, `state_distribution`,
+`chunking_level`, `lazy_decode`, `chunk_size`, `integrity_level`), shrank the
+VM-family and dispatcher selectors to what the tool actually emits, and wired
+`opaque_predicates` to the R2 tap — so the default pending list is now
+`identifier_polymorphism, fingerprint_reduction` only.
 
 Deliberately **not** on the roadmap, with reasons (these are reference
 techniques we reject): dead-code/fake-handler injection (Clyde/ScriptShield/
@@ -729,7 +736,7 @@ tags, uniform error messages, no-marker assertions (no `pc`, `R`, `K`,
 | `classify.py` | honor directives; capability-set aware (R5) | W2/W3 |
 | `constpool.py`, `runtime/constpool_runtime.py`, `strings/bank.py`, `runtime/stringbank_runtime.py` | dense alphabet blob layer behind one shared encoder module `couxobf/encode85.py` (R4); exact-int numeric path (R7) | W2 |
 | `vm/encode.py`, `vm/isa.py` | upvalue/vararg opcodes + cell lowering (R5) | W3 |
-| `config.py` | wire or delete (R12); add `blob_encoding`, `vm_closures`, `index_to_num`, `inline_helpers` | W1–W3 |
+| `config.py` | ~~wire or delete (R12)~~ done: 13 inert fields removed, selectors shrunk, `opaque_predicates` wired to the R2 tap; add `vm_closures`, `index_to_num`, `inline_helpers` | W1–W3 |
 | `docs/SECURITY.md` | fix stale "four state models / three dispatch shapes" paragraph once R1 lands | W1 |
 | `tests/` | corpus fixtures (R0), reuse-audit contract (R3), fuzz battery (R3), new micro fixtures (E1) | W0–W3 |
 | `tools/bench.py` | new (E3) | W1 |
@@ -743,7 +750,12 @@ and the reuse-audit contract passing.
 
 ## G. Parts to remove
 
-Removed because they add surface without protection, each with the reason:
+Removed because they add surface without protection, each with the reason.
+**All of items 1–3 below are now implemented (R12):** the fields left the
+dataclass, the CLI choice lists, the web option surface and the profile
+constructors in one commit, and the pending list dropped from fifteen names
+to two (`identifier_polymorphism`, `fingerprint_reduction` — genuinely
+unbuilt).
 
 1. **`Config.junk_level`, `encoded_pc`, `epoch_masks`** — declared since the
    first design, never wired, and the project's own review concluded junk

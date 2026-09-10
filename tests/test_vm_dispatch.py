@@ -314,3 +314,87 @@ def test_a_tapped_build_executes_like_its_source():
     got = execute(tc, out.source, "got.luau", timeout=30)
     assert got.returncode == 0, got.stderr[:300]
     assert got.stdout == want.stdout, (got.stdout, want.stdout)
+
+
+def test_key_tap_preference_follows_opaque_predicates():
+    """R12 wired the knob: `opaque_predicates` is what the tap listens to."""
+    from couxobf.config import Config
+    from couxobf.vm.format import FormatPrefs
+
+    assert FormatPrefs.from_config(Config()).allow_key_taps is True
+    assert (FormatPrefs.from_config(Config(opaque_predicates=False))
+            .allow_key_taps is False)
+
+
+def test_a_draw_never_taps_when_the_preference_is_off():
+    """The chance is still spent (the stream stays put), the draw is not."""
+    from couxobf.rng import Rng
+    from couxobf.vm.format import FormatPrefs, draw
+
+    on = FormatPrefs(allow_key_taps=True)
+    off = FormatPrefs(allow_key_taps=False)
+    tapped_on = 0
+    for seed in range(40):
+        key = bytes([(seed * 7 + i) & 0xFF for i in range(16)])
+        if draw(Rng(key), on).key_taps:
+            tapped_on += 1
+        assert not draw(Rng(key), off).key_taps, seed
+    assert tapped_on, "forty draws produced no tap at all; knob untestable"
+
+
+def test_opaque_predicates_off_keeps_the_payload_term_out_of_the_artifact():
+    """With the predicate off the forced-tap draw must stay honored-less.
+
+    The forced draw below injects a tap into any spec the knob allowed; with
+    ``opaque_predicates=False`` it must inject nothing, and the artifact's key
+    math must carry no payload term -- neither the ladder's third operand nor
+    the bank's nested one.
+    """
+    import couxobf.vm.format as F
+    import couxobf.vm.wiring as W
+    from dataclasses import replace
+
+    src = ("local function acc(n)\n"
+           "  local t = 0\n"
+           "  for i = 1, n do\n"
+           "    if i % 3 == 0 then t = t + i * 2 else t = t + i end\n"
+           "  end\n"
+           "  return t\n"
+           "end\n"
+           "print(acc(60), acc(7))\n")
+
+    orig_draw = F.draw
+
+    def forced(rng, prefs=None, **kw):
+        spec = orig_draw(rng, prefs, **kw)
+        if spec.key_taps or spec.header.legacy:
+            return spec
+        if prefs is None or not prefs.allow_key_taps:
+            return spec           # the knob is off: honor it, do not inject
+        _p, filler_at, _t = spec.header._map()
+        if not filler_at:
+            spec = replace(spec, header=replace(spec.header,
+                                                filler=((1, 0x5A),)))
+            _p, filler_at, _t = spec.header._map()
+        return replace(spec, key_taps=(sorted(filler_at)[0],))
+
+    from couxobf.config import Config
+    from couxobf.pipeline import build
+
+    F.draw = forced
+    W.draw = forced
+    try:
+        out = build(src, Config(reproducible_seed=29, opaque_predicates=False,
+                                min_virtualize_body_nodes=1,
+                                max_output_growth=0),
+                    name="untapped.luau", verify=True)
+    finally:
+        F.draw = orig_draw
+        W.draw = orig_draw
+    assert out.stats.virtualized >= 1
+    assert not [t for g in out.stats.vm_groups
+                for t in [(g.get("format") or {}).get("key_taps")]
+                if t], "a tap slipped through the knob"
+    assert not re.search(r"\w+\.bxor\(op,\s*\d+,\s*\w+\)", out.source)
+    assert not re.search(r"\w+\.bxor\(\w+\.bxor\(op,\s*\d+\),\s*\w+\)",
+                         out.source)

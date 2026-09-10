@@ -65,36 +65,6 @@ def _alias_ratio(config) -> float:
     return {0: 0.0, 1: 0.35, 2: 0.6, 3: 0.8}[int(config.opcode_aliases)]
 
 
-def _family_rotation(vm_family) -> tuple:
-    """Every family this build can spread across, with the pinned one first.
-
-    ``state_distribution`` asks for different VMs in one artifact and
-    ``vm_family`` asks for a specific one.  Both are real options, so the
-    rotation honors the pin for group 0 and spreads the rest behind it, instead
-    of one silently cancelling the other.
-    """
-    wanted = str(getattr(vm_family, "value", vm_family))
-    ordered = [wanted] + [f.value for f in VMFamily if f.value != wanted]
-    return tuple(ordered)
-
-
-def _dispatcher_rotation(dispatcher_family) -> tuple:
-    """Every dispatcher shape this build can spread across, pinned one first.
-
-    The mirror of :func:`_family_rotation`, for the same reason: ``--dispatcher
-    bucket`` has to be observable.  Handing ``DISPATCHERS`` over directly let
-    ``_make_groups`` shuffle the pool and index it, so a build with a single group
-    drew a shape at random and the flag changed nothing an analyst could see.
-    ``mixed`` is the value that means "I do not care", so it is the only one that
-    leaves group 0 unpinned.
-    """
-    wanted = str(getattr(dispatcher_family, "value", dispatcher_family))
-    pool = list(_vm_runtime.DISPATCHERS)
-    if wanted not in pool or wanted in ("", "mixed", "none"):
-        return tuple(pool)
-    return tuple([wanted] + [d for d in pool if d != wanted])
-
-
 def _format_variety(config) -> int:
     """How much the instruction format is allowed to move. 0 means never."""
     if not config.operand_randomization:
@@ -239,7 +209,7 @@ _BUDGET_TRIMS = (
     (("instruction_fusion", False), ("super_instructions", False)),
     (("opcode_aliases", 0),),
     (("metadata_fragmentation", False),),
-    (("vm_variety", 1), ("state_distribution", False)),
+    (("vm_variety", 1),),
     (("control_flow_level", 0), ("block_permutation", False)),
     (("edge_indirection", False), ("instruction_formats", 0)),
     (("pc_protection", False), ("opcode_randomization", False)),

@@ -825,6 +825,10 @@ class FormatPrefs:
     allow_edges: bool = False
     allow_renumbered_header: bool = True
     allow_instruction_reorder: bool = True
+    #: Fold a payload-header filler byte into the dispatch key (R2's
+    #: predicate tap).  Driven by ``opaque_predicates``: the tap is the
+    #: genuine opaque predicate, keyed to sealed data instead of a tautology.
+    allow_key_taps: bool = True
     #: Disguise the opcode number in the stream.  Free in bytes, so it is spent
     #: whenever the format is randomized at all rather than by probability.
     allow_op_cipher: bool = True
@@ -870,6 +874,7 @@ class FormatPrefs:
             allow_renumbered_header=variety >= 1,
             allow_instruction_reorder=bool(config.control_flow_level >= 1)
             and variety >= 1,
+            allow_key_taps=bool(config.opaque_predicates),
             weight={0: 0.0, 1: 0.5, 2: 0.8, 3: 1.0}[max(0, min(3, variety))],
         )
 
@@ -981,12 +986,14 @@ def draw(rng: Optional[Rng], prefs: Optional[FormatPrefs] = None, *,
     # payload of the group, so the tap is one group-wide constant -- but one
     # the interpreter's text does not contain: the ladder's keys become an
     # image of the numbering under a salt that only the (encrypted) payload
-    # carries.  Drawn unconditionally so the stream does not branch on
-    # whether the header happened to grow filler.
+    # carries.  The chance is drawn unconditionally (so the stream never
+    # branches on whether the header happened to grow filler); the knob only
+    # decides whether the draw is honored.  ``opaque_predicates`` owns the
+    # knob: this tap is what that option now delivers.
     _t_positions, filler_at, _t_total = header._map()
     tap_wanted = rng.chance(0.5)
     key_taps: Tuple[int, ...] = ()
-    if tap_wanted and not header.legacy:
+    if tap_wanted and prefs.allow_key_taps and not header.legacy:
         # The legacy header is a fixed-width struct.pack layout with no room
         # for a filler byte, so taps only ride renumbered headers.  When the
         # header drew no filler of its own, the tap adds one: a byte that

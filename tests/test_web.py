@@ -663,11 +663,18 @@ def test_the_endpoint_names_the_fields_nothing_reads():
     assert set(body["pending"]) == declared - set(Config.IMPLEMENTED)
     # Refused on the way in, listed on the way out: a field the pipeline does not
     # read cannot be asked for, and cannot be quietly forgotten either.
-    for name in ("junk_level", "chunking_level"):
-        code, refused = handle({"source": "print(1)", "options": {name: 2}})
+    for name in ("identifier_polymorphism", "fingerprint_reduction"):
+        code, refused = handle({"source": "print(1)", "options": {name: True}})
         assert code == 400, name
         assert "does not read it yet" in refused["error"], name
         assert name in body["pending"], name
+    # R12 removed the inert dials outright: asking for one is now an unknown
+    # option rather than a pending one -- they are not in the list to forget.
+    for name in ("junk_level", "chunking_level", "integrity_level"):
+        code, refused = handle({"source": "print(1)", "options": {name: 2}})
+        assert code == 400, name
+        assert "unknown option" in refused["error"], name
+        assert name not in body["pending"], name
 
 
 def describe():

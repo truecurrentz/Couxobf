@@ -192,28 +192,46 @@ def test_module_entry_point_runs():
 
 
 # ---------------------------------------------------------------------------
-# --vm-family
+# --vm-family / --dispatcher
 # ---------------------------------------------------------------------------
 #
-# The config field existed for a long time with no way to set it from the
-# command line, so "the VM has four families" was not a claim a user of the CLI
-# could exercise. These are the tests that make the flag real.
+# The tool emits one woven VM family and one guarded dispatcher; R12 shrank
+# the selector surfaces to say exactly that.  The flags stay real for what
+# exists, and the legacy spellings are pinned twice: the CLI refuses them,
+# while a saved config naming one still loads and normalizes.
 
-FAMILIES = ("register", "accumulator", "stack", "hybrid")
+LEGACY_FAMILIES = ("register", "accumulator", "stack", "hybrid")
+LEGACY_DISPATCHERS = ("woven", "nested_if", "bucket", "decision_tree",
+                      "state_transition", "threaded")
 
 
-@pytest.mark.parametrize("family", FAMILIES)
-def test_vm_family_flag_is_accepted(family):
+def test_vm_family_flag_is_accepted():
     code, out, _ = run_captured(
         ["report", FIXTURE, "--seed", "1", "--min-nodes", "4",
-         "--vm-family", family])
+         "--vm-family", "woven"])
     assert code == EXIT_OK
-    assert f"vm family (config)  : {family}" in out, out
-    # The request and the artifact have to agree, not merely both be printed:
-    # group 0 runs the family the flag named.  (`vm_variety` gives the later
-    # groups different ones, which the group lines report in full.)
+    assert "vm family (config)  : woven" in out, out
     group0 = [l for l in out.splitlines() if l.strip().startswith("vm 0")][0]
-    assert "woven" in group0, (family, group0)
+    assert "woven" in group0, group0
+
+
+@pytest.mark.parametrize("legacy", LEGACY_FAMILIES)
+def test_vm_family_cli_no_longer_offers_legacy_names(capsys, legacy):
+    """The old family names are loadable in saved configs, not CLI choices."""
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args(
+            ["protect", FIXTURE, "--vm-family", legacy])
+    assert exc.value.code == 2          # argparse usage error
+    assert "invalid choice" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("legacy", LEGACY_DISPATCHERS)
+def test_dispatcher_cli_no_longer_offers_legacy_names(capsys, legacy):
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args(
+            ["protect", FIXTURE, "--dispatcher", legacy])
+    assert exc.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
 
 
 def test_vm_family_rejects_an_unknown_value(capsys):
@@ -228,39 +246,35 @@ def test_vm_family_is_reachable_from_report_too():
     """Both subcommands that build need the flag, or the report describes a
     build the CLI cannot actually produce."""
     parser = build_parser()
-    for argv in (["protect", FIXTURE, "--vm-family", "stack"],
-                 ["report", FIXTURE, "--vm-family", "stack"]):
+    for argv in (["protect", FIXTURE, "--vm-family", "woven"],
+                 ["report", FIXTURE, "--vm-family", "woven"]):
         args = parser.parse_args(argv)
-        assert args.vm_family == "stack", argv[0]
+        assert args.vm_family == "woven", argv[0]
 
 
 def test_vm_family_shows_up_in_the_report():
     code, out, _ = run_captured(
         ["report", FIXTURE, "--seed", "1", "--min-nodes", "4",
-         "--vm-family", "accumulator"])
+         "--vm-family", "woven"])
     assert code == EXIT_OK
-    assert "vm family (config)  : accumulator" in out
+    assert "vm family (config)  : woven" in out
     assert any("woven" in l for l in out.splitlines()
                if l.strip().startswith("vm 0")), out
 
 
-def test_vm_family_aliases_do_not_change_the_output():
-    """Four families, four different artifacts -- with virtualization on.
+def test_legacy_selector_names_still_load_through_saved_configs():
+    """The CLI no longer offers the old names, but saved configs load them.
 
-    Without --min-nodes this fixture virtualizes nothing, the interpreter is
-    never emitted, and all four outputs are byte-identical. That is correct
-    behaviour, and it is exactly the case that would let a vacuous version of
-    this test pass.
+    Loadability is the compatibility promise; normalization is why it costs
+    nothing: every legacy spelling arrives at the same resolved selector, so
+    a saved config builds exactly what the defaults build.
     """
-    outs = {}
-    for family in FAMILIES:
-        code, out, _ = run_captured(
-            ["protect", FIXTURE, "--seed", "7", "--min-nodes", "1",
-             "--vm-family", family, "--no-verify"])
-        assert code == EXIT_OK
-        outs[family] = out
-    assert "0 virtualized" not in outs["stack"], "nothing was virtualized"
-    assert len(set(outs.values())) == 1
+    from couxobf.config import Config
+    for family in LEGACY_FAMILIES:
+        assert Config.from_dict({"vm_family": family}).vm_family.value == "woven"
+    for dispatcher in LEGACY_DISPATCHERS:
+        got = Config.from_dict({"dispatcher_family": dispatcher}).dispatcher_family
+        assert got.value == "mixed"
 
 
 def test_vm_family_without_virtualization_is_a_noop():
@@ -270,27 +284,26 @@ def test_vm_family_without_virtualization_is_a_noop():
     program the design says should not be virtualized at all.
     """
     plain = run_captured(["protect", FIXTURE, "--seed", "7", "--no-verify"])[1]
-    stacked = run_captured(["protect", FIXTURE, "--seed", "7", "--no-verify",
-                            "--vm-family", "stack"])[1]
-    assert plain == stacked
+    woven = run_captured(["protect", FIXTURE, "--seed", "7", "--no-verify",
+                          "--vm-family", "woven"])[1]
+    assert plain == woven
 
 
-@pytest.mark.parametrize("family", FAMILIES)
-def test_vm_family_output_executes(family, tmp_path):
+def test_vm_family_output_executes(tmp_path):
     toolchain = find_toolchain()
     if not toolchain.can_execute:
         pytest.skip("luau runtime not available")
-    path = tmp_path / f"{family}.luau"
+    path = tmp_path / "woven.luau"
     code, _, err = run_captured(
         ["protect", FIXTURE, "--seed", "7", "--min-nodes", "1",
-         "--vm-family", family, "-o", str(path)])
+         "--vm-family", "woven", "-o", str(path)])
     assert code == EXIT_OK, err
     original = subprocess.run([toolchain.luau, FIXTURE], capture_output=True,
                               text=True)
     protected = subprocess.run([toolchain.luau, str(path)], capture_output=True,
                                text=True)
     assert original.returncode == protected.returncode, protected.stderr[:400]
-    assert original.stdout == protected.stdout, family
+    assert original.stdout == protected.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +333,7 @@ def test_named_vm_level_changes_how_much_is_virtualized(level):
 
 
 @pytest.mark.parametrize("flag,value", [
-    (["--dispatcher", "bucket"], "dispatcher_family"),
+    (["--dispatcher", "none"], "dispatcher_family"),
     (["--string-level", "2"], "string_protection_level"),
     (["--cache-policy", "full"], "cache_policy"),
     (["--max-vm-functions", "3"], "max_vm_functions"),
@@ -332,7 +345,7 @@ def test_protection_knobs_reach_the_config(flag, value):
     config = cli._config_from_args(args)
     got = getattr(config, value)
     got = getattr(got, "value", got)
-    expected = {"dispatcher_family": "bucket", "string_protection_level": 2,
+    expected = {"dispatcher_family": "none", "string_protection_level": 2,
                 "cache_policy": "full", "max_vm_functions": 3,
                 "opcode_randomization": False, "block_permutation": False}[value]
     assert got == expected, f"{value}: {got!r} != {expected!r}"
@@ -342,7 +355,7 @@ def test_protect_and_report_take_the_same_knobs():
     """They drifted once already, when --vm-family was added to protect only."""
     parser = build_parser()
     argv = {
-        "--dispatcher": ["bucket"],
+        "--dispatcher": ["mixed"],
         "--string-level": ["2"],
         "--cache-policy": ["none"],
         "--no-block-permutation": [],
@@ -357,12 +370,16 @@ def test_protect_and_report_take_the_same_knobs():
                 pytest.fail(f"{command} does not accept {knob}")
 
 
-def test_dispatcher_aliases_reach_the_single_output():
+def test_both_dispatcher_choices_reach_the_single_output():
+    """`none` declines a transform that no longer has alternatives, so both
+    offered values build, and both build the one guarded dispatcher."""
     outs = {}
-    for shape in ("nested_if", "bucket", "decision_tree"):
-        outs[shape] = run_captured(
+    for shape in ("none", "mixed"):
+        code, out, _ = run_captured(
             ["protect", FIXTURE, "--seed", "7", "--min-nodes", "1",
-             "--dispatcher", shape, "--no-verify"])[1]
+             "--dispatcher", shape, "--no-verify"])
+        assert code == EXIT_OK
+        outs[shape] = out
     assert len(set(outs.values())) == 1
 
 

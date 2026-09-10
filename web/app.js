@@ -868,7 +868,7 @@ const FALLBACK = {
 
 /* The int fields a slider can represent: the endpoint allows up to 4096, which a
    range input would turn into a lottery.  Those get a number box instead. */
-const WIDE_INTS = new Set(["bounded_cache_size", "chunk_size", "max_vm_functions",
+const WIDE_INTS = new Set(["bounded_cache_size", "max_vm_functions",
                            "min_virtualize_body_nodes", "decoy_constants"]);
 
 function useFallback() {

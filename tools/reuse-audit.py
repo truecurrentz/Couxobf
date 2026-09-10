@@ -84,8 +84,7 @@ CASES: Tuple[Tuple[str, Dict[str, Any]], ...] = (
     # The shipped knob plus several VMs in one artifact: a matcher that has to
     # feed one recovered table into three interpreters scores zero on `shape` and
     # `arms` for a different reason -- there is more than one of each.
-    ("polymorphic", {"vm_variety": 3, "state_distribution": True,
-                     "dispatcher_family": "mixed"}),
+    ("polymorphic", {"vm_variety": 3, "dispatcher_family": "mixed"}),
 )
 
 SHAPE_FIELDS = ("op_bytes", "reg_bytes", "wide_bytes", "pad", "wides_first",

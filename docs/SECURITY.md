@@ -118,8 +118,10 @@ local recovers the execution order mechanically. The fetch itself is no longer
 `byte(code, pc)` written at the dispatch site -- it is a generated per-group reader
 whose offsets, widths and masks come from the same descriptor as the encoder, which
 means a grep for the fetch misses, and a recovered reader is per-group rather than
-one per artifact. `encoded_pc` would hide the program counter and is
-declared-but-not-read, so the report lists it as pending rather than pretending.
+one per artifact. The `encoded_pc` knob that once claimed to hide the program
+counter was removed in R12: pc protection is what `pc_protection` (biased and
+relative jump targets) actually delivers, and a dead knob is not how the tool
+talks about protection.
 
 ### Constant pool encryption (implemented)
 
@@ -247,9 +249,10 @@ into 512-byte pages with shuffled page order and per-occurrence tickets instead 
 ids, and each page's keystream is separately addressed. Page size is fixed -- it is
 a `StringBank` constructor argument constrained to multiples of 64, not a `Config`
 field, so there is no knob to advertise and no diversity to claim -- and there is
-one implementation of the bank reader. `chunking_level`, `numeric_protection_level`,
-`constant_protection_level` and `table_key_protection` are declared and reported
-pending.
+one implementation of the bank reader. `numeric_protection_level`,
+`constant_protection_level` and `table_key_protection` are wired; the
+`chunking_level` knob was removed in R12 (per-chunk keys remain unbuilt and are
+not advertised as if they existed).
 
 **Semantic fidelity constrains transformation.** The tool must preserve Luau
 semantics exactly, including observable error messages (user code matches on

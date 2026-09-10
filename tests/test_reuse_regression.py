@@ -94,7 +94,6 @@ def test_shipped_builds_transfer_almost_nothing(path):
         source = fh.read()
     for label, over in (("hardened", {}),
                         ("polymorphic", {"vm_variety": 3,
-                                         "state_distribution": True,
                                          "dispatcher_family": "mixed"})):
         transfer = _case_transfer(source, os.path.basename(path), over)
         # A recovered table decodes almost none of the next build's stream.

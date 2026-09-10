@@ -2,12 +2,11 @@
 
 A config field that nothing reads is worse than a missing field.  Setting it
 looks like a decision; the build silently does something else; and nothing in
-the output says which.  Thirty-five of the forty-seven fields here were in that
-state, and nearly all of them defaulted to "on" -- so a default build was
-configured as though it applied opaque predicates, branch inversion, block
-permutation, super-instructions, PC protection, state distribution, call-frame
-obfuscation, chunking, lazy decoding, decoys, metadata fragmentation and
-fingerprint reduction, and applied none of them.
+the output says which.  The fields that were in that state were removed
+outright (R12): junk padding, chunking, integrity levels, extra VM families
+and dispatch shapes all advertised control the build never exercised, so they
+left the dataclass, the CLI and the docs together instead of staying as inert
+dials.  What remains is held to the same standard in both directions below.
 
 ``Config.IMPLEMENTED`` is the list of fields the compiler actually reads.  The
 tests below hold it to that in both directions: a field in the list must really
@@ -24,7 +23,7 @@ import re
 import pytest
 
 from couxobf import cli
-from couxobf.config import Config, IntegrityLevel
+from couxobf.config import Config, DispatcherFamily, VMFamily
 
 FIXTURE = str(pathlib.Path(__file__).parent / "fixtures" / "micro" / "multiret.luau")
 
@@ -76,14 +75,41 @@ def test_the_defaults_request_features_that_are_not_built():
     field would read as a list of fields that got built.
     """
     pending = dict(Config().pending_fields())
-    for name in ("max_vm_depth", "mixed_execution", "handler_splitting",
-                 "call_frame_obfuscation", "encoded_pc", "epoch_masks",
-                 "integrity_level",
-                 "identifier_polymorphism", "fingerprint_reduction",
-                 "chunking_level", "lazy_decode",
-                 "junk_level"):
+    for name in ("identifier_polymorphism", "fingerprint_reduction"):
         assert name in pending, name
-    assert len(pending) <= 20, sorted(pending)
+    assert len(pending) <= 4, sorted(pending)
+
+
+def test_the_removed_fields_are_gone_for_good():
+    """R12 deleted the inert dials; they must not creep back as kwargs.
+
+    A field that quietly reappeared would show up as pending again (and the
+    default config would start requesting it), so the removal is pinned both
+    ways: the names are not declared, and naming one is refused.
+    """
+    removed = ("junk_level", "encoded_pc", "epoch_masks", "max_vm_depth",
+               "mixed_execution", "handler_splitting",
+               "call_frame_obfuscation", "dispatcher_splitting",
+               "state_distribution", "chunking_level", "lazy_decode",
+               "chunk_size", "integrity_level")
+    assert not set(removed) & ALL_FIELDS
+    for name in removed:
+        with pytest.raises(ValueError, match="unknown config keys"):
+            Config.from_dict({name: 1})
+
+
+def test_legacy_selector_names_still_load_but_normalize():
+    """Saved configs naming an older family or dispatch shape keep loading.
+
+    They all normalize to what the tool actually emits -- one woven family,
+    one guarded dispatcher -- instead of failing the load.
+    """
+    for legacy in ("register", "stack", "accumulator", "hybrid"):
+        assert Config.from_dict({"vm_family": legacy}).vm_family is VMFamily.WOVEN
+    for legacy in ("woven", "nested_if", "bucket", "decision_tree",
+                   "state_transition", "threaded", "indirect"):
+        assert (Config.from_dict({"dispatcher_family": legacy}).dispatcher_family
+                is DispatcherFamily.MIXED)
 
 
 def test_turning_a_feature_off_removes_it_from_the_pending_list():
@@ -91,11 +117,11 @@ def test_turning_a_feature_off_removes_it_from_the_pending_list():
     baseline = {n for n, _ in Config().pending_fields()}
     turned_off = {n for n, _ in Config(
         opaque_predicates=False, decoys=False, numeric_protection_level=0,
-        integrity_level=IntegrityLevel.NONE).pending_fields()}
+        fingerprint_reduction=False).pending_fields()}
     # `decoys`, `opaque_predicates` and numeric constants are deliberately not in
     # here any more: they became real options, so turning them off changes the
     # build rather than changing the pending list.
-    assert baseline - turned_off == {"integrity_level"}
+    assert baseline - turned_off == {"fingerprint_reduction"}
 
 
 def test_debug_build_is_not_reported_when_off():
