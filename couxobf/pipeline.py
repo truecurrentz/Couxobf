@@ -32,7 +32,7 @@ import textwrap
 import time
 import dataclasses
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import classify as _classify
 from . import comments as _comments
@@ -378,7 +378,8 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
     classification = _classify.classify_module(
         module, config, domains.get("vm"),
         directives=directives)
-    selected = _select_for_vm(module, classification)
+    selected = _select_for_vm(module, classification,
+                              upvalues_ok=bool(config.vm_upvalues))
 
     # -- back end ---------------------------------------------------------
     runtime_names: Dict[str, Any] = {}
@@ -406,6 +407,7 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         opaque_predicates=bool(config.opaque_predicates),
         control_flow_level=int(config.control_flow_level),
         isa_subset=bool(config.vm_isa_subset),
+        vm_upvalues=bool(config.vm_upvalues),
         layout_rng=domains.get("cfg"),
         dispatcher_family=DispatcherFamily.MIXED,
         opcode_randomization=config.opcode_randomization,
@@ -445,7 +447,8 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
     )
 
     stats = _collect_stats(module, classification, out, source_size,
-                           index_stats)
+                           index_stats, selected=selected,
+                           upvalues_ok=bool(config.vm_upvalues))
     stats.guard = dict(runtime_names.get("guard") or {})
     stats.fingerprint = str(runtime_names.get("fingerprint") or "")
     stats.fingerprint_requested = bool(runtime_names.get("fingerprint_requested"))
@@ -493,16 +496,53 @@ def _guard_report(guard: Dict[str, Any]) -> List[str]:
     return ["", *obj.report_lines()]
 
 
-def _select_for_vm(module, classification) -> Set[int]:
+def _upvalue_home_map(module) -> Dict[int, Tuple[int, ...]]:
+    """For every prototype with upvalues, the prototype each upvalue's value
+    ultimately lives in.
+
+    Mirrors ``Lowerer._upvalue_home`` -- the same walk, run before the lowerer
+    exists, because the selector needs the answer to decide who may be
+    virtualized.  ``from_local`` descriptors home in the immediate parent's
+    register file; the rest relay through the parent's own upvalue, and the
+    walk ends wherever the chain started as a local.  The home matters because
+    an upvalue whose home is a *virtualized* prototype has its storage inside a
+    VM frame, which no Luau closure can see -- and the accessor trick R5 uses
+    is exactly such a closure.
+    """
+    parents: Dict[int, Any] = {}
+    for p in module.walk():
+        for c in p.children:
+            parents[c.proto_id] = p
+
+    def home(proto: Any, i: int) -> int:
+        desc = proto.upvalues[i]
+        par = parents[proto.proto_id]
+        if desc.from_local:
+            return par.proto_id
+        return home(par, desc.index)
+
+    return {p.proto_id: tuple(home(p, i) for i in range(len(p.upvalues)))
+            for p in module.walk() if p.upvalues}
+
+
+def _select_for_vm(module, classification, upvalues_ok: bool = False) -> Set[int]:
     """Prototypes the classifier picked that the encoder can actually take.
 
-    The classifier does not know the VM's constraints -- upvalues and nested
-    closures are out, because the VM frame is a table and anything a real
-    Luau closure must see cannot live in it.  Varargs crossed that line in R5
-    (the entry point stashes the caller's packed arguments in the frame, and
-    nothing outside the call can observe them).  Intersecting here means the
-    reported count is the count that will really be virtualized, not the count
-    the classifier wished for.
+    The classifier does not know the VM's constraints -- nested closures are
+    out, because the VM frame is a table and anything a real Luau closure must
+    see cannot live in it.  Varargs crossed that line in R5 (the entry point
+    stashes the caller's packed arguments in the frame, and nothing outside the
+    call can observe them); upvalue *reads and writes* cross it here when
+    ``upvalues_ok`` is set, because the stub hands the interpreter accessor
+    closures over the native storage instead of storing the value in the frame.
+
+    One line does not move even then: an upvalue whose home prototype is itself
+    virtualized has its storage inside a frame no closure can see, so any
+    selected prototype with such an upvalue is unselected again.  Selection and
+    homes are circular -- A may home B's upvalue while B homes A's -- so the
+    removal runs to a fixpoint.  Intersecting here means the reported count is
+    the count that will really be virtualized, not the count the classifier
+    wished for.
     """
     from .vm import encode as _encode
 
@@ -510,14 +550,24 @@ def _select_for_vm(module, classification) -> Set[int]:
     for proto in module.walk():
         if classification.level(proto.proto_id) <= 0:
             continue
-        ok, _reason = _encode.can_virtualize(proto)
+        ok, _reason = _encode.can_virtualize(proto, upvalues_ok=upvalues_ok)
         if ok:
             chosen.add(proto.proto_id)
+    if upvalues_ok and chosen:
+        homes = _upvalue_home_map(module)
+        changed = True
+        while changed:
+            changed = False
+            for pid in sorted(chosen):
+                if any(h in chosen for h in homes.get(pid, ())):
+                    chosen.discard(pid)
+                    changed = True
     return chosen
 
 
 def _collect_stats(module, classification, out: str, source_size: int,
-                   index_stats=None) -> BuildStats:
+                   index_stats=None, selected: Optional[Set[int]] = None,
+                   upvalues_ok: bool = False) -> BuildStats:
     from .vm import encode as _encode
 
     # ``source_size`` is the caller's, because the honest denominator for the
@@ -530,17 +580,29 @@ def _collect_stats(module, classification, out: str, source_size: int,
     # would hide the node floor, which is the reason most prototypes are left
     # alone and the first setting a user needs to find.
     reasons_by_proto = {d.proto_id: d.reason for d in classification.decisions}
-    encodable = {p.proto_id for p in module.walk()
-                 if _encode.can_virtualize(p)[0]}
+    # The selection is the caller's, not recomputed here: with upvalue support
+    # the final set is a fixpoint (prototypes whose upvalue homes are
+    # virtualized are removed after the first pass), and recomputing it
+    # independently is how the report drifts from what the build actually did.
+    if selected is None:
+        selected = _select_for_vm(module, classification,
+                                  upvalues_ok=upvalues_ok)
     reasons: Dict[str, int] = {}
     for proto in module.walk():
         stats.prototypes += 1
         pid = proto.proto_id
-        if pid in encodable and classification.level(pid) > 0:
+        if pid in selected:
             stats.virtualized += 1
             continue
-        if pid not in encodable:
-            key = _encode.can_virtualize(proto)[1] or "not encodable"
+        ok, reason = _encode.can_virtualize(proto, upvalues_ok=upvalues_ok)
+        if not ok:
+            key = reason or "not encodable"
+        elif classification.level(pid) > 0:
+            # Encodable and wanted by the classifier, yet not in the final
+            # selection: that only happens to upvalue-capturing prototypes
+            # whose home ended up virtualized, removed by the fixpoint.
+            key = ("an upvalue's home lives inside the VM, where no closure "
+                   "can reach it")
         else:
             key = reasons_by_proto.get(pid) or "not selected"
         reasons[key] = reasons.get(key, 0) + 1

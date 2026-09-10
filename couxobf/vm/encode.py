@@ -139,8 +139,8 @@ class EncodedProto:
 
 
 
-def can_virtualize(proto: FuncIR, fmt: Optional[FormatSpec] = None
-                   ) -> Tuple[bool, str]:
+def can_virtualize(proto: FuncIR, fmt: Optional[FormatSpec] = None,
+                   upvalues_ok: bool = False) -> Tuple[bool, str]:
     """Whether this prototype can run in the VM, and why not if it cannot.
 
     The boundary is about *reachability*: the VM frame is an ordinary table, so
@@ -149,7 +149,15 @@ def can_virtualize(proto: FuncIR, fmt: Optional[FormatSpec] = None
     honest option; approximating them is how a VM ends up subtly wrong.
     Varargs crossed this line in R5: the entry point stashes the caller's
     packed arguments in the frame, which is all a VARARG instruction ever
-    needed -- nothing outside the call can observe them.
+    needed -- nothing outside the call can observe them.  Upvalue *reads and
+    writes* cross it here when ``upvalues_ok`` is set: the stub replaces the
+    function and hands the interpreter accessor closures closing over the same
+    expression the native reconstruction uses, so the frame never holds the
+    shared state -- it holds live doors to it.  One boundary does not move
+    even then: an upvalue whose home prototype is itself virtualized has its
+    storage inside a frame no closure can see, so the selector refuses such a
+    prototype (the pipeline enforces that; this function cannot see the
+    module).
 
     ``fmt`` adds the size constraints that belong to a *format*: a jump target
     has to fit in the field that carries it, and an absolute target has to fit
@@ -163,8 +171,16 @@ def can_virtualize(proto: FuncIR, fmt: Optional[FormatSpec] = None
         return False, f"{proto.num_regs} registers exceeds the VM's {MAX_REGISTERS}"
     if proto.children:
         return False, "creates closures"
-    if proto.upvalues:
+    if proto.upvalues and not upvalues_ok:
         return False, "captures upvalues"
+    if proto.upvalues:
+        # Each upvalue index rides the wire's wide field.  In practice a
+        # function captures a handful, but a prototype that captures more
+        # than the field can count must be refused before encoding, not
+        # crash inside it.
+        for i in range(len(proto.upvalues)):
+            if fmt is not None and i > fmt.max_wide(("w", "up")):
+                return False, f"upvalue {i} does not fit the wire format"
     if proto.num_params > 255:
         return False, "too many parameters to encode"
     if _uses_coroutines(proto):
@@ -442,6 +458,15 @@ def _field_values(ins: Instr, op: str, fmt: FormatSpec, nconsts: int,
     elif op == OP.VARARG:
         values[("r", 0)] = r(0)
         values[("w", "count")] = _biased(int(a[1]), op, "count", limit)
+    # ``up`` is an index into the accessor list the stub built for this
+    # prototype -- an unsigned immediate, no bias.  The operand is an ``Up``,
+    # not an int, so the index is spelled out.
+    elif op == OP.GETUPVAL:
+        values[("r", 0)] = r(0)
+        values[("w", "up")] = _wide(a[1].index, op, "up", limit)
+    elif op == OP.SETUPVAL:
+        values[("r", 1)] = r(1)
+        values[("w", "up")] = _wide(a[0].index, op, "up", limit)
     elif op == OP.TAILCALL:
         values[("r", 0)] = r(0)
         values[("w", "argc")] = _wide(int(a[1]), op, "argc", limit)
@@ -547,7 +572,8 @@ def encode_proto(proto: FuncIR, opmap: OpcodeMap,
                  order: Optional[Sequence[int]] = None,
                  fmt: Optional[FormatSpec] = None,
                  rng: Any = None,
-                 alias_chance: float = 0.0) -> EncodedProto:
+                 alias_chance: float = 0.0,
+                 upvalues_ok: bool = False) -> EncodedProto:
     """Encode one prototype.  Raises if it cannot be virtualized.
 
     ``order`` is the block emission order, as a sequence of block ids.  It
@@ -561,7 +587,7 @@ def encode_proto(proto: FuncIR, opmap: OpcodeMap,
     against a chosen format.
     """
     spec = fmt if fmt is not None else LEGACY_SPEC
-    ok, reason = can_virtualize(proto, spec)
+    ok, reason = can_virtualize(proto, spec, upvalues_ok=upvalues_ok)
     if not ok:
         raise EncodingError(f"prototype {proto.proto_id} is not virtualizable: "
                             f"{reason}")

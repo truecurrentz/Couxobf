@@ -192,6 +192,18 @@ class Config:
     #: the function; a build whose one VM runs three numeric helpers is not the
     #: build that virtualized a table-heavy one.
     vm_isa_subset: bool = True
+    #: R5 (second increment): virtualize functions that *capture upvalues*.
+    #: The stub the entry point replaces such a function with builds, per
+    #: upvalue, a getter and a setter closure over the same expression the
+    #: native reconstruction uses to reach that variable -- so reads and writes
+    #: stay live and agree with any native sibling that shares it.  Only a
+    #: prototype whose upvalues all resolve into *native* (non-virtualized)
+    #: prototypes qualifies; an upvalue that would point into another VM's
+    #: frame is still refused, because a VM frame is a table and a real Luau
+    #: closure must be able to see what it names.  Off by default: the
+    #: accessor closures are new machinery and the fixture list in
+    #: tests/test_vm_upvalues.py is the gate that argues for turning it on.
+    vm_upvalues: bool = False
     #: Keep control-flow edges out of the instruction stream: the payload
     #: carries an ordinal and the destinations live in their own blob.
     edge_indirection: bool = True
@@ -444,6 +456,7 @@ class Config:
         "pc_protection",
         "opcode_cipher",
         "vm_isa_subset",
+        "vm_upvalues",
         "edge_indirection",
         "dispatcher_family",
         "metadata_fragmentation",

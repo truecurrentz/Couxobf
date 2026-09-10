@@ -51,6 +51,8 @@ REG_VARS: Dict[str, Tuple[str, ...]] = {
     OP.UNM: ("a", "x"), OP.NOT: ("a", "x"), OP.LEN: ("a", "x"),
     OP.CALL: ("base",),
     OP.VARARG: ("base",),
+    OP.GETUPVAL: ("a",),
+    OP.SETUPVAL: ("v",),
     OP.TAILCALL: ("base",),
     OP.RETURN: ("base",),
     OP.RETURN0: (),
@@ -300,6 +302,19 @@ def _body(op: str, fam: Family, n: Dict[str, str], fmt: FormatSpec,
             "  for i = 1, count do",
         ] + ["    " + line for line in fam.store("R[base + i - 1]", "va[" + np + " + i]")] + \
             ["  end", "end"]
+    if op in (OP.GETUPVAL, OP.SETUPVAL):
+        # The frame holds no upvalue state: it holds the accessor list the
+        # stub built -- one getter/setter pair per upvalue, each a real Luau
+        # closure over the native variable the upvalue names.  Calling them
+        # is what keeps reads and writes live and consistent with any native
+        # sibling sharing the variable.  ``up`` is zero-based on the wire, so
+        # the one-based pairs sit at 2*up+1 and 2*up+2.  A prototype with no
+        # upvalues never encodes either opcode, so the entry point's ``false``
+        # placeholder is never indexed.
+        uv = "R." + n["uvs"]
+        if op == OP.GETUPVAL:
+            return fam.store("R[a]", "(%s[up * 2 + 1])()" % uv)
+        return ["(%s[up * 2 + 2])(R[v])" % uv]
     if op == OP.TAILCALL:
         return ["return " + n["call"] + "(R, base, argc, tail)"]
     if op == OP.RETURN:
@@ -990,7 +1005,7 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
     lines += [
         "  end",
         "end",
-        f"local function {n['enter']}(p, E, ...)",
+        f"local function {n['enter']}(p, E, _uv, ...)",
         # The environment guard rides the dispatch loop (see ``loop_guard``),
         # masked like any other opaque check, rather than sitting at the head
         # of this function: an entry point that opens with the check is a
@@ -1007,11 +1022,18 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         "  end",
         # R5: the vararg tail rides the frame.  A VARARG instruction is then a
         # slice of this pack -- nothing outside the call can observe it, which
-        # is why varargs could join the VM while upvalues still cannot.  The
-        # named-parameter count travels as a field of the pack itself, because
-        # `args` is fresh per call and nothing that reads it looks past `.n`.
+        # is why varargs could join the VM.  The named-parameter count travels
+        # as a field of the pack itself, because `args` is fresh per call and
+        # nothing that reads it looks past `.n`.
         "  args.%s = %s" % (n["vnp"], nparams_expr),
         "  R.%s = args" % n["vpack"],
+        # R5's second increment: upvalues ride the frame too -- but not as
+        # state.  ``_uv`` is the accessor list the stub built for this
+        # prototype (getter/setter closures over the native variable), or
+        # ``false`` when the prototype captures nothing.  GETUPVAL and
+        # SETUPVAL call through it; the frame itself never holds a captured
+        # value, so nothing outside the call can observe a copy.
+        "  R.%s = _uv" % n["uvs"],
         f"  return {n['exec']}(p, R, E, _ec)",
         "end",
     ]

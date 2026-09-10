@@ -38,6 +38,8 @@ NAMES = {
     # R5: the frame key holding the caller's packed arguments and the pack
     # field recording the named-parameter count
     "vpack": "_kVp", "vnp": "_kVn",
+    # R5's second increment: the frame key holding the upvalue accessor list
+    "uvs": "_kUv",
 }
 
 #: The layouts worth crossing with the shapes: the historical one, a padded

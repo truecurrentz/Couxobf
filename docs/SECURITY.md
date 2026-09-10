@@ -123,17 +123,49 @@ counter was removed in R12: pc protection is what `pc_protection` (biased and
 relative jump targets) actually delivers, and a dead knob is not how the tool
 talks about protection.
 
+### Varargs and upvalues at the VM boundary (implemented, R5)
+
+The VM frame is an ordinary table, so the boundary for joining it is: nothing
+a real Luau closure must be able to see may live in the frame. Varargs
+crossed first (R5): call arguments are private to the call, so the entry point
+stashes the caller's packed arguments in the frame and `VARARG` is a slice of
+them. Upvalue *reads and writes* cross with `vm_upvalues` (R5's second
+increment, off by default), and they cross differently: the frame still holds
+no captured state. The stub replacing a capturing function is emitted at the
+closure site, so it is lexically inside the scope that owns the variables; it
+builds, per upvalue, a getter and a setter closure over the very expression
+the native reconstruction uses -- the owner's register slot, or the
+per-iteration snapshot local where Luau's semantics demand one -- and hands
+the list to the interpreter as a third entry argument. `GETUPVAL` and
+`SETUPVAL` call through it, which keeps reads and writes live and consistent
+with any native sibling sharing the variable, including writes that land
+between two of the child's reads. One line does not move even with the flag:
+a capture whose owning prototype is itself virtualized has its storage inside
+a frame no closure can see, so the selector unselects such a prototype (a
+fixpoint, since the ownership relation is circular). Today an owner can never
+actually be virtualized -- it creates a closure, which the encoder refuses --
+so the fixpoint is a guard for the day closure creation (R5c) joins the VM.
+
+**Cost added:** a capturing stub allocates two closures per upvalue per call
+and every `GETUPVAL`/`SETUPVAL` is two indirect calls. That is real, and it is
+why the flag defaults off; the common case (no captures) passes `false` and
+allocates nothing. What it buys is structural: upvalue-heavy code -- state
+machines, iterators with retained closures, module patterns -- used to be
+exactly the code the VM could not take, and leaving it native left a
+recognizable shape in every artifact.
+
 ### Directives: per-function control (implemented, R8)
 
 A `--!couxobf:no_virtualize` or `--!couxobf:virtualize` comment names the
 first function declared after it, so the user can exempt a hot callback from
 the VM or force-protect a function the score would skip. The directive is a
 request about *which* functions run in the VM, not a licence to ignore what
-the VM cannot represent: a `virtualize` on a function that captures upvalues
-(the VM has no closure support yet), on the main chunk, or under
-`virtualization_level = none` is reported as ignored rather than implied to
-have run, and an unknown `--!couxobf:` spelling fails the build instead of
-silently doing nothing. See `docs/research-comparison.md` § R8.
+the VM cannot represent: a `virtualize` on a function the selected VM cannot
+take -- with `vm_upvalues` off, that still includes functions capturing
+upvalues -- on the main chunk, or under `virtualization_level = none` is
+reported as ignored rather than implied to have run, and an unknown
+`--!couxobf:` spelling fails the build instead of silently doing nothing. See
+`docs/research-comparison.md` § R8.
 
 ### Constant pool encryption (implemented)
 
@@ -288,6 +320,19 @@ them with `pcall`), `setfenv` behaviour, per-iteration loop variable capture,
 and numeric-for coercion through `tonumber`. Every one of those is a place a
 more aggressive transformation would be wrong. Correctness is not negotiable
 here, which caps how far obfuscation can go.
+
+**A captured loop-body local is shared storage, not a per-iteration cell.**
+Luau gives every iteration of a loop its own cell for a local declared in the
+body, and a retained closure must keep seeing that iteration's cell. The
+reconstruction models registers as shared slots, so a closure capturing such a
+local and called after the loop ends reads whatever the last iteration left
+there. Loop *variables* are the exception: they are copied into a
+per-iteration local at the closure site, which is exact while the local is not
+written through the closure -- the moment two closures share a captured local
+and one writes it, a copy is no longer a cell, which is why the copy is not
+extended to loop-body locals. Fixing this needs a real cell model (a fresh
+cell per iteration with every access, native and virtualized alike, routed
+through it) and is a prerequisite of R5c, not of any setting in this tool.
 
 **`#` on a table with nil holes is reproduced in content, not in length.**
 When a multi-value result -- a call return, a vararg list (R5) -- is appended

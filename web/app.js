@@ -45,6 +45,12 @@ const SPEC = [
        "handler count follows the code instead of being the whole ISA in every " +
        "build. It also shrinks the artifact; a VM running three numeric helpers " +
        "does not need forty arms."],
+      ["vm_upvalues", "Virtualize capturing functions", "bool",
+       "Lets functions that capture upvalues run in the VM. The stub replacing " +
+       "such a function builds getter and setter closures over the same storage " +
+       "the native code uses, so reads and writes stay live and shared with any " +
+       "native sibling. A capture whose owner is itself virtualized still keeps " +
+       "the function native. Off by default."],
     ],
   },
   {

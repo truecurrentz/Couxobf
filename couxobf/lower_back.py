@@ -415,7 +415,8 @@ class Reconstructor:
         # fits a three-byte field does not fit a two-byte one.
         group = self.vm.group_for(proto.proto_id)
         fmt = self.vm.fmt_for(proto.proto_id)
-        ok, _reason = _encode.can_virtualize(proto, fmt)
+        ok, _reason = _encode.can_virtualize(
+            proto, fmt, upvalues_ok=self.vm.upvalues_ok)
         if not ok:
             return None
         order = None
@@ -425,7 +426,8 @@ class Reconstructor:
         self.vm_encoded[proto.proto_id] = _encode.encode_proto(
             proto, self.vm.opmap_for(proto.proto_id), order=order, fmt=fmt,
             rng=self.vm_layout_rng,
-            alias_chance=self.vm.alias_chance)
+            alias_chance=self.vm.alias_chance,
+            upvalues_ok=self.vm.upvalues_ok)
         # A vararg parameter list, not the prototype's declared parameters:
         # the descriptor carries the real count and the interpreter distributes
         # the arguments itself.  From the caller's side this is an ordinary
@@ -442,6 +444,32 @@ class Reconstructor:
         # interpreter in the closure rather than storing "which VM" in the
         # artifact means a build with three VMs carries no table that says so.
         enter = self.vm.enter_for(proto.proto_id)
+        # R5's second increment: upvalues ride the third argument.  This stub
+        # is emitted at the CLOSURE site, so it is lexically inside the scope
+        # that owns the captured variables -- which is what lets the accessor
+        # closures close over the very expression the native reconstruction
+        # uses (the parent's register slot, or the per-iteration snapshot local
+        # when Luau's semantics demand one).  Reads and writes through them are
+        # therefore live and consistent with any native sibling sharing the
+        # variable.  A prototype capturing nothing passes ``false``: GETUPVAL
+        # and SETUPVAL never encode for it, so the placeholder is never
+        # touched, and the common case allocates nothing.
+        if proto.upvalues and self.vm.upvalues_ok:
+            items: List[A.TableItem] = []
+            for i in range(len(proto.upvalues)):
+                target = self._upvalue_expr(proto, i)
+                param = self._param_name(proto.proto_id, 0) + "_u"
+                items.append(A.TableItem(kind="array", value=A.Func(
+                    params=[],
+                    body=A.Block(body=[A.Return(values=[target])]))))
+                items.append(A.TableItem(kind="array", value=A.Func(
+                    params=[A.Param(name=param)],
+                    body=A.Block(body=[A.Assign(
+                        targets=[self._upvalue_expr(proto, i)],
+                        values=[A.Name(name=param)])]))))
+            uv_arg: A.Expr = A.Table(items=items)
+        else:
+            uv_arg = A.Bool(value=False)
         return A.Func(
             params=[A.Param(name=None)],
             body=A.Block(body=[A.Return(values=[A.Call(
@@ -450,6 +478,7 @@ class Reconstructor:
                               key=_num(self.vm.row_key(proto.proto_id))),
                       A.Call(fn=A.Name(name=self.vm.names["getfenv"]),
                              args=[_num(1)]),
+                      uv_arg,
                       A.Vararg()])])]))
 
     def _build_parent_map(self, module: IRModule) -> None:
@@ -966,6 +995,7 @@ def reconstruct_protected(module: IRModule,
                           fusion_level: int = 0,
                           alias_ratio: float = 0.0,
                           alias_chance: float = 0.0,
+                          vm_upvalues: bool = False,
                           env_guard: int = 0,
                           dump_guard: int = 0,
                           guard_policy: str = "fail",
@@ -1062,6 +1092,12 @@ def reconstruct_protected(module: IRModule,
                                  protos_by_id=({q.proto_id: q for q in module.protos}
                                                 if isa_subset else None),
                                  isa_subset=bool(isa_subset),
+                                 # R5's second increment: whether upvalue-capturing
+                                 # prototypes may ride the VM.  The eligibility and
+                                 # the native-home restriction were already decided
+                                 # by the selector; this only tells the stub whether
+                                 # to hand ``enter`` an accessor list.
+                                 upvalues_ok=bool(vm_upvalues),
                                  # wiring indexes this positionally as
                                  # (append, iter, iterpack, itercheck); passing
                                  # the dict would hand it the role *keys*.

@@ -334,7 +334,7 @@ P3 = polish. Each item names the axes above.
 | R2 | Real opaque predicates + opaque dispatch arms (build-keyed, never foldable, never dead) | `opaque_predicates` is a tautology today; docs admit the gap | **P1 — done** (VM tap + native split arms) |
 | R3 | Regression automation: reuse-audit thresholds as a test; seeded differential fuzz battery | "detect and prevent regressions automatically" | **P0/P1** |
 | R4 | Dense blob encoding: per-build 85-alphabet encoder for pool/bank/payload literals | `\xHH` = 4 chars/byte; hello.luau at 739×; size ceiling forces dropping real protection | **P1 — done** |
-| R5 | Closure-capable virtualization (upvalues via shared cell tables; varargs via frame field) | our biggest coverage gap vs Prometheus/Clyde | **P2 — varargs done** |
+| R5 | Closure-capable virtualization (upvalues via accessor closures behind `vm_upvalues`; varargs via frame field) | our biggest coverage gap vs Prometheus/Clyde | **P2 — varargs and upvalues done; nested closures next** |
 | R6 | Per-group constant pools with group-format AAD binding | one recovered accessor currently yields all constants | **P2** |
 | R7 | Exact integer arithmetic number encoding (split/add/fold) behind `numeric_protection_level=2` | numbers currently only get float-safe disguises | **P2 — done** |
 | R8 | `--!couxobf:` directives (`no_virtualize`, `virtualize`) | per-function user control, Luaq parity | **P2 — done** |
@@ -535,7 +535,7 @@ skip-threshold behaviour, and dense-vs-hex differential on a real example.
 *Default.* On, with the threshold escape above; `Config.blob_encoding =
 "dense" | "hex"` is wired through the API option surface and the web form.
 
-### R5 — Closure-capable virtualization (P2 — varargs done)
+### R5 — Closure-capable virtualization (P2 — varargs and upvalues done)
 
 *Problem.* `can_virtualize` refuses any prototype with upvalues, varargs, or
 nested closures — i.e. most real Roblox code (callbacks, state objects).
@@ -558,32 +558,56 @@ fills sequentially can report a different length than one the native compiler
 builds with a size hint — the content is exact, the holey length is not
 pinned, and code that needs the true count should use `table.pack(...).n`.
 
-*Still to come (upvalues and nested closures).* Below is the design for the
-remaining two barriers.
+*As built (upvalue increment).* Upvalue reads and writes cross the boundary
+behind `vm_upvalues` (default off), and not by the cell-table design sketched
+below — a simpler mechanism subsumed it. The stub the entry point replaces a
+capturing function with is emitted at the closure site, which puts it
+lexically inside the scope owning the captured variables. It builds, per
+upvalue, a getter and a setter closure over the same expression the native
+reconstruction uses to reach that variable (the owner's register slot, or the
+per-iteration snapshot local where Luau's semantics demand one) and passes
+the list as a third `enter` argument; `GETUPVAL`/`SETUPVAL` call through it.
+Because the accessors target the very storage native siblings use, reads and
+writes are live and consistent by construction — including a native write
+landing between two of the child's reads, and two VM siblings sharing one
+counter. The cell-table design would have rewritten the parent's accesses to
+go through a cell; the accessor design needs no parent rewrite at all, and
+per-iteration capture comes free because the stub is created per iteration
+and captures the snapshot local. The one line that does not move: an upvalue
+whose home prototype is itself virtualized has storage no Luau closure can
+see, so the selector removes such prototypes — a fixpoint, since the relation
+is circular. Today the fixpoint cannot fire (a home creates a closure, which
+the encoder refuses); it is the guard for the closure increment. Coverage is
+measured in `tests/test_vm_upvalues.py`: read-only capture, VM child writes
+read by the native parent and the reverse, shared counter across a VM/native
+sibling pair, per-iteration capture of a loop variable, two upvalues with a
+local, capture composed with varargs, `pcall` through a VM closure,
+relay-chained captures through native scopes, and the refusal paths.
+
+*Still to come (nested closures).* A virtualized prototype that creates
+closures of its own is still refused. The uncaptured children are the easy
+half (hoistable as constants); children captured by later code need VM-state
+cells visible to Luau closures, which is the hard case and the reason the
+cell model was not thrown away above. `can_virtualize` grew a capability flag
+(`upvalues_ok`) instead of a blanket refusal; the classifier keeps the size
+floor.
 
 *Reference.* Prometheus' upvalue proxies; Clyde's `LOAD_UPVAL/STORE_UPVAL/
-CLOSE_UPVAL` with an `openUVs` table. We do it our way, at the IR level.
-
-*Design.* Upvalues become **shared cell tables** created by the parent
-closure (`local cell = {}` captured as a real Luau upvalue by both the native
-parent and the VM entry closure); `GETUPVAL/SETUPVAL` read/write `cell[1]`.
-Varargs: frame field — the enter wrapper packs `...` into `R` slots plus a
-`va` table; `VARARG` reads it. Nested closures whose own bodies are
-virtualizable become VM-entry closures closing over the same cells.
-`can_virtualize` gains a capability set instead of a blanket refusal; the
-classifier keeps the size floor.
+CLOSE_UPVAL` with an `openUVs` table. We did it our way, at the IR level, and
+the accessors replaced both the proxies and the cells for reads/writes.
 
 *Why better.* Virtualization coverage jumps from "leaf numeric code" to
 "most application code" — the single largest protection gain available.
 
-*Cost.* One table indirection per upvalue access; enter wrapper +1 closure.
-*Compatibility risk.* Medium — per-iteration capture, `debug.setupvalue`
-visibility, and coroutine interactions need fixtures. Roll out behind
-`Config.vm_closures = "off"|"cells"`, default **off** until the fixture list
-in E1 passes, then on at hardened+.
-*Test.* New micro fixtures: closure-over-loop-local, shared counter across
-two closures, upvalue write from VM child read by native parent, `pcall`
-through a VM closure, `select('#', ...)` in VM. Differential at every level.
+*Cost.* Two accessor closures per upvalue per call of a capturing stub, and
+each upvalue access is an indirect call; prototypes without captures pass
+`false` and pay nothing. That cost is why the flag defaults off.
+*Compatibility risk.* Low for what ships — the fixture list above is the
+gate — but the loop-body-local cell limitation (documented in SECURITY.md)
+bounds which captures are safe. The frame holds no captured state, so there
+is no second copy of an upvalue anywhere in the artifact for a dumper to find
+or for semantics to disagree with.
+*Test.* `tests/test_vm_upvalues.py`, differential against the source itself.
 
 ### R6 — Per-group pools (P2)
 
