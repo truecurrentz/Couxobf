@@ -56,6 +56,7 @@ of a return list.  This is what makes ``f(g())``, ``local a, b = f()`` and
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import ast_nodes as A
@@ -362,6 +363,20 @@ class Reconstructor:
         self.bank = bank
         self.bank_accessor = bank_accessor
         self.bank_ticket = bank_ticket or (lambda ticket: ticket)
+        #: Probability that a block of the flattened native driver gains a
+        #: split arm (R2 native side): a second ``elseif`` whose encoded
+        #: state the build can prove no reachable pc ever takes, carrying a
+        #: copy of the real block's tail assignments.  0.0 keeps the driver
+        #: exactly as before; the pipeline turns it on with
+        #: ``opaque_predicates`` at ``control_flow_level >= 1``.
+        self.split_arms_rate: float = 0.0
+        #: How many decoy arms the build actually emitted, for the report.
+        self.split_arms_emitted: int = 0
+        #: One entry per flattened prototype: the drawn encoding and every
+        #: real/decoy state value.  Tests read it to prove the
+        #: exactly-one-satisfiable invariant symbolically; production never
+        #: looks at it.
+        self.split_log: List[Dict[str, Any]] = []
         if (pool is None) != (accessor is None):
             raise ReconstructionError("pool and accessor must be given together")
 
@@ -577,30 +592,81 @@ class Reconstructor:
                 salt = 0
                 mul = 1
                 mode = 0
-        arms: List[Tuple[A.Expr, A.Block]] = []
-        for b in proto.blocks:
+
+        # The state encoding, split into its two halves so the real arms and
+        # the split-arm decoys cannot drift apart: ``enc_of`` is the value a
+        # block's id maps to, ``enc_expr`` a fresh copy of the left-hand
+        # side (two arms must never share an AST node).  All three forms are
+        # bijections of the state -- mul is drawn odd against a power-of-two
+        # modulus -- so a value outside the image of the block ids is
+        # provably unreachable, which is what the decoy arms below trade on.
+        def enc_of(block_id: int) -> int:
             if mode == 1:
-                left = A.Bin(op="%", left=A.Bin(op="-", left=_name(pc), right=_num(salt)),
+                return (block_id - salt) % modulus
+            if mode == 2:
+                return (((block_id + salt) * mul) + (salt % 251)) % modulus
+            return ((block_id * mul) + salt) % modulus
+
+        def enc_expr() -> A.Expr:
+            if mode == 1:
+                return A.Bin(op="%",
+                             left=A.Bin(op="-", left=_name(pc), right=_num(salt)),
                              right=_num(modulus))
-                right = _num((b.id - salt) % modulus)
-            elif mode == 2:
-                left = A.Bin(op="%",
+            if mode == 2:
+                return A.Bin(op="%",
                              left=A.Bin(op="+",
                                         left=A.Bin(op="*", left=A.Bin(op="+", left=_name(pc), right=_num(salt)), right=_num(mul)),
                                         right=_num(salt % 251)),
                              right=_num(modulus))
-                right = _num((((b.id + salt) * mul) + (salt % 251)) % modulus)
-            else:
-                left = A.Bin(
-                    op="%",
-                    left=A.Bin(op="+",
-                               left=A.Bin(op="*", left=_name(pc), right=_num(mul)),
-                               right=_num(salt)),
-                    right=_num(modulus),
-                )
-                right = _num(((b.id * mul) + salt) % modulus)
-            cond = A.Bin(op="==", left=left, right=right)
-            arms.append((cond, A.Block(body=self._block_body(proto, b, pc))))
+            return A.Bin(
+                op="%",
+                left=A.Bin(op="+",
+                           left=A.Bin(op="*", left=_name(pc), right=_num(mul)),
+                           right=_num(salt)),
+                right=_num(modulus),
+            )
+
+        encoded = {enc_of(b.id) for b in proto.blocks}
+        rate = float(self.split_arms_rate)
+        draw = self.vm_layout_rng if (rate > 0 and self.vm_layout_rng is not None) else None
+        arms: List[Tuple[A.Expr, A.Block]] = []
+        decoys: List[Tuple[int, int, int]] = []
+        for b in proto.blocks:
+            body = self._block_body(proto, b, pc)
+            cond = A.Bin(op="==", left=enc_expr(), right=_num(enc_of(b.id)))
+            arms.append((cond, A.Block(body=body)))
+            # R2's native-side split arm: an ``elseif`` whose encoded state
+            # no reachable pc can take (pc is only ever set to a block id,
+            # and the decoy value is outside the encoding's image of them),
+            # carrying a copy of the real block's tail assignments.  There is
+            # no dead branch -- only a branch the build can prove unreachable
+            # but a reader cannot without solving the flattened CFG.  The
+            # tail copy means even a bug that reached it would still land on
+            # the block's real successor.
+            if draw is not None and body and draw.chance(rate):
+                v = draw.randbelow(modulus)
+                steps = 0
+                while v in encoded and steps < 64:
+                    v = (v + 1) % modulus
+                    steps += 1
+                if v in encoded:
+                    continue            # a pathological block table; skip
+                tail_n = min(len(body), 1 + draw.randbelow(3))
+                tail = copy.deepcopy(body[-tail_n:])
+                arms.append((A.Bin(op="==", left=enc_expr(), right=_num(v)),
+                             A.Block(body=tail)))
+                decoys.append((b.id, v, tail_n))
+                self.split_arms_emitted += 1
+        self.split_log.append({
+            "proto": proto.proto_id,
+            "mode": mode,
+            "salt": salt,
+            "mul": mul,
+            "modulus": modulus,
+            "block_ids": [b.id for b in proto.blocks],
+            "encoded": [enc_of(b.id) for b in proto.blocks],
+            "decoys": decoys,
+        })
         stmts.append(A.While(
             cond=_name(pc),
             body=A.Block(body=[A.If(arms=arms,
@@ -884,6 +950,7 @@ def reconstruct_protected(module: IRModule,
                           vm_family: Any = "register",
                           block_permutation: bool = False,
                           opaque_predicates: bool = True,
+                          control_flow_level: int = 0,
                           layout_rng: Any = None,
                           dispatcher_family: Any = "mixed",
                           opcode_randomization: bool = True,
@@ -1078,7 +1145,20 @@ def reconstruct_protected(module: IRModule,
                         pool_ticket=pool_ticket,
                         bank_ticket=bank_ticket)
     rec.vm_layout_rng = layout_rng if layout_rng is not None else vm_rng
+    # R2's native-side split arms ride the same honesty wire as the VM's
+    # predicate tap: `opaque_predicates` is the switch, and the
+    # control-flow level is the rate dial.  Level 0 flattens without arms,
+    # so the compact profile emits none.
+    rec.split_arms_rate = (
+        {0: 0.0, 1: 0.12, 2: 0.2, 3: 0.3}[max(0, min(3, int(control_flow_level)))]
+        if opaque_predicates else 0.0)
     body = rec.reconstruct(module)
+
+    # The native-side opaque arms are not the pool's, so the count lands here
+    # rather than at seal time; 0 when nothing was flattened or the knobs are
+    # off, which the report then says.
+    if names_out is not None:
+        names_out["split_arms"] = rec.split_arms_emitted
 
     # The VM's bytecode and constants are interned here, before the pool is
     # sealed below.  Doing it after would hand out slot numbers the encrypted

@@ -331,7 +331,7 @@ P3 = polish. Each item names the axes above.
 |---|---|---|---|
 | R0 | Green baseline everywhere: test corpus must not require an external Luau checkout; add repo-local conformance fixtures | failing/erroring tests hide regressions | **P0** |
 | R1 | Restore multi-group VMs: `vm_variety` actually drives `make_plan`; report and docs reflect it | dead knob, dishonest `maximum` profile, single recognizable VM pattern | **P0** |
-| R2 | Real opaque predicates + opaque dispatch arms (build-keyed, never foldable, never dead) | `opaque_predicates` is a tautology today; docs admit the gap | **P1** (VM tap done; native split arms pending) |
+| R2 | Real opaque predicates + opaque dispatch arms (build-keyed, never foldable, never dead) | `opaque_predicates` is a tautology today; docs admit the gap | **P1 — done** (VM tap + native split arms) |
 | R3 | Regression automation: reuse-audit thresholds as a test; seeded differential fuzz battery | "detect and prevent regressions automatically" | **P0/P1** |
 | R4 | Dense blob encoding: per-build 85-alphabet encoder for pool/bank/payload literals | `\xHH` = 4 chars/byte; hello.luau at 739×; size ceiling forces dropping real protection | **P1 — done** |
 | R5 | Closure-capable virtualization (upvalues via shared cell tables; varargs via frame field) | our biggest coverage gap vs Prometheus/Clyde | **P2** |
@@ -343,9 +343,8 @@ P3 = polish. Each item names the axes above.
 | R11 | Dispatcher speed option: inlined-chain dispatch for small groups | 2 closure calls/instruction is slow | **P2 — done** |
 | R12 | Remove dead config surface; every remaining field either wired or gone (see G) | 15 pending fields erode trust in the report | **P1 — done** |
 
-Status: R0, R1, R3, R4, R7, R11 and R12 are implemented and measured (see
-`docs/benchmarks.md`), and R2's VM-side predicate tap is implemented (the
-native-side split arms remain deferred); the fuzz battery is in
+Status: R0, R1, R2, R3, R4, R7, R11 and R12 are implemented and measured
+(see `docs/benchmarks.md`); the fuzz battery is in
 `tests/test_fuzz_differential.py`, and the reuse-audit's verdict is pinned
 as a regression test in `tests/test_reuse_regression.py`.  Everything else
 is as listed.  R12 removed thirteen inert fields (`junk_level`, `encoded_pc`,
@@ -414,7 +413,7 @@ stop matching hardened; differential fixture suite at variety=2,3.
 *Default.* On at `maximum` (as the profile already promises); 1 at
 hardened/balanced/compact.
 
-### R2 — Real opaque predicates and opaque arms (P1) — **VM side implemented**
+### R2 — Real opaque predicates and opaque arms (P1) — **implemented**
 
 *Problem.* Today's `opaque_predicates` emits
 `if not ((op == op) and (pc >= 1) and (#code >= pc))` — a boundary check, not
@@ -443,15 +442,21 @@ formats, whenever the header is a renumbered one), keyed into the reuse-audit
 `shape` and the structural fingerprint, so a recovered tapped table does not
 score as reuse of an untapped group.
 
-*Not yet built (native side).* In the flattened state machine, *split arms*:
-two `elseif` arms whose conditions are `state_enc == f(id)` and
-`state_enc == g(id)` with exactly one satisfiable given the build's
-modulus/affine choices; the unsatisfiable one holds a *copy* of a real block's
-tail assignment sequence produced from the same IR (so even under a bug it
-executes the same semantics). No dead branch ever exists — only a branch the
-build can prove unreachable but a reader cannot. Deferred because it needs the
-exactly-one-satisfiable invariant unit-tested over the affine forms before it
-is safe to turn on; the VM tap already delivers the load-bearing property.
+*Native side (also built).* The flattened native driver gains *split arms*
+at the same knob (`opaque_predicates`, rate-limited by
+`control_flow_level`: 0.12 / 0.2 / 0.3 at levels 1–3, none at 0).  For a
+drawn block, a second `elseif` joins the arm whose encoded state lies
+outside the affine encoding's image of the block ids: the counter is only
+ever assigned a block id, so the build can prove the arm unreachable while
+a reader can only show it by solving the flattened CFG.  The decoy arm
+carries a deep copy of the real block's last one-to-three statements,
+drawn from the same IR — even under a bug that reached it, it executes
+the same tail semantics and lands on the same successor.  No dead branch
+ever exists; only a branch whose unreachability is work to prove.  The
+drawn encoding (mode/salt/mul/modulus), the real states and the decoy
+states are logged per prototype (`Reconstructor.split_log`) so the
+exactly-one-satisfiable invariant is unit-proven symbolically over the
+affine forms rather than asserted (`tests/test_split_arms.py`).
 
 *Why better.* First genuine opaque predicate in the tool; keyed to sealed
 data instead of algebraic identities; structurally per-build.

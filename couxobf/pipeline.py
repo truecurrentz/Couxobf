@@ -109,6 +109,9 @@ class BuildStats:
     #: Decoy constants planted in the pool, counted at seal time so it reflects the
     #: pool the artifact carries rather than the budget it was given.
     pool_decoys: int = 0
+    #: Split arms emitted into flattened native drivers (R2 native side):
+    #: opaque ``elseif`` arms whose encoded state the build proves unreachable.
+    split_arms: int = 0
     #: One entry per VM group this artifact carries: family, dispatcher, opcode
     #: count, instruction format and how many prototypes it runs.  Read out of the
     #: plan rather than derived from the config, because with `vm_variety` above 1
@@ -365,6 +368,7 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         vm_family=VMFamily.WOVEN,
         block_permutation=config.block_permutation,
         opaque_predicates=bool(config.opaque_predicates),
+        control_flow_level=int(config.control_flow_level),
         isa_subset=bool(config.vm_isa_subset),
         layout_rng=domains.get("cfg"),
         dispatcher_family=DispatcherFamily.MIXED,
@@ -410,6 +414,7 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
     stats.fingerprint_requested = bool(runtime_names.get("fingerprint_requested"))
     stats.fingerprint_bound = bool(runtime_names.get("fingerprint_bound"))
     stats.pool_decoys = int(runtime_names.get("pool_decoys") or 0)
+    stats.split_arms = int(runtime_names.get("split_arms") or 0)
     stats.vm_groups = list(runtime_names.get("vm_plan") or [])
     stats.elapsed_ms = (time.perf_counter() - started) * 1000.0
 
@@ -594,6 +599,15 @@ def cost_report(result: BuildResult) -> str:
             "                        running the payload against the pool." % s.pool_decoys)
     else:
         lines.append("pool decoys           : none.  Every entry in the pool is referenced.")
+    if s.split_arms:
+        lines.append(
+            "split arms            : %d opaque branches added to the flattened native\n"
+            "                        drivers.  Each is keyed to an encoded state the\n"
+            "                        build proves no reachable counter can take, so it\n"
+            "                        never runs -- but a reader cannot show that\n"
+            "                        without solving the control flow." % s.split_arms)
+    else:
+        lines.append("split arms            : none in this build.")
     lines.append(f"elapsed             : {s.elapsed_ms:.1f} ms")
     lines.append("")
 
