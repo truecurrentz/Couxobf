@@ -343,10 +343,11 @@ P3 = polish. Each item names the axes above.
 | R11 | Dispatcher speed option: inlined-chain dispatch for small groups | 2 closure calls/instruction is slow | **P2 — done** |
 | R12 | Remove dead config surface; every remaining field either wired or gone (see G) | 15 pending fields erode trust in the report | **P1** |
 
-Status: R0, R1, R4 and R11 are implemented and measured (see
-`docs/benchmarks.md`); R3's fuzz battery is in
-(`tests/test_fuzz_differential.py`) with the reuse-audit thresholds still to
-become a test; everything else is as listed.
+Status: R0, R1, R3, R4 and R11 are implemented and measured (see
+`docs/benchmarks.md`): the fuzz battery is in
+`tests/test_fuzz_differential.py`, and the reuse-audit's verdict is pinned
+as a regression test in `tests/test_reuse_regression.py`; everything else is
+as listed.
 
 Deliberately **not** on the roadmap, with reasons (these are reference
 techniques we reject): dead-code/fake-handler injection (Clyde/ScriptShield/
