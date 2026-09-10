@@ -288,13 +288,18 @@ runs the same language the guard is written in. The artifact's own report states
 what the guard captured and whether it tripped, because a build should not claim
 more than it did.
 
-**One pool and one bank per artifact.** Constant data lives in exactly two places
--- the sealed pool and the string bank -- each authenticated as a whole. So the
-"single point of extraction" criticism is only half answered: there is one reader
-per interpreter for *code*, and one for *data* for the entire program. Per-VM-group
-pools, each keyed and AAD-bound to the format of the interpreter that reads it, are
-the next structural change and are not built; until then a dumper who recovers the
-pool accessor has every literal in the program, decoys included.
+**A pool per VM group, one bank for everything else.** Since R6, each VM group
+seals its *own* constant pool: its own region key and an AAD of
+`context + group fingerprint`, so a blob lifted out of one group fails to
+authenticate under another group's runtime even inside the same artifact --
+and each group's runtime carries its own accessor name. The blast radius of a
+recovered accessor is now one group's constants (its protos' bytecode
+constants plus its decoys), not the whole program. Native code -- string keys,
+guards, the bank itself -- keeps one shared pool: it has no group to bind to,
+and splitting it would buy another decrypt pass but no additional boundary.
+The bank remains authenticated as a whole, which is the last single reader for
+*string* data; a recovered group pool never yields the bank, and a recovered
+bank never yields any group's pool.
 
 **One function, one interpreter.** `vm_variety` gives a program several VMs and
 `vm_isa_subset` gives each one its own instruction set, but a prototype belongs to

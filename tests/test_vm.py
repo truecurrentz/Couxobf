@@ -172,7 +172,9 @@ def vm_reconstruct(src: str, name: str = "test.luau", seed: bytes = b"\x07" * 16
     rec = _VMReconstructor(_plan(seed))
     body = printer.emit(rec.reconstruct(module))
     parts = [lower_back.HELPERS_SRC,
-             wiring.prelude_source(_plan(seed), dict(rec.encoded), _lit, _lit)]
+             wiring.prelude_source(_plan(seed), dict(rec.encoded),
+                                   lambda pid, v: _lit(v),
+                                   lambda pid, v: _lit(v))]
     parts.append(body)
     return "\n".join(parts), set(rec.encoded)
 
@@ -527,7 +529,7 @@ def test_vm_row_keys_are_build_specific_tickets():
     assert plan.row_key(7) != 7
     src = wiring.prelude_source(
         plan, {7: type("E", (), {"code": b"abc", "consts": (), "edges": ()})()},
-        const_expr=lambda v: "nil", code_expr=lambda b: '"abc"')
+        const_expr=lambda pid, v: "nil", code_expr=lambda pid, b: '"abc"')
     assert "[%d]" % plan.row_key(7) in src
     assert "[7] = { code" not in src
 
@@ -778,7 +780,9 @@ def test_every_dispatcher_shape_computes_the_same_thing(dispatcher, vm_family):
     rec = _VMReconstructor(plan)
     body = printer.emit(rec.reconstruct(module))
     parts = [lower_back.HELPERS_SRC,
-             wiring.prelude_source(plan, dict(rec.encoded), _lit, _lit),
+             wiring.prelude_source(plan, dict(rec.encoded),
+                                   lambda pid, v: _lit(v),
+                                   lambda pid, v: _lit(v)),
              body]
     out = "\n".join(parts)
     assert rec.encoded, "nothing was virtualized"

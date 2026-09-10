@@ -958,6 +958,10 @@ _CMP = {OP.EQ: "==", OP.NE: "~=", OP.LT: "<", OP.LE: "<=",
 #: Not a secret -- a delimiter, so the extension is unambiguous.
 _FINGERPRINT_AAD_TAG = b"\xc1f"
 
+#: Marks a *per-group* pool context (R6): the delimiter says the bytes that
+#: follow are one VM group's own fingerprint rather than the whole plan's.
+_GROUP_POOL_AAD_TAG = b"\xc1g"
+
 
 def reconstruct_protected(module: IRModule,
                           keys: Any,
@@ -1174,6 +1178,53 @@ def reconstruct_protected(module: IRModule,
     bank_ticket = lambda ticket: (int(ticket) ^ bank_ticket_mask) & 0xffffffff
     if names_out is not None:
         names_out["bank_ticket_mask"] = bank_ticket_mask if bank is not None else 0
+
+    # R6: one constant pool per VM group, when a build actually has more than
+    # one.  Today a single pool holds every constant in the artifact -- native
+    # literals and every group's bytecode alike -- so one recovered accessor
+    # yields all of them.  Splitting by group means a pool lifted out of group 0
+    # neither decrypts under group 1's key nor authenticates against its AAD
+    # (bound to the group's own fingerprint), so the blast radius of one
+    # recovered accessor is one group's descriptors, not the program.  Native
+    # code keeps the shared pool: splitting it would cost a decrypt per scope
+    # for no structural gain, because native literals have no group to bind to.
+    # The pools are created here but interned lazily while the prelude emits,
+    # and sealed below with the rest, so the dense-encoding decision still sees
+    # every blob it is deciding about.
+    group_pools: Dict[int, Any] = {}
+    group_pool_names: Dict[int, Dict[str, str]] = {}
+    group_ticket_masks: Dict[int, int] = {}
+    group_tickets: Dict[int, Any] = {}
+    per_group_pools = plan is not None and len(plan.groups) > 1
+    if per_group_pools:
+        from .vm.wiring import group_fingerprint, structural_fingerprint
+        vm_stream = vm_rng if vm_rng is not None else rng
+        for group in plan.groups:
+            gnames = default_names(fresh_prefix(rng, prefixes))
+            gcontext = context + _GROUP_POOL_AAD_TAG + group_fingerprint(group)
+            if fingerprint and plan.protos:
+                # Mirror the shared pool's binding: the artifact fingerprint
+                # rides the AAD when there is something virtualized to bind to.
+                gcontext += _FINGERPRINT_AAD_TAG + structural_fingerprint(plan)
+            group_pools[group.index] = ConstantPool(
+                keys, vm_stream.fork("vm-pool-%d" % group.index), gcontext,
+                cache_policy=cache_policy, cache_bound=cache_bound,
+                decoys=0, constant_level=constant_level,
+                numeric_level=numeric_level, enc_domain=crypto_enc_domain,
+                mac_domain=crypto_mac_domain)
+            group_pool_names[group.index] = gnames
+            gt_rng = vm_stream.fork("vm-pool-ticket-%d" % group.index)
+            gt_mask = (gt_rng.u32() if hasattr(gt_rng, "u32")
+                       else (0x2F91C4D5 ^ group.index)) & 0xffffffff
+            if gt_mask == 0:
+                gt_mask = 0x2F91C4D5
+            group_ticket_masks[group.index] = gt_mask
+            group_tickets[group.index] = (
+                lambda slot, m=gt_mask: (int(slot) ^ m) & 0xffffffff)
+        if names_out is not None:
+            names_out["group_pools"] = {
+                str(i): dict(n) for i, n in sorted(group_pool_names.items())}
+
     rec = Reconstructor(pool=pool, accessor=names["get"], vm=plan, bank=bank,
                         bank_accessor=(bank_names["get"] if bank_names else None),
                         helpers=helper_map,
@@ -1216,7 +1267,20 @@ def reconstruct_protected(module: IRModule,
                     if group.describes(pid)}
             if mine:
                 _validate_payload(mine, group.opmap, group.fmt)
-        pooled = lambda value: "%s(%d)" % (names["get"], pool_ticket(pool.slot(value)))
+        # With per-group pools (R6) each prototype's descriptors are interned
+        # into the pool of the group that runs it; without, everything shares
+        # the one pool, as before.  The pid decides the pool, so the routing
+        # lives here rather than inside the prelude, which stays
+        # pool-agnostic.
+        if per_group_pools:
+            def pooled(pid: int, value: Any) -> str:
+                group = plan.group_for(pid)
+                gp = group_pools[group.index]
+                return "%s(%d)" % (group_pool_names[group.index]["get"],
+                                   group_tickets[group.index](gp.slot(value)))
+        else:
+            def pooled(pid: int, value: Any) -> str:
+                return "%s(%d)" % (names["get"], pool_ticket(pool.slot(value)))
         vm_src = _wiring.prelude_source(plan, rec.vm_encoded, pooled, pooled,
                                         edges_expr=pooled,
                                         entry_guard=guard.entry_lines(),
@@ -1227,16 +1291,35 @@ def reconstruct_protected(module: IRModule,
     need_pool = len(pool) > 0
     need_bank = bank is not None and len(bank) > 0
 
-    # One crypto module for both, when both exist.  The module is ~8KB; two
-    # copies would be two decoders to find and two places to drift.
+    # R6: seal the group pools too.  Every group that runs a prototype
+    # interned at least its bytecode, so these are non-empty in practice; the
+    # length check keeps an unexpected empty pool from crashing the build
+    # instead of refusing to seal.
+    group_sealed: Dict[int, Any] = {}
+    for index in sorted(group_pools):
+        if len(group_pools[index]):
+            group_sealed[index] = group_pools[index].seal()
+
+    # One crypto module shared by every runtime that needs one, when more than
+    # one does.  The module is ~8KB; N copies would be N decoders to find and N
+    # places to drift.  A lone runtime emits the module inline instead, which is
+    # what ``emit_crypto=not crypto_src`` below encodes for each consumer.
+    crypto_users = int(need_pool) + int(need_bank) + len(group_sealed)
     crypto_src = ""
-    if need_pool and need_bank:
+    crypto_host: Dict[str, str] = {}
+    if crypto_users >= 2:
         from .runtime.luau_crypto import crypto_runtime
+        if need_pool:
+            crypto_host = names
+        elif group_sealed:
+            crypto_host = group_pool_names[min(group_sealed)]
+        else:
+            crypto_host = bank_names
         crypto_src = ("local %s = (function()\n%s end)()\n" % (
-            names["crypto"],
-            crypto_runtime({"xor": names["c_xor"], "sha": names["c_sha"],
-                            "mac": names["c_mac"], "open": names["c_open"],
-                            "seal": names["c_seal"]},
+            crypto_host["crypto"],
+            crypto_runtime({"xor": crypto_host["c_xor"], "sha": crypto_host["c_sha"],
+                            "mac": crypto_host["c_mac"], "open": crypto_host["c_open"],
+                            "seal": crypto_host["c_seal"]},
                            enc_domain=crypto_enc_domain,
                            mac_domain=crypto_mac_domain)))
 
@@ -1251,10 +1334,12 @@ def reconstruct_protected(module: IRModule,
     bank_sealed = bank.seal() if need_bank else None
     dense_codec = None
     dense_skipped = ""
-    if blob_encoding == "dense" and (need_pool or need_bank):
+    if blob_encoding == "dense" and (need_pool or need_bank or group_sealed):
         blob_bytes = 0
         if sealed is not None:
             blob_bytes += len(sealed.ciphertext) + len(sealed.aad) + 64
+        for _gindex, gsealed in sorted(group_sealed.items()):
+            blob_bytes += len(gsealed.ciphertext) + len(gsealed.aad) + 64
         if bank_sealed is not None:
             blob_bytes += (len(bank_sealed.blob) + len(bank_sealed.ticket_ct)
                            + 64)
@@ -1284,6 +1369,31 @@ def reconstruct_protected(module: IRModule,
                                 mac_domain=sealed.mac_domain,
                                 dense=dense_codec)
 
+    # R6: one runtime per group pool, each opening its own blob with its own
+    # accessor.  They land in the same ``pool`` component as the shared one --
+    # the ordering inside the component is irrelevant, the runtimes are
+    # independent -- so the block/dependency plumbing is untouched.  When a
+    # shared crypto module exists each runtime calls it by the host's names,
+    # exactly the way the bank does; a lone runtime emitted its crypto inline.
+    group_pool_src = ""
+    for index in sorted(group_sealed):
+        gsealed = group_sealed[index]
+        gnames = dict(group_pool_names[index])
+        if crypto_src:
+            gnames["crypto"] = crypto_host["crypto"]
+            for role in ("c_xor", "c_sha", "c_mac", "c_open", "c_seal"):
+                gnames[role] = crypto_host[role]
+        gruntime = ConstantPoolRuntime(gnames, cache_policy=cache_policy,
+                                       cache_bound=cache_bound)
+        group_pool_src += gruntime.emit(
+            gsealed.key, gsealed.nonce, gsealed.tag, gsealed.ciphertext,
+            gsealed.aad, emit_crypto=not crypto_src,
+            guard_check=runtime_guard_check,
+            ticket_mask=group_ticket_masks[index],
+            enc_domain=gsealed.enc_domain, mac_domain=gsealed.mac_domain,
+            dense=dense_codec)
+    pool_src += group_pool_src
+
     bank_src = ""
     if need_bank:
         from .runtime.luau_crypto import crypto_runtime
@@ -1293,13 +1403,15 @@ def reconstruct_protected(module: IRModule,
         # tickets entirely.
         bn = dict(bank_names)
         if crypto_src:
-            # The shared module exports the *pool's* field names, so the bank
+            # The shared module exports the *host's* field names, so the bank
             # has to call it by those.  Keeping its own would compile fine and
             # then fail at the first decrypt with "attempt to call a nil
-            # value", because the field simply is not there.
-            bn["crypto"] = names["crypto"]
+            # value", because the field simply is not there.  The host is the
+            # pool that owns the module -- the shared pool when it exists,
+            # otherwise the first group pool (R6).
+            bn["crypto"] = crypto_host["crypto"]
             for role in ("c_xor", "c_sha", "c_mac", "c_open", "c_seal"):
-                bn[role] = names[role]
+                bn[role] = crypto_host[role]
         bank_runtime = StringBankRuntime(
             bn, cache_policy=string_cache_policy,
             emit_crypto=not crypto_src)

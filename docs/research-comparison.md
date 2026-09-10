@@ -335,7 +335,7 @@ P3 = polish. Each item names the axes above.
 | R3 | Regression automation: reuse-audit thresholds as a test; seeded differential fuzz battery | "detect and prevent regressions automatically" | **P0/P1** |
 | R4 | Dense blob encoding: per-build 85-alphabet encoder for pool/bank/payload literals | `\xHH` = 4 chars/byte; hello.luau at 739×; size ceiling forces dropping real protection | **P1 — done** |
 | R5 | Closure-capable virtualization (upvalues via accessor closures behind `vm_upvalues`; varargs via frame field) | our biggest coverage gap vs Prometheus/Clyde | **P2 — varargs and upvalues done; nested closures next** |
-| R6 | Per-group constant pools with group-format AAD binding | one recovered accessor currently yields all constants | **P2** |
+| R6 | Per-group constant pools with group-format AAD binding | one recovered accessor currently yields all constants | **P2 — done** |
 | R7 | Exact integer arithmetic number encoding (split/add/fold) behind `numeric_protection_level=2` | numbers currently only get float-safe disguises | **P2 — done** |
 | R8 | `--!couxobf:` directives (`no_virtualize`, `virtualize`) | per-function user control, Luaq parity | **P2 — done** |
 | R9 | Index-to-number pass for provably-static table keys (opt-in) | structural transform at zero runtime cost | **P3 — done** |
@@ -609,21 +609,34 @@ is no second copy of an upvalue anywhere in the artifact for a dumper to find
 or for semantics to disagree with.
 *Test.* `tests/test_vm_upvalues.py`, differential against the source itself.
 
-### R6 — Per-group pools (P2)
+### R6 — Per-group pools (P2) — **implemented**
 
 *Problem.* One pool per artifact: recovering one accessor yields every
 constant (reviewer point #19).
 
 *Reference.* Clyde's per-proto keys; reviewer-analysis #19 already scoped it.
 
-*Change.* Each VM group seals its own pool with its own region key and AAD =
-context + group fingerprint; the pool descriptor tables are fragmented per
-group (we already fragment metadata). Native code keeps one shared pool.
+*As built.* When a build virtualizes protos into more than one VM group, each
+group seals its own `ConstantPool` with its own region key (from
+`vm_stream.fork("vm-pool-%d")`) and AAD = `context + group fingerprint`
+(`group_fingerprint` is a sha256 over the group's family, dispatcher, opcode
+assignment, format prefs and proto roster). Each group gets its own runtime
+accessor name and ticket mask, so one recovered accessor yields only that
+group's constants — its protos' bytecode constants plus its own decoys. The
+native path keeps one shared pool (no group to bind to) plus the bank; the
+report's `crypto_host` records which names the bank borrows so the remap is
+auditable. With a single group (or no VM), the code path is exactly the
+pre-R6 one: same stream draws, same pool, same report shape.
 
-*Cost.* +1 decrypt per group at load. *Risk.* Low — pool code is unit-tested.
-*Test.* Cross-build/cross-group pool-swap tests must fail authentication;
-existing seal/open suites per group.
-*Default.* On when `vm_variety > 1`.
+*Cost.* +1 decrypt + MAC per extra group at load, negligible on the sizes we
+serve. *Risk.* Low — pool code is unit-tested; the split is gated on
+`len(plan.groups) > 1` so default builds are byte-identical to before.
+*Test.* `tests/test_vm_pools.py`: per-group pool accounting, distinct
+accessors, determinism, same-group open, and a cross-group blob swap that
+must fail authentication with the neutral wording; differential execution of
+a three-group build.
+*Default.* On automatically when `vm_variety > 1` produces more than one
+group.
 
 ### R7 — Exact integer arithmetic encoding (P2) — **implemented**
 

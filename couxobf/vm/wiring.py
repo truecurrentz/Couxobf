@@ -194,6 +194,27 @@ def structural_fingerprint(plan: "VMPlan") -> bytes:
     return h.digest()[:8]
 
 
+def group_fingerprint(group: "VMGroup") -> bytes:
+    """One group's share of :func:`structural_fingerprint`.
+
+    Same content, one group's worth, so a per-group constant pool can bind its
+    AAD to *its own* machine: family, dispatcher, opcode count and instruction
+    format.  A blob lifted out of group 0 then fails to open under group 1's
+    runtime even inside the same artifact, because the two groups are different
+    machines -- which is the point of having them.
+    """
+    import hashlib
+    import json
+
+    return hashlib.sha256(json.dumps({
+        "group": group.index,
+        "family": group.family,
+        "dispatcher": group.dispatcher,
+        "opcodes": group.opmap.opcode_count(),
+        "format": group.fmt.summary(),
+    }, sort_keys=True, default=str).encode("utf-8")).digest()[:8]
+
+
 def _fresh_names(rng: Rng, count: int, reserved: Iterable[str] = ()) -> List[str]:
     """Unique names outside the ``_k`` space the rest of the output uses."""
     gen = make_name_generator(rng, reserved=set(_SHARED) | set(reserved))
@@ -510,9 +531,9 @@ def _pack_edges(edges: Sequence[int]) -> bytes:
 
 
 def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
-                   const_expr: Callable[[Any], str],
-                   code_expr: Callable[[bytes], str],
-                   edges_expr: Optional[Callable[[bytes], str]] = None,
+                   const_expr: Callable[[int, Any], str],
+                   code_expr: Callable[[int, bytes], str],
+                   edges_expr: Optional[Callable[[int, bytes], str]] = None,
                    entry_guard: Sequence[str] = (),
                    fragmented: Optional[bool] = None,
                    opaque_predicates: bool = True) -> str:
@@ -525,10 +546,12 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
     description of a VM at once (#17).
 
     ``const_expr`` and ``code_expr`` produce the expression text for a pooled
-    constant and for a bytecode blob.  Taking them as callbacks keeps this
-    module independent of the constant pool, so the unprotected reconstruction
-    path can pass literal emitters and the protected one can pass pool reads --
-    the same bytecode, protected or not.
+    constant and for a bytecode blob, and receive the prototype id alongside the
+    value: with per-group pools (R6) the pool a descriptor belongs to is decided
+    by the group that runs the prototype, and only the pid says which group that
+    is.  Taking them as callbacks keeps this module independent of the constant
+    pool, so the unprotected reconstruction path can pass literal emitters and
+    the protected one can pass pool reads -- the same bytecode, protected or not.
     """
     interpreter_parts: List[str] = []
     for group in plan.groups:
@@ -543,19 +566,19 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
     edge_rows = []
     for pid in sorted(encoded):
         enc = encoded[pid]
-        consts = ", ".join(const_expr(v) for v in enc.consts)
+        consts = ", ".join(const_expr(pid, v) for v in enc.consts)
         # Deliberately no `entry` or `nparams` here.  Both are already in the
         # payload header, which travels inside the authenticated blob; the
         # interpreter reads them from there.  Putting them here as well created
         # a second, plaintext, unauthenticated copy that an editor could change
         # without invalidating any tag.
-        payload_rows.append("  [%d] = function() return %s end," % (pid, code_expr(enc.code)))
+        payload_rows.append("  [%d] = function() return %s end," % (pid, code_expr(pid, enc.code)))
         const_rows.append("  [%d] = function() return { %s } end," % (pid, consts))
         if enc.edges and edges_expr is not None:
             # Four bytes per edge, so the stream itself carries only ordinals
             # and the positions they mean live somewhere else entirely (#18).
             blob = _pack_edges(enc.edges)
-            edge_rows.append("  [%d] = function() return %s end," % (pid, edges_expr(blob)))
+            edge_rows.append("  [%d] = function() return %s end," % (pid, edges_expr(pid, blob)))
     if not payload_rows:
         # No prototype made it in, so there is nothing to dispatch.  Emitting
         # the interpreter anyway would be dead weight an analyst could study
@@ -584,11 +607,11 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
         joined = []
         for pid in sorted(encoded):
             enc = encoded[pid]
-            consts = ", ".join(const_expr(v) for v in enc.consts)
-            edges = (" edges = function() return " + edges_expr(_pack_edges(enc.edges)) + " end,") if (
+            consts = ", ".join(const_expr(pid, v) for v in enc.consts)
+            edges = (" edges = function() return " + edges_expr(pid, _pack_edges(enc.edges)) + " end,") if (
                 enc.edges and edges_expr is not None) else ""
             joined.append("  [%d] = { code = function() return %s end, consts = function() return { %s } end,%s },"
-                          % (plan.row_key(pid), code_expr(enc.code), consts, edges))
+                          % (plan.row_key(pid), code_expr(pid, enc.code), consts, edges))
         parts.append("local %s = {\n%s\n}"
                      % (plan.rows_table, "\n".join(joined)))
         return _finish(parts)
