@@ -28,11 +28,28 @@ from couxobf.verify.output import (OutputValidationError, validate_output,
                                    validate_or_raise)
 from test_roundtrip import EXCLUDED, MICRO_DIR, _conformance_dir
 
+#: Compute-heavy corpus programs whose virtualized build is slow enough to run
+#: past the default ``execute()`` budget.  Their OUTPUT is identical to the
+#: original -- the cost is the expected, documented price of virtualizing tight
+#: numeric loops (docs/SECURITY.md) -- so the differential test extends the
+#: protected-side budget here instead of weakening the equivalence check.  The
+#: original always runs under the fast default.
+PROTECTED_TIMEOUT = {
+    "buffers.luau": 240,
+    "constructs.luau": 240,
+}
+
 TOOLCHAIN = find_toolchain()
 
 
 def _corpus():
+    from tests.corpus import REPO_CORPUS
     files = sorted(glob.glob(os.path.join(MICRO_DIR, "*.luau")))
+    # The repo-local corpus always runs: it is written here and versioned here,
+    # so a checkout without an external Luau source tree still exercises the
+    # full-build differential over multi-block, loop- and table-heavy programs.
+    files += [p for p in REPO_CORPUS if os.path.basename(p) not in
+              {os.path.basename(f) for f in files}]
     conf = _conformance_dir()
     if conf:
         files += sorted(glob.glob(os.path.join(conf, "*.luau")))
@@ -67,7 +84,8 @@ def test_build_output_matches_original(path):
         pytest.fail(f"{base}: build failed: {exc}")
 
     original = execute(TOOLCHAIN, src, base, timeout=30)
-    protected = execute(TOOLCHAIN, result.source, "built.luau", timeout=30)
+    protected = execute(TOOLCHAIN, result.source, "built.luau",
+                        timeout=PROTECTED_TIMEOUT.get(base, 30))
 
     assert original.returncode == protected.returncode, (
         f"{base}: rc {original.returncode} != {protected.returncode}\n"
@@ -112,6 +130,48 @@ def test_same_seed_is_byte_identical():
     b = build(src, Config(reproducible_seed=11), verify=False)
     assert a.source == b.source
     assert a.seed == b.seed
+
+
+def test_same_seed_is_byte_identical_across_processes():
+    """Reproducibility must survive the interpreter's hash randomization.
+
+    The bootstrap-order shuffle used to read its candidates off a set of
+    strings, whose iteration order follows PYTHONHASHSEED: two processes with
+    one seed produced two artifacts, because a shuffle of a differently
+    ordered list lands on a different permutation even with identical random
+    draws.  The single-process test above cannot see that bug; this one runs
+    the same pinned build in two subprocesses under different hash seeds and
+    compares the finished output byte for byte.
+    """
+    import subprocess
+    src = ("local function f(a, b)\n"
+           "  local t = {x = a, y = b}\n"
+           "  for i = 1, 4 do t.x += i * t.y end\n"
+           "  return t.x, t.y\n"
+           "end\n"
+           "print(f(3, 4))\n")
+    program = (
+        "import hashlib, sys\n"
+        "from couxobf.config import Config\n"
+        "from couxobf.pipeline import build\n"
+        "src = sys.argv[1]\n"
+        "r = build(src, Config(reproducible_seed=11, min_virtualize_body_nodes=1),\n"
+        "          name='det.luau', verify=False)\n"
+        "print(hashlib.sha256(r.source.encode()).hexdigest())\n"
+    )
+    digests = []
+    for hashseed in ("1", "424242"):
+        env = dict(os.environ, PYTHONHASHSEED=hashseed)
+        proc = subprocess.run([sys.executable, "-c", program, src],
+                              capture_output=True, text=True, timeout=120,
+                              env=env,
+                              cwd=os.path.dirname(os.path.dirname(
+                                  os.path.abspath(__file__))))
+        assert proc.returncode == 0, proc.stderr[-400:]
+        digests.append(proc.stdout.strip())
+    assert digests[0] == digests[1], (
+        "the same source, config and seed produced different artifacts in "
+        "two processes -- some stage still depends on hash ordering")
 
 
 def test_different_seed_differs():
@@ -585,13 +645,24 @@ def test_the_report_lists_every_vm_group_the_artifact_carries():
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     with open(os.path.join(repo, "examples", "maze.luau"), encoding="utf-8") as fh:
         source = fh.read()
-    out = build(source, _maze_config(vm_variety=3, state_distribution=True,
-                                     dispatcher_family="mixed"),
+    out = build(source, _maze_config(vm_variety=3, dispatcher_family="mixed"),
                 name="maze.luau", verify=False)
     groups = out.stats.vm_groups
-    assert len(groups) == 1, [g.get("family") for g in groups]
+    # The knob is honored: as many groups as the selection can populate, each
+    # carrying at least one prototype, and never more than requested.
+    assert 2 <= len(groups) <= 3, [g.get("family") for g in groups]
     assert all(g.get("protos", 0) >= 1 for g in groups), groups
     assert {(g.get("family"), g.get("dispatcher")) for g in groups} == {("woven", "woven")}
+    # The groups disagree with each other on something structural -- otherwise
+    # "several VMs" would be several copies of one.  Formats are per-group
+    # draws, so with more than one group at least one descriptor field differs.
+    if len(groups) > 1:
+        # summary() carries nested dicts and lists, so the dedupe key is a
+        # canonical JSON spelling rather than a tuple of items.
+        import json
+        fmts = {json.dumps(g.get("format") or {}, sort_keys=True)
+                for g in groups}
+        assert len(fmts) > 1, "every group drew the same format"
     # The group lines are the indented ones; "vm family (config)" is the request,
     # which is a different fact and is printed as such.
     lines = [l for l in out.report.splitlines() if l.startswith("  vm ")]

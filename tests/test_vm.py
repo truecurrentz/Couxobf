@@ -66,6 +66,12 @@ NAMES = {
     "iter": "_kiter",
     "iterpack": "_kiterpack",
     "itercheck": "_kitercheck",
+    # R5: frame key the entry point stashes the caller's argument pack under,
+    # and the pack field recording the named-parameter count
+    "vpack": "_kVp",
+    "vnp": "_kVn",
+    # R5's second increment: frame key holding the upvalue accessor list
+    "uvs": "_kUv",
 }
 
 
@@ -94,6 +100,11 @@ class _VMReconstructor(lower_back.Reconstructor):
         self.encoded[proto.proto_id] = enc
         # A real Luau closure that enters the interpreter.  To the surrounding
         # native code this is indistinguishable from the function it replaces.
+        # The third argument is the upvalue accessor list; this harness never
+        # virtualizes a prototype that captures (``can_virtualize`` above runs
+        # without ``upvalues_ok``), so the ``false`` placeholder is the honest
+        # value -- and omitting it would hand the first call argument to the
+        # interpreter as the accessor list.
         return A.Func(
             params=[A.Param(name=None)],
             body=A.Block(body=[A.Return(values=[A.Call(
@@ -103,6 +114,7 @@ class _VMReconstructor(lower_back.Reconstructor):
                                            is_float=False)),
                       A.Call(fn=A.Name(name=NAMES["getfenv"]),
                              args=[A.Number(value=1, is_float=False)]),
+                      A.Bool(value=False),
                       A.Vararg()])])]))
 
 
@@ -256,9 +268,15 @@ def test_encoded_stream_walks_clean():
             continue
         opmap = _opmap()
         for proto in _all_protos(module):
-            if not encode.can_virtualize(proto)[0]:
+            # ``upvalues_ok`` on purpose: GETUPVAL/SETUPVAL have been
+            # encodable since R5's second increment, and the walk's job is to
+            # prove the encoder and ``operand_size`` agree for every opcode
+            # the ISA can carry -- including those two.  The walk only reads
+            # bytes; the accessor closures exist at the stub, not in the
+            # stream, so nothing here needs a runtime to run them.
+            if not encode.can_virtualize(proto, upvalues_ok=True)[0]:
                 continue
-            enc = encode.encode_proto(proto, opmap)
+            enc = encode.encode_proto(proto, opmap, upvalues_ok=True)
             pc, code = enc.lua_entry - 1, enc.code
             while pc < len(code):
                 name = opmap.to_op[code[pc]]

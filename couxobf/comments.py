@@ -105,6 +105,48 @@ def find_all(source: str) -> List[HashComment]:
     return _scan(source, dashes=True)
 
 
+#: What a directive comment looks like: the whole comment is the directive.
+#: Only short ``--`` comments qualify -- a marker buried inside a
+#: ``--[=[ ... ]=]`` block is data, and treating it as configuration is how a
+#: string becomes a setting.
+_DIRECTIVE = re.compile(r"^--!couxobf:\s*([A-Za-z_][A-Za-z0-9_]*)\s*$")
+
+#: The directive names the build understands.  ``no_virtualize`` keeps the
+#: following function native; ``virtualize`` forces it into the VM regardless
+#: of its complexity score; ``no_index_to_num`` exempts the following local
+#: declaration from the R9 key-rewriting pass.  Luaq's per-function opt-outs
+#: were the reference; the spellings are this tool's own.
+DIRECTIVES = ("no_virtualize", "virtualize", "no_index_to_num")
+
+
+class Directive(NamedTuple):
+    """One ``--!couxobf:`` directive: the line it sits on and the name it asks."""
+
+    line: int
+    name: str
+
+
+def find_directives(source: str) -> List[Directive]:
+    """Every ``--!couxobf:<name>`` directive comment, with its line.
+
+    Uses the same string-aware scan as everything else in this module, so a
+    directive-shaped string literal or long comment is not a directive.  A
+    directive names the first function declared at or after its line -- the
+    declaration that follows it -- which is what the classifier binds; a
+    directive with no function after it is silently moot.  Unknown names are
+    returned as-is: the caller refuses the build, because a misspelled
+    directive that quietly did nothing is the dead knob this project keeps
+    removing.
+    """
+    out: List[Directive] = []
+    for hit in _scan(source, dashes=True):
+        text = source[hit.start:hit.end].strip()
+        m = _DIRECTIVE.match(text)
+        if m:
+            out.append(Directive(hit.line, m.group(1)))
+    return out
+
+
 def _scan(source: str, dashes: bool) -> List[HashComment]:
     hits: List[HashComment] = []
     i = 0

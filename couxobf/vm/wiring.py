@@ -116,6 +116,11 @@ class VMPlan:
     groups: List[VMGroup] = field(default_factory=list)
     #: Alias-opcode usage rate, and the fusion rules offered to the encoder.
     alias_chance: float = 0.0
+    #: R5's second increment: whether upvalue-capturing prototypes may ride the
+    #: VM at all.  Mirrors :attr:`Config.vm_upvalues`.  When true the stub hands
+    #: ``enter`` an accessor list instead of ``false``; the eligibility and the
+    #: native-home restriction are decided by the selector, not here.
+    upvalues_ok: bool = False
     #: Per-prototype dispatch decisions, for the report.
     decisions: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -204,7 +209,21 @@ def _fresh_names(rng: Rng, count: int, reserved: Iterable[str] = ()) -> List[str
 #: Per-build name roles the interpreter needs, in the order they are drawn.
 _ROLES = ("code", "exec", "enter", "call", "getfenv", "acc", "stack", "sp",
           "pc", "regs", "consts", "env", "edges",
-          "ro", "r8", "rr", "rw", "rk", "rp", "rt")
+          "ro", "r8", "rr", "rw", "rk", "rp", "rt",
+          # Appended last so the draws before it do not move: the dispatch
+          # key's payload-tap local, renamed like every other working name.
+          "pt",
+          # R5: where the entry point stashes the caller's packed arguments so
+          # a VARARG instruction is a slice of them.  ``vpack`` is the frame
+          # key the pack travels under; ``vnp`` is the pack field that records
+          # how many of those arguments were named parameters.
+          "vpack", "vnp",
+          # R5's second increment: the frame key under which the entry point
+          # stashes the stub's upvalue accessor list (getter/setter closures
+          # over the native variables).  ``false`` when the prototype captures
+          # nothing -- GETUPVAL/SETUPVAL never execute then, so it is never
+          # indexed.
+          "uvs")
 
 
 def make_plan(rng: Rng, protos: Iterable[int],
@@ -226,7 +245,8 @@ def make_plan(rng: Rng, protos: Iterable[int],
               dispatchers: Optional[Sequence[str]] = None,
               fragmented: bool = True,
               protos_by_id: Optional[Dict[int, Any]] = None,
-              isa_subset: bool = False) -> VMPlan:
+              isa_subset: bool = False,
+              upvalues_ok: bool = False) -> VMPlan:
     """Build a :class:`VMPlan` from the build's ``vm`` randomness stream.
 
     ``rng`` should be the domain-separated stream for VM generation, not the
@@ -253,8 +273,12 @@ def make_plan(rng: Rng, protos: Iterable[int],
     dispatcher = _dispatcher_name(dispatcher, rng)
     tables = tuple(tables or _fresh_names(rng, 4))
     if names is None:
-        drawn = _fresh_names(rng, len(_ROLES) + 1)
-        names = dict(zip(_ROLES, drawn[:len(_ROLES)]))
+        # Exactly one name per role: historically this drew one extra and threw
+        # it away, and the draw count is part of the vm stream's fingerprint --
+        # keeping it constant is what lets a new role (R5's ``uvs``) join the
+        # roster without shifting every name drawn afterwards.
+        drawn = _fresh_names(rng, len(_ROLES))
+        names = dict(zip(_ROLES, drawn))
     else:
         # A caller-supplied name set: the test harness pins these so a failure
         # names the function it came from.  They must reach the groups too -- a
@@ -296,7 +320,8 @@ def make_plan(rng: Rng, protos: Iterable[int],
                   dispatcher=primary.dispatcher,
                   groups=groups,
                   alias_chance=alias_chance,
-                  fragmented=bool(fragmented))
+                  fragmented=bool(fragmented),
+                  upvalues_ok=bool(upvalues_ok))
 
 
 def _make_groups(rng: Rng, proto_ids: List[int], names: Dict[str, str], *,
@@ -319,7 +344,11 @@ def _make_groups(rng: Rng, proto_ids: List[int], names: Dict[str, str], *,
     with each other, and round-robin guarantees they get equal populations
     instead of 63 prototypes in one VM and one in the other.
     """
-    count = 1
+    # ``variety`` is honored again: every group draws its own format, opcode
+    # map, cipher and dispatch key, so a devirtualizer recovered from one
+    # group does not read the others.  Capped at the population -- a group
+    # with no prototype would still emit a whole interpreter for nothing.
+    count = max(1, min(int(variety), len(proto_ids) or 1))
     family_pool = ["woven"]
     dispatcher_pool = ["woven"]
     if len(family_pool) < count:

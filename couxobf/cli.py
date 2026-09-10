@@ -82,6 +82,8 @@ def _config_from_args(args) -> Config:
         config.env_guard = args.env_guard
     if getattr(args, "dump_guard", None) is not None:
         config.dump_guard = args.dump_guard
+    if getattr(args, "index_to_num", False):
+        config.index_to_num = True
     if args.minify:
         config.minify = True
     if args.no_strip_types:
@@ -211,12 +213,15 @@ def _add_protection_knobs(sp) -> None:
     --vm-family was added to protect and forgotten on report, so `report`
     described a build the CLI could not produce.
     """
-    sp.add_argument("--vm-family", choices=["woven", "register", "accumulator", "stack", "hybrid"], default=None,
+    # The choice lists name what the tool actually emits: one woven VM family
+    # and one guarded dispatcher.  Older spellings (register/stack/...,
+    # bucket/nested_if/...) stay loadable in saved configs -- the selectors
+    # normalize them -- but are no longer offered as choices.
+    sp.add_argument("--vm-family", choices=["woven"], default=None,
                     help="operand discipline of the generated interpreter")
-    sp.add_argument("--dispatcher", choices=["woven", "mixed", "nested_if", "decision_tree", "bucket", "state_transition", "threaded"],
-                    default=None,
+    sp.add_argument("--dispatcher", choices=["none", "mixed"], default=None,
                     help="shape of the opcode dispatch; mixed (the default) "
-                         "picks one at random per build")
+                         "lets the build draw its dispatch shapes")
     # 0..3, not 0..2: Config.from_profile("maximum") sets 3, so a CLI that
     # rejected 3 could not express its own maximum profile.  Levels 2 and 3 are
     # currently identical -- lower_back activates the bank at ">= 2" and there
@@ -237,7 +242,8 @@ def _add_protection_knobs(sp) -> None:
                     help="use a stable opcode numbering (weaker, but makes two "
                          "builds comparable)")
     sp.add_argument("--no-opaque-predicates", action="store_true",
-                    help="disable VM-state opaque validity predicates")
+                    help="disable the opaque predicates (the dispatch key's "
+                         "payload tap and the VM-state validity checks)")
     sp.add_argument("--no-block-permutation", action="store_true",
                     help="lay VM blocks out in IR order")
     sp.add_argument("--max-vm-functions", type=int, default=None,
@@ -246,6 +252,10 @@ def _add_protection_knobs(sp) -> None:
                     help="size budget ratio; 0 disables trimming")
     sp.add_argument("--env-guard", type=int, choices=(0, 1, 2), default=None,
                     help="environment logging guard level")
+    sp.add_argument("--index-to-num", action="store_true",
+                    help="rewrite the keys of provably-static local tables to\n"
+                         "per-build numeric handles (R9; opt-in, whitelist-safe;\n"
+                         "exempt a table with --!couxobf:no_index_to_num above it)")
     sp.add_argument("--dump-guard", type=int, choices=(0, 1, 2), default=None,
                     help="dump surface guard level")
 

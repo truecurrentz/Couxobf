@@ -65,16 +65,22 @@ none of which the build controls.
 ### Virtualization and dispatch (implemented)
 
 A selected prototype is lowered to a register file driven by a generated
-interpreter, with no lexical blocks and no visible loop structure. Four state
-models (`register`, `accumulator`, `stack`, `hybrid`) and three dispatch shapes
-(`nested_if`, `decision_tree`, `bucket`) are drawn per VM group, and `vm_variety`
-means one artifact can hold two or three of them at once, each with its own opcode
-map, field widths, jump-target mode and handler fusion. Two more axes are per group
-as well: `vm_isa_subset` gives a VM only the operations its own protos were lowered
-to, and `opcode_cipher` stores a bijective image of the dispatcher's number in the
-bytecode, with the order of the dispatch arms drawn alongside it. The report prints
-one line per group so the claim is checkable rather than asserted, and the web
-result panel shows the same table, cipher included.
+interpreter, with no lexical blocks and no visible loop structure. The
+interpreter itself is one deliberately consolidated design -- a single register
+discipline with a guarded, table-indexed dispatch -- because shipping four
+parallel interpreter shapes put four recognizable surfaces in every artifact and
+gave a deobfuscator four times the targets. What varies is everything *around*
+that one shape, and it varies per VM group: `vm_variety` lets one artifact hold
+several interpreters at once, and each group draws its own opcode numbering,
+instruction format (field widths, operand masks, padding, field order,
+jump-target mode and opcode cipher), instruction subset and dispatch-key
+mixing. Two more axes are per group as well: `vm_isa_subset` gives a VM only
+the operations its own protos were lowered to, and `opcode_cipher` stores a
+bijective image of the dispatcher's number in the bytecode, with the order of
+the dispatch arms drawn alongside it. The report prints one line per group so
+the claim is checkable rather than asserted, and the web result panel shows the
+same table, cipher included. The earlier multi-family/multi-dispatcher names
+still load for saved configs, but they normalize to this one interpreter.
 
 (The heading used to read "control-flow flattening". It was a misnomer: what is
 implemented is dispatch, not flattening -- there is no threaded code and no
@@ -83,13 +89,14 @@ instruction reordering, which is real; graph flattening is not claimed.)
 
 **Cost added:** an analyst must reconstruct a CFG per group, under a numbering
 and an instruction geometry that exist only in this file, before they can reason
-about the program at all. A tool written against `nested_if` with 1-byte operands
-and absolute jump targets does not read a group that chose `decision_tree`, 2-byte
-operands and an edge table. A group that narrowed its instruction set also has
-fewer arms than the tool expects, and its payload numbers have to pass through
-that build's reader before they mean anything. This is the single largest cost
-multiplier in the current build, because it attacks *structure*, which is what a
-human reads first.
+about the program at all. A tool written against one group's 1-byte operands,
+biased jump targets and additive register mask does not read a sibling group
+with 2-byte operands, an edge table and a different mask -- the recovered
+format is per group, not per artifact. A group that narrowed its instruction
+set also has fewer arms than the tool expects, and its payload numbers have to
+pass through that build's reader before they mean anything. This is the single
+largest cost multiplier in the current build, because it attacks *structure*,
+which is what a human reads first.
 
 **What that cost is, measured.** `tools/reuse-audit.py` builds the same program
 under several configurations, learns a "stored value means operation" table from
@@ -111,8 +118,54 @@ local recovers the execution order mechanically. The fetch itself is no longer
 `byte(code, pc)` written at the dispatch site -- it is a generated per-group reader
 whose offsets, widths and masks come from the same descriptor as the encoder, which
 means a grep for the fetch misses, and a recovered reader is per-group rather than
-one per artifact. `encoded_pc` would hide the program counter and is
-declared-but-not-read, so the report lists it as pending rather than pretending.
+one per artifact. The `encoded_pc` knob that once claimed to hide the program
+counter was removed in R12: pc protection is what `pc_protection` (biased and
+relative jump targets) actually delivers, and a dead knob is not how the tool
+talks about protection.
+
+### Varargs and upvalues at the VM boundary (implemented, R5)
+
+The VM frame is an ordinary table, so the boundary for joining it is: nothing
+a real Luau closure must be able to see may live in the frame. Varargs
+crossed first (R5): call arguments are private to the call, so the entry point
+stashes the caller's packed arguments in the frame and `VARARG` is a slice of
+them. Upvalue *reads and writes* cross with `vm_upvalues` (R5's second
+increment, off by default), and they cross differently: the frame still holds
+no captured state. The stub replacing a capturing function is emitted at the
+closure site, so it is lexically inside the scope that owns the variables; it
+builds, per upvalue, a getter and a setter closure over the very expression
+the native reconstruction uses -- the owner's register slot, or the
+per-iteration snapshot local where Luau's semantics demand one -- and hands
+the list to the interpreter as a third entry argument. `GETUPVAL` and
+`SETUPVAL` call through it, which keeps reads and writes live and consistent
+with any native sibling sharing the variable, including writes that land
+between two of the child's reads. One line does not move even with the flag:
+a capture whose owning prototype is itself virtualized has its storage inside
+a frame no closure can see, so the selector unselects such a prototype (a
+fixpoint, since the ownership relation is circular). Today an owner can never
+actually be virtualized -- it creates a closure, which the encoder refuses --
+so the fixpoint is a guard for the day closure creation (R5c) joins the VM.
+
+**Cost added:** a capturing stub allocates two closures per upvalue per call
+and every `GETUPVAL`/`SETUPVAL` is two indirect calls. That is real, and it is
+why the flag defaults off; the common case (no captures) passes `false` and
+allocates nothing. What it buys is structural: upvalue-heavy code -- state
+machines, iterators with retained closures, module patterns -- used to be
+exactly the code the VM could not take, and leaving it native left a
+recognizable shape in every artifact.
+
+### Directives: per-function control (implemented, R8)
+
+A `--!couxobf:no_virtualize` or `--!couxobf:virtualize` comment names the
+first function declared after it, so the user can exempt a hot callback from
+the VM or force-protect a function the score would skip. The directive is a
+request about *which* functions run in the VM, not a licence to ignore what
+the VM cannot represent: a `virtualize` on a function the selected VM cannot
+take -- with `vm_upvalues` off, that still includes functions capturing
+upvalues -- on the main chunk, or under `virtualization_level = none` is
+reported as ignored rather than implied to have run, and an unknown
+`--!couxobf:` spelling fails the build instead of silently doing nothing. See
+`docs/research-comparison.md` § R8.
 
 ### Constant pool encryption (implemented)
 
@@ -151,6 +204,22 @@ invented primitive is the one part of a system like this that is likely to be
 actually broken rather than merely bypassable. Confidentiality, integrity and
 obfuscation are kept separate: the tag detects tampering, the cipher hides
 bytes, and neither one obscures program structure.
+
+### Index-to-number table keys (implemented, R9, opt-in)
+
+The pool hides key *strings*, but breaking the pool once yields the shape of
+every record. `index_to_num` (CLI `--index-to-num`, off by default) goes a
+step further for tables it can prove safe: it rewrites the keys to per-build
+numeric handles *before lowering*, so the key strings never enter the pool at
+all. The safety rule is a strict whitelist -- the table must be a plain local
+bound once to a literal-string-key constructor, never reassigned, never captured
+as an upvalue, and used only as `t.name` or `t["literal"]`. Any value-flow
+(passing, returning, aliasing, dynamic indexing, method call, operator operand)
+declines the table, and a table can opt out with
+`--!couxobf:no_index_to_num` above its declaration. Runtime cost is zero
+(numeric indexing is marginally faster); a corpus-wide run rewrote 0 tables and
+declined 7, with every build still verifying, which is the point of a
+whitelist: it is allowed to do nothing, it is never allowed to change behaviour.
 
 ### Per-build variation (implemented)
 
@@ -206,10 +275,13 @@ position in the file is decided by the emitter rather than by the build seed.
 Diversifying the implementations is on the roadmap and is not done (#23, #24).
 
 **The environment guard raises cost and prevents nothing.** `env_guard` and
-`dump_guard` capture the interesting library names at load and re-check five
-surfaces (`string.dump`, `getbytecode`, `getscriptbytecode`, `debug.getinfo`,
-`debug.gethook`) at every VM entry; at level 2 the build can neutralize a logging
-`__index` or refuse once a surface has been swapped. None of that is a boundary.
+`dump_guard` capture the interesting library names at load and re-check the
+watched surfaces (`string.dump`, `getbytecode`, `getscriptbytecode`,
+`debug.getinfo`, `debug.gethook`) from inside the dispatch loop, masked the
+way an opaque predicate is -- a mid-run swap of a surface is caught within a
+handful of instructions rather than at a greppable entry point; at level 2
+the build refuses with the dispatcher's own fallthrough wording, assembled at
+runtime so the phrase never appears in the artifact. None of that is a boundary.
 A dumper that patches the in-memory proto never calls any of those functions; a
 hook installed before the artifact loads sees the capture happen; and a debugger
 runs the same language the guard is written in. The artifact's own report states
@@ -237,9 +309,10 @@ into 512-byte pages with shuffled page order and per-occurrence tickets instead 
 ids, and each page's keystream is separately addressed. Page size is fixed -- it is
 a `StringBank` constructor argument constrained to multiples of 64, not a `Config`
 field, so there is no knob to advertise and no diversity to claim -- and there is
-one implementation of the bank reader. `chunking_level`, `numeric_protection_level`,
-`constant_protection_level` and `table_key_protection` are declared and reported
-pending.
+one implementation of the bank reader. `numeric_protection_level`,
+`constant_protection_level` and `table_key_protection` are wired; the
+`chunking_level` knob was removed in R12 (per-chunk keys remain unbuilt and are
+not advertised as if they existed).
 
 **Semantic fidelity constrains transformation.** The tool must preserve Luau
 semantics exactly, including observable error messages (user code matches on
@@ -247,6 +320,33 @@ them with `pcall`), `setfenv` behaviour, per-iteration loop variable capture,
 and numeric-for coercion through `tonumber`. Every one of those is a place a
 more aggressive transformation would be wrong. Correctness is not negotiable
 here, which caps how far obfuscation can go.
+
+**A captured loop-body local is shared storage, not a per-iteration cell.**
+Luau gives every iteration of a loop its own cell for a local declared in the
+body, and a retained closure must keep seeing that iteration's cell. The
+reconstruction models registers as shared slots, so a closure capturing such a
+local and called after the loop ends reads whatever the last iteration left
+there. Loop *variables* are the exception: they are copied into a
+per-iteration local at the closure site, which is exact while the local is not
+written through the closure -- the moment two closures share a captured local
+and one writes it, a copy is no longer a cell, which is why the copy is not
+extended to loop-body locals. Fixing this needs a real cell model (a fresh
+cell per iteration with every access, native and virtualized alike, routed
+through it) and is a prerequisite of R5c, not of any setting in this tool.
+
+**`#` on a table with nil holes is reproduced in content, not in length.**
+When a multi-value result -- a call return, a vararg list (R5) -- is appended
+into a table, the VM copies all `n` values including trailing nils, so every
+*element* is present and correctly placed. But `#t` on a table containing nil
+holes is undefined in Luau itself: the result depends on the internal
+array/hash split, which depends on how the table was built. The native
+compiler builds `{ ... }` with a size hint; the VM fills the table
+sequentially. For a holey table the two can report different lengths. This is
+undefined-behaviour territory the language itself does not pin down (the same
+source rebuilt with different allocation could move it), and it predates R5 --
+the call-return path has always had it. Code that needs the true count of a
+possibly-holey pack should use `table.pack(...).n`, which is exact and which
+the VM reproduces bit-for-bit.
 
 ## Verification
 

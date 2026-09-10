@@ -50,6 +50,9 @@ REG_VARS: Dict[str, Tuple[str, ...]] = {
     OP.LE: ("a", "x", "y"), OP.GT: ("a", "x", "y"), OP.GE: ("a", "x", "y"),
     OP.UNM: ("a", "x"), OP.NOT: ("a", "x"), OP.LEN: ("a", "x"),
     OP.CALL: ("base",),
+    OP.VARARG: ("base",),
+    OP.GETUPVAL: ("a",),
+    OP.SETUPVAL: ("v",),
     OP.TAILCALL: ("base",),
     OP.RETURN: ("base",),
     OP.RETURN0: (),
@@ -142,20 +145,34 @@ class OperandView:
         return {k: v + self.shift - back
                 for k, v in self.fmt.offsets(self.op).items()}
 
-    def reads(self) -> List[str]:
-        """The operand reads, in wire order, all before ``pc`` moves."""
+    def reads(self, code_var: Optional[str] = None) -> List[str]:
+        """The operand reads, in wire order, all before ``pc`` moves.
+
+        ``code_var`` enables the format's inline-read mode: the field
+        arithmetic is spelled at the read site instead of calling the
+        generated readers, trading artifact bytes for the function-call
+        cost on the interpreter's hottest path.  Jump targets stay a reader
+        call either way (see ``_rt_source`` for why).
+        """
+        from .format import inline_read
+        inline = bool(getattr(self.fmt, "inline_reads", False)) and code_var
         names = self.names()
         lines: List[str] = []
         for key, at in sorted(self.offsets().items(), key=lambda kv: kv[1]):
             var = names[key]
             pos = _pos(at)
-            if key[0] == "r":
+            if key == ("w", "target"):
+                lines.append(_target_read(self.fmt, pos))
+            elif inline:
+                kind = "r" if key[0] == "r" else (
+                    "p" if self.fmt.reg_in_wide(key) else "w")
+                lines.append("local %s = %s"
+                             % (var, inline_read(self.fmt, kind, code_var, pos)))
+            elif key[0] == "r":
                 lines.append(f"local {var} = _rr({pos})")
             elif self.fmt.reg_in_wide(key):
                 # register semantics, wide storage -- see ``isa.REGISTER_IN_WIDE``
                 lines.append(f"local {var} = _rp({pos})")
-            elif key == ("w", "target"):
-                lines.append(_target_read(self.fmt, pos))
             else:
                 lines.append(f"local {var} = _rk({pos})")
         return lines
@@ -261,6 +278,43 @@ def _body(op: str, fam: Family, n: Dict[str, str], fmt: FormatSpec,
             "  for i = 1, nres do",
         ] + ["    " + line for line in fam.store("R[base + i - 1]", "res[i]")] + \
             ["  end", "end"]
+    if op == OP.VARARG:
+        # count arrives biased like nres, so -1 ("every vararg, packed") is 0
+        # on the wire and `< 0` here after the bias is removed.  The pack the
+        # entry point stashed holds every argument the caller sent; the named
+        # parameters are its first slots, so the varargs start just past the
+        # count it recorded.  Reading past `.n` yields nil, which is exactly
+        # what a short vararg list must produce.
+        va = "R." + n["vpack"]
+        np = "va." + n["vnp"]
+        return [
+            "local va = " + va,
+            "if count < 0 then",
+            "  local t = {}",
+            "  local m = 0",
+            "  for i = " + np + " + 1, va.n do",
+            "    m += 1",
+            "    t[m] = va[i]",
+            "  end",
+            "  t.n = m",
+            "  R[base] = t",
+            "else",
+            "  for i = 1, count do",
+        ] + ["    " + line for line in fam.store("R[base + i - 1]", "va[" + np + " + i]")] + \
+            ["  end", "end"]
+    if op in (OP.GETUPVAL, OP.SETUPVAL):
+        # The frame holds no upvalue state: it holds the accessor list the
+        # stub built -- one getter/setter pair per upvalue, each a real Luau
+        # closure over the native variable the upvalue names.  Calling them
+        # is what keeps reads and writes live and consistent with any native
+        # sibling sharing the variable.  ``up`` is zero-based on the wire, so
+        # the one-based pairs sit at 2*up+1 and 2*up+2.  A prototype with no
+        # upvalues never encodes either opcode, so the entry point's ``false``
+        # placeholder is never indexed.
+        uv = "R." + n["uvs"]
+        if op == OP.GETUPVAL:
+            return fam.store("R[a]", "(%s[up * 2 + 1])()" % uv)
+        return ["(%s[up * 2 + 2])(R[v])" % uv]
     if op == OP.TAILCALL:
         return ["return " + n["call"] + "(R, base, argc, tail)"]
     if op == OP.RETURN:
@@ -356,11 +410,12 @@ def _body(op: str, fam: Family, n: Dict[str, str], fmt: FormatSpec,
 
 
 def _fix_bias(op: str, fmt: FormatSpec, view: OperandView) -> List[str]:
-    """Adjust the two operands that are biased rather than raw.
+    """Adjust the operands that are biased rather than raw.
 
-    ``nres`` and ``tail`` carry ``+1`` so that ``-1`` ("absent") survives a
-    field that cannot go negative; ``tail`` additionally names a register slot,
-    which only matters because the register file is one-based.
+    ``nres``, ``tail`` and VARARG's ``count`` carry ``+1`` so that ``-1``
+    ("absent" / "all of them") survives a field that cannot go negative;
+    ``tail`` additionally names a register slot, which only matters because
+    the register file is one-based.
     """
     out: List[str] = []
     if op == OP.CALL:
@@ -368,6 +423,8 @@ def _fix_bias(op: str, fmt: FormatSpec, view: OperandView) -> List[str]:
         out.append("tail = tail - 1")
     elif op == OP.TAILCALL:
         out.append("tail = tail - 1")
+    elif op == OP.VARARG:
+        out.append("count = count - 1")
     return out
 
 
@@ -393,7 +450,7 @@ def _handler(op: str, n: Dict[str, str], fam: Optional[Family] = None,
     spec = fmt if fmt is not None else LEGACY_SPEC
     v = view if view is not None else OperandView(spec, op)
     advance = spec.body_size(op)
-    out = v.reads()
+    out = v.reads(code_var=n.get("code"))
     travel = advance
     if advance and op not in _NO_ADVANCE:
         # Advancing before doing the work is what lets every format -- padded,
@@ -426,7 +483,7 @@ def _fused_handler(rule: FusionRule, n: Dict[str, str], fam: Family,
     for op, base in ((rule.first, 0), (rule.second, shift)):
         view = OperandView(fmt, op, base)
         lines.append("do")
-        lines += ["  " + ln for ln in view.reads()]
+        lines += ["  " + ln for ln in view.reads(code_var=n.get("code"))]
         lines += ["  " + ln for ln in _fix_bias(op, fmt, view)]
         lines += ["  " + ln for ln in _body(op, fam, n, fmt)]
         lines.append("end")
@@ -564,13 +621,19 @@ def _dispatch_key_seed(entries: Sequence[_Entry], fmt: FormatSpec) -> int:
 def _dispatch_key_number(number: int, seed: int, fmt: FormatSpec) -> int:
     mask = (1 << (8 * max(1, int(getattr(fmt, "op_bytes", 1))))) - 1
     salt = ((seed ^ (seed >> 9) ^ (seed << 7)) & mask)
-    return ((number ^ salt) + ((seed >> 16) & mask)) & mask
+    pt = fmt.key_tap_value() if getattr(fmt, "key_taps", ()) else 0
+    return ((number ^ salt ^ pt) + ((seed >> 16) & mask)) & mask
 
 
 def _dispatch_key_expr(var: str, seed: int, fmt: FormatSpec) -> str:
     mask = (1 << (8 * max(1, int(getattr(fmt, "op_bytes", 1))))) - 1
     salt = ((seed ^ (seed >> 9) ^ (seed << 7)) & mask)
     bias = (seed >> 16) & mask
+    if getattr(fmt, "key_taps", ()):
+        # The tapped shape folds the payload-read term in at runtime; see
+        # the chain ladder for why the text alone must not decode.
+        return ("bit32.band(bit32.bxor(bit32.bxor(%s, %d), _pt) + %d, %d)"
+                % (var, salt, bias, mask))
     return "bit32.band(bit32.bxor(%s, %d) + %d, %d)" % (var, salt, bias, mask)
 
 
@@ -690,6 +753,64 @@ def dispatch_seed(entries: Sequence[_Entry]) -> int:
     return total
 
 
+def _emit_chain_ladder(lines: List[str], entries: Sequence[_Entry],
+                       n: Dict[str, str], fam: Family, fmt: FormatSpec,
+                       trace: Optional[List[Tuple[Tuple[int, ...],
+                                                  Tuple[str, ...]]]] = None
+                       ) -> None:
+    """The ``chain`` dispatch shape: handler bodies inlined in an if ladder.
+
+    One scramble per instruction -- ``band(bxor(op, salt), mask)`` -- and then
+    plain integer comparisons, one per arm, in this build's drawn order.  No
+    closure call, no bucket table, no pack-of-results protocol on return:
+    a RETURN arm's ``return ...`` leaves the interpreter directly, which is
+    several times cheaper per instruction than the bank shape on hot loops.
+
+    The scramble is the protection half: ``bxor`` with the format's salt is a
+    bijection over the opcode field, so distinct numbers always map to
+    distinct keys, an unassigned number can never collide with a real arm,
+    and the keys in the ladder are a per-build image of the numbering rather
+    than the numbering itself.
+    """
+    mask = (1 << (8 * max(1, fmt.op_bytes))) - 1
+    salt = getattr(fmt, "dispatch_salt", 0) & mask
+    # R2's tap: when the format taps a header filler byte, the scramble
+    # gains a term the interpreter's text does not carry.  ``_pt`` is read
+    # from the payload once per call, so the ladder's constants are an image
+    # of the numbering under a salt the (encrypted) payload holds -- lifting
+    # the interpreter alone no longer decodes the arms.  ``bxor`` stays
+    # bijective in ``op`` either way, so an unassigned number still cannot
+    # collide with a real arm.
+    tapped = bool(getattr(fmt, "key_taps", ()))
+    pt = fmt.key_tap_value() if tapped else 0
+    dk = _local_ident((getattr(fmt, "arm_seed", 0) ^ salt ^ 0xC417), 7)
+    if tapped:
+        lines.append("    local %s = bit32.band(bit32.bxor(op, %d, _pt), %d)"
+                     % (dk, salt, mask))
+    else:
+        lines.append("    local %s = bit32.band(bit32.bxor(op, %d), %d)"
+                     % (dk, salt, mask))
+    first = True
+    for entry in entries:
+        number = entry.numbers[0]
+        key = (number ^ salt ^ pt) & mask
+        cond = "%s == %d" % (dk, key)
+        lines.append("    %s %s then" % ("if" if first else "elseif", cond))
+        first = False
+        if trace is not None:
+            # Routing truth is recorded as the plain number the arm accepts:
+            # the scramble is bijective, so "which value reaches which arm"
+            # is the same fact stated without it, and the harness evaluates
+            # these conditions with only ``op`` in scope.
+            trace.append((tuple(entry.numbers),
+                          (_plain_cond(tuple(entry.numbers)),)))
+        for body_line in entry.body(n, fam, fmt):
+            lines.append("      " + body_line)
+    lines.append("    else")
+    lines.append("      error(%s)" % _vm_fail(fmt, 1))
+    lines.append("    end")
+
+
 def _emit_dispatch(lines: List[str], entries: Sequence[_Entry],
                    n: Dict[str, str], fam: Family, dispatcher: str,
                    fmt: FormatSpec,
@@ -782,12 +903,14 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         loop_guard += ["  " + line for line in entry_guard]
         loop_guard.append("end")
 
+    # The loop's tripwire: a pc driven off the payload reaches the same
+    # neutral error as every other invalid VM state.  The payload's length is
+    # hoisted to a local -- computing `#code` per instruction made the
+    # tripwire cost several percent of a hot loop for nothing, because the
+    # length cannot change while the loop runs.
+    code_len = _local_ident((getattr(spec, "arm_seed", 0) ^ 0x1E4F), 9)
     opaque_line = ([
-        # A short opaque branch whose truth depends on the bytecode and the
-        # decoded opcode for this execution, not on a repetitive algebraic
-        # identity.  It doubles as a cheap tamper tripwire: a bad pc/op image
-        # reaches the same neutral error as every other invalid VM state.
-        f"    if not ((op == op) and (pc >= 1) and (#{n['code']} >= pc)) then error({_vm_fail(spec, 5)}) end",
+        f"    if {code_len} < pc or pc < 1 then error({_vm_fail(spec, 5)}) end",
     ] if opaque_predicates else [])
 
     lines: List[str] = [
@@ -839,12 +962,27 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         lines.append("  if type(%s) == \"function\" then %s = %s() end" % (EDGE_LOCAL, EDGE_LOCAL, EDGE_LOCAL))
     lines += ["  " + ln for ln in reader_lines(spec, code, EDGE_LOCAL)]
     lines += [
+        f"  local {code_len} = #{n['code']}",
         # The entry point comes out of the payload header, which is inside the
         # authenticated blob, rather than from the descriptor table beside it.
         f"  local pc = {entry_expr}",
     ] + ["  " + decl for decl in fam.state]
+    tap_read = spec.key_tap_read(code)
+    if tap_read:
+        # The dispatch key's payload term, read once per call.  Placed with
+        # the frame locals rather than in the loop: it cannot change while
+        # the payload runs, and recomputing it per instruction would charge
+        # the hot path for a constant.
+        lines.append("  local _pt = %s" % tap_read)
     entries = dispatch_entries(opmap, spec)
-    handler_table, handler_call, handler_ret, handler_buckets = _emit_handler_bank(lines, entries, n, fam, spec, trace)
+    shape = getattr(spec, "dispatch_shape", "bank")
+    if shape == "chain":
+        # No bank: the arms' bodies go into the ladder below, so nothing here
+        # declares the closure table or its pack-of-results protocol.
+        handler_table = handler_call = handler_ret = ""
+        handler_buckets = 1
+    else:
+        handler_table, handler_call, handler_ret, handler_buckets = _emit_handler_bank(lines, entries, n, fam, spec, trace)
     lines += [
         "  while true do",
         # The selector comes from the generated reader, not from a `byte(code, pc)`
@@ -859,17 +997,20 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         *["    " + line for line in loop_guard],
     ]
 
-    _emit_dispatch(lines, entries, n, fam, dispatcher,
-                   spec, trace, handler_table, handler_call, handler_ret, handler_buckets)
+    if shape == "chain":
+        _emit_chain_ladder(lines, entries, n, fam, spec, trace)
+    else:
+        _emit_dispatch(lines, entries, n, fam, dispatcher,
+                       spec, trace, handler_table, handler_call, handler_ret, handler_buckets)
     lines += [
         "  end",
         "end",
-        f"local function {n['enter']}(p, E, ...)",
-        # The environment guard, when this build has one: checking on entry is
-        # what catches a runner that swaps the dump surfaces while the artifact
-        # is already running.  Before the frame is built, so a refused call never
-        # touches the payload at all.
-        *[f"  {line}" for line in entry_guard],
+        f"local function {n['enter']}(p, E, _uv, ...)",
+        # The environment guard rides the dispatch loop (see ``loop_guard``),
+        # masked like any other opaque check, rather than sitting at the head
+        # of this function: an entry point that opens with the check is a
+        # signature for it, and the loop already re-checks often enough that a
+        # mid-run swap is caught within a handful of instructions.
         "  local _ec = p.code",
         "  if type(_ec) == \"function\" then _ec = _ec() end",
         "  local R = {}",
@@ -879,6 +1020,20 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         "  for i = 1, %s do" % nparams_expr,
         "    R[i] = args[i]",
         "  end",
+        # R5: the vararg tail rides the frame.  A VARARG instruction is then a
+        # slice of this pack -- nothing outside the call can observe it, which
+        # is why varargs could join the VM.  The named-parameter count travels
+        # as a field of the pack itself, because `args` is fresh per call and
+        # nothing that reads it looks past `.n`.
+        "  args.%s = %s" % (n["vnp"], nparams_expr),
+        "  R.%s = args" % n["vpack"],
+        # R5's second increment: upvalues ride the frame too -- but not as
+        # state.  ``_uv`` is the accessor list the stub built for this
+        # prototype (getter/setter closures over the native variable), or
+        # ``false`` when the prototype captures nothing.  GETUPVAL and
+        # SETUPVAL call through it; the frame itself never holds a captured
+        # value, so nothing outside the call can observe a copy.
+        "  R.%s = _uv" % n["uvs"],
         f"  return {n['exec']}(p, R, E, _ec)",
         "end",
     ]
@@ -889,7 +1044,7 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
 _CORE_TOKENS = (("pc", "pc"), ("R", "regs"), ("K", "consts"), ("E", "env"),
                 ("EG", "edges"), ("_ro", "ro"), ("_r8", "r8"),
                 ("_rr", "rr"), ("_rw", "rw"), ("_rk", "rk"),
-                ("_rp", "rp"), ("_rt", "rt"))
+                ("_rp", "rp"), ("_rt", "rt"), ("_pt", "pt"))
 
 
 def _le_read(read: str, at: int, width: int) -> str:

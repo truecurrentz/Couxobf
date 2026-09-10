@@ -204,7 +204,7 @@ def test_the_refusal_is_the_dispatchers_own_error():
     names = {k: "n_" + k for k in ("code", "exec", "enter", "call", "getfenv",
                                    "acc", "stack", "sp", "append", "iter",
                                    "iterpack", "itercheck", "pc", "regs", "consts",
-                                   "env", "edges")}
+                                   "env", "edges", "vpack", "vnp", "uvs")}
     assert guardmod.REFUSAL not in vmruntime.interpreter_source(
         OpcodeMap.identity(), names)
 
@@ -259,8 +259,11 @@ def test_environment_guard_is_separate_from_vm_entry():
     """Environment detection stays in its guard block, not the payload VM."""
     out = build(SOURCE, _cfg(2), name="guard.luau", verify=False)
     check = out.runtime_names["guard"]["locals"]["check"]
-    enters = re.findall(r"local function \w+\(p,?\s*\w+,?\.\.\.\)(.{0,140})",
-                        out.source, re.S)
+    # The entry point's signature is ``enter(p, env, uvs, ...)`` since R5's
+    # second increment added the upvalue accessor list as a third argument.
+    enters = re.findall(
+        r"local function \w+\(p,\s*\w+,\s*\w+,\s*\.\.\.\)(.{0,140})",
+        out.source, re.S)
     assert enters, "no VM entry points in a build that virtualized functions"
     for head in enters:
         assert not re.search(r"if not %s\(\)\s*then" % re.escape(check), head), head

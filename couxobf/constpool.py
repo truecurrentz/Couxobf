@@ -44,6 +44,11 @@ TAG_NUM = 2
 TAG_STR = 3
 TAG_NUM_MASKED = 4
 TAG_STR_FRAG = 5
+#: An exact integer stored as two 32-bit halves, reassembled by integer
+#: arithmetic at runtime.  The double bytes never appear, so a decoder that
+#: scans for ``string.unpack(">d")`` reads nothing -- and the halves
+#: themselves decode to nothing plausible without the reconstruction rule.
+TAG_NUM_SPLIT = 6
 
 DEFAULT_MASK_MUL = (0x12 << 12) | 0x345
 DEFAULT_MASK_ADD = 0x5BD1E995
@@ -83,6 +88,36 @@ def encode_value(value: Any) -> bytes:
         raw = bytes(value)
         return bytes([TAG_STR]) + struct.pack(">I", len(raw)) + raw
     raise ConstantPoolError(f"cannot encode constant of type {type(value).__name__}")
+
+
+def _split_halves(value: Any) -> Optional[Tuple[int, int]]:
+    """High/low 32-bit halves of an exact-integer double, or ``None``.
+
+    The split is safe exactly where double arithmetic is exact: ``value``
+    must be an integer with ``|value| <= 2**53``, because the runtime
+    reconstructs it as ``hi * 2**32 + lo`` and both terms have to land on
+    representable values with an exact sum.  Negative zero is refused: it
+    compares equal to zero but ``-0.0 + 0.0`` is ``+0.0``, so no arithmetic
+    form can carry the sign bit -- masked double bytes remain its path.
+    NaN and the infinities are not integers and fall out of the first test.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    v = float(value)
+    if v != v or v in (float("inf"), float("-inf")):
+        return None
+    if v == 0.0:
+        if struct.pack(">d", v)[0] & 0x80:
+            return None                     # negative zero: arithmetic loses the sign
+        return (0, 0)
+    if v != int(v):
+        return None
+    iv = int(v)
+    if abs(iv) > (1 << 53):
+        return None
+    hi = iv >> 32                            # arithmetic shift keeps negatives exact
+    lo = iv - (hi << 32)                     # 0 <= lo < 2**32 by construction
+    return (hi, lo)
 
 
 def _mask8(seed: int, mul: int, add: int, shift: int) -> bytes:
@@ -136,6 +171,16 @@ def serialize_dynamic(values: List[Any], rng: Rng,
     """
     out = [struct.pack(">I", len(values))]
     for v in values:
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and numeric_level > 1:
+            # Level 2's exact-integer split: the value is rebuilt at runtime
+            # from two 32-bit halves by integer arithmetic, so its double
+            # bytes never exist in the blob.  Only values the split is exact
+            # for qualify; the rest fall through to the masked-double path.
+            halves = _split_halves(v)
+            if halves is not None:
+                hi, lo = halves
+                out.append(bytes([TAG_NUM_SPLIT]) + struct.pack(">iI", hi, lo))
+                continue
         if isinstance(v, (int, float)) and not isinstance(v, bool) and numeric_level > 0:
             seed = rng.randbelow(0x7FFFFFFF)
             raw = struct.pack(">d", float(v))
@@ -407,6 +452,12 @@ def decode_pool(plaintext: bytes, mask_mul: int = DEFAULT_MASK_MUL,
             pos += 8
             (value,) = struct.unpack(">d", raw)
             out.append(value)
+        elif tag == TAG_NUM_SPLIT:
+            hi, lo = struct.unpack_from(">iI", plaintext, pos)
+            pos += 8
+            # The same reconstruction the Luau decoder runs: integer doubles,
+            # exact by the eligibility rule on the encoding side.
+            out.append(float(hi) * 4294967296.0 + float(lo))
         elif tag == TAG_STR_FRAG:
             (count_frag,) = struct.unpack_from(">H", plaintext, pos)
             pos += 2

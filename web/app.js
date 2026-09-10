@@ -45,6 +45,12 @@ const SPEC = [
        "handler count follows the code instead of being the whole ISA in every " +
        "build. It also shrinks the artifact; a VM running three numeric helpers " +
        "does not need forty arms."],
+      ["vm_upvalues", "Virtualize capturing functions", "bool",
+       "Lets functions that capture upvalues run in the VM. The stub replacing " +
+       "such a function builds getter and setter closures over the same storage " +
+       "the native code uses, so reads and writes stay live and shared with any " +
+       "native sibling. A capture whose owner is itself virtualized still keeps " +
+       "the function native. Off by default."],
     ],
   },
   {
@@ -109,6 +115,10 @@ const SPEC = [
       ["table_key_protection", "Table keys", "bool",
        "Assemble syntactic property names from protected fragments so field access " +
        "does not expose a stable GETTABLEK/SETTABLEK key vocabulary."],
+      ["index_to_num", "Table keys to numbers", "bool",
+       "Rewrite the keys of provably-static local tables to per-build numeric " +
+       "handles, so the key strings never enter the constant pool at all. " +
+       "Opt-in whitelist; a table can bow out with --!couxobf:no_index_to_num above it."],
       ["cache_policy", "Decoded-string cache", "select",
        "How much plaintext sits in the heap: `none` re-materialises on every read, " +
        "`full` keeps everything, `bounded` keeps a rolling window."],
@@ -165,6 +175,12 @@ const SPEC = [
        "tooling uses), `strip` always, `strict` refuses the input. A # inside a " +
        "string or an operator like #t is never touched, and the stripped source is " +
        "re-parsed to prove nothing was cut through."],
+      ["blob_encoding", "Blob spelling", "select",
+       "How sealed blobs (pool ciphertext, string pages) are written. `dense` " +
+       "ships base85 over a per-build alphabet (~1.25 chars per byte, decoded " +
+       "once at load); `hex` keeps the escaped form (~4 chars per byte) for " +
+       "debugging. Same protection either way, and tiny builds keep `hex` " +
+       "automatically when the decoder would cost more than it saves."],
       ["max_output_growth", "Size budget", "float",
        "Above this ratio the pipeline gives up the most expensive optional passes " +
        "and rebuilds, then reports what it dropped. 0 disables the check. A maximum " +
@@ -841,12 +857,14 @@ const FALLBACK = {
   cache_policy: { kind: "enum", choices: ["none", "bounded", "full"], default: "none" },
   guard_policy: { kind: "choice", choices: ["fail", "ignore"], default: "fail" },
   hash_comments: { kind: "choice", choices: ["auto", "strip", "strict"], default: "auto" },
+  blob_encoding: { kind: "choice", choices: ["dense", "hex"], default: "dense" },
   instruction_formats: { kind: "int", min: 0, max: 2, default: 1 },
   opcode_aliases: { kind: "int", min: 0, max: 4, default: 1 },
   string_protection_level: { kind: "int", min: 0, max: 3, default: 2 },
   constant_protection_level: { kind: "int", min: 0, max: 1, default: 1 },
   numeric_protection_level: { kind: "int", min: 0, max: 2, default: 1 },
   table_key_protection: { kind: "bool", default: true },
+  index_to_num: { kind: "bool", default: false },
   control_flow_level: { kind: "int", min: 0, max: 3, default: 2 },
   branch_inversion: { kind: "bool", default: true },
   env_guard: { kind: "int", min: 0, max: 2, default: 1 },
@@ -861,7 +879,7 @@ const FALLBACK = {
 
 /* The int fields a slider can represent: the endpoint allows up to 4096, which a
    range input would turn into a lottery.  Those get a number box instead. */
-const WIDE_INTS = new Set(["bounded_cache_size", "chunk_size", "max_vm_functions",
+const WIDE_INTS = new Set(["bounded_cache_size", "max_vm_functions",
                            "min_virtualize_body_nodes", "decoy_constants"]);
 
 function useFallback() {

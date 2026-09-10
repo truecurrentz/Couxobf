@@ -56,6 +56,7 @@ of a return list.  This is what makes ``f(g())``, ``local a, b = f()`` and
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import ast_nodes as A
@@ -362,6 +363,20 @@ class Reconstructor:
         self.bank = bank
         self.bank_accessor = bank_accessor
         self.bank_ticket = bank_ticket or (lambda ticket: ticket)
+        #: Probability that a block of the flattened native driver gains a
+        #: split arm (R2 native side): a second ``elseif`` whose encoded
+        #: state the build can prove no reachable pc ever takes, carrying a
+        #: copy of the real block's tail assignments.  0.0 keeps the driver
+        #: exactly as before; the pipeline turns it on with
+        #: ``opaque_predicates`` at ``control_flow_level >= 1``.
+        self.split_arms_rate: float = 0.0
+        #: How many decoy arms the build actually emitted, for the report.
+        self.split_arms_emitted: int = 0
+        #: One entry per flattened prototype: the drawn encoding and every
+        #: real/decoy state value.  Tests read it to prove the
+        #: exactly-one-satisfiable invariant symbolically; production never
+        #: looks at it.
+        self.split_log: List[Dict[str, Any]] = []
         if (pool is None) != (accessor is None):
             raise ReconstructionError("pool and accessor must be given together")
 
@@ -400,7 +415,8 @@ class Reconstructor:
         # fits a three-byte field does not fit a two-byte one.
         group = self.vm.group_for(proto.proto_id)
         fmt = self.vm.fmt_for(proto.proto_id)
-        ok, _reason = _encode.can_virtualize(proto, fmt)
+        ok, _reason = _encode.can_virtualize(
+            proto, fmt, upvalues_ok=self.vm.upvalues_ok)
         if not ok:
             return None
         order = None
@@ -410,7 +426,8 @@ class Reconstructor:
         self.vm_encoded[proto.proto_id] = _encode.encode_proto(
             proto, self.vm.opmap_for(proto.proto_id), order=order, fmt=fmt,
             rng=self.vm_layout_rng,
-            alias_chance=self.vm.alias_chance)
+            alias_chance=self.vm.alias_chance,
+            upvalues_ok=self.vm.upvalues_ok)
         # A vararg parameter list, not the prototype's declared parameters:
         # the descriptor carries the real count and the interpreter distributes
         # the arguments itself.  From the caller's side this is an ordinary
@@ -427,6 +444,32 @@ class Reconstructor:
         # interpreter in the closure rather than storing "which VM" in the
         # artifact means a build with three VMs carries no table that says so.
         enter = self.vm.enter_for(proto.proto_id)
+        # R5's second increment: upvalues ride the third argument.  This stub
+        # is emitted at the CLOSURE site, so it is lexically inside the scope
+        # that owns the captured variables -- which is what lets the accessor
+        # closures close over the very expression the native reconstruction
+        # uses (the parent's register slot, or the per-iteration snapshot local
+        # when Luau's semantics demand one).  Reads and writes through them are
+        # therefore live and consistent with any native sibling sharing the
+        # variable.  A prototype capturing nothing passes ``false``: GETUPVAL
+        # and SETUPVAL never encode for it, so the placeholder is never
+        # touched, and the common case allocates nothing.
+        if proto.upvalues and self.vm.upvalues_ok:
+            items: List[A.TableItem] = []
+            for i in range(len(proto.upvalues)):
+                target = self._upvalue_expr(proto, i)
+                param = self._param_name(proto.proto_id, 0) + "_u"
+                items.append(A.TableItem(kind="array", value=A.Func(
+                    params=[],
+                    body=A.Block(body=[A.Return(values=[target])]))))
+                items.append(A.TableItem(kind="array", value=A.Func(
+                    params=[A.Param(name=param)],
+                    body=A.Block(body=[A.Assign(
+                        targets=[self._upvalue_expr(proto, i)],
+                        values=[A.Name(name=param)])]))))
+            uv_arg: A.Expr = A.Table(items=items)
+        else:
+            uv_arg = A.Bool(value=False)
         return A.Func(
             params=[A.Param(name=None)],
             body=A.Block(body=[A.Return(values=[A.Call(
@@ -435,6 +478,7 @@ class Reconstructor:
                               key=_num(self.vm.row_key(proto.proto_id))),
                       A.Call(fn=A.Name(name=self.vm.names["getfenv"]),
                              args=[_num(1)]),
+                      uv_arg,
                       A.Vararg()])])]))
 
     def _build_parent_map(self, module: IRModule) -> None:
@@ -577,30 +621,81 @@ class Reconstructor:
                 salt = 0
                 mul = 1
                 mode = 0
-        arms: List[Tuple[A.Expr, A.Block]] = []
-        for b in proto.blocks:
+
+        # The state encoding, split into its two halves so the real arms and
+        # the split-arm decoys cannot drift apart: ``enc_of`` is the value a
+        # block's id maps to, ``enc_expr`` a fresh copy of the left-hand
+        # side (two arms must never share an AST node).  All three forms are
+        # bijections of the state -- mul is drawn odd against a power-of-two
+        # modulus -- so a value outside the image of the block ids is
+        # provably unreachable, which is what the decoy arms below trade on.
+        def enc_of(block_id: int) -> int:
             if mode == 1:
-                left = A.Bin(op="%", left=A.Bin(op="-", left=_name(pc), right=_num(salt)),
+                return (block_id - salt) % modulus
+            if mode == 2:
+                return (((block_id + salt) * mul) + (salt % 251)) % modulus
+            return ((block_id * mul) + salt) % modulus
+
+        def enc_expr() -> A.Expr:
+            if mode == 1:
+                return A.Bin(op="%",
+                             left=A.Bin(op="-", left=_name(pc), right=_num(salt)),
                              right=_num(modulus))
-                right = _num((b.id - salt) % modulus)
-            elif mode == 2:
-                left = A.Bin(op="%",
+            if mode == 2:
+                return A.Bin(op="%",
                              left=A.Bin(op="+",
                                         left=A.Bin(op="*", left=A.Bin(op="+", left=_name(pc), right=_num(salt)), right=_num(mul)),
                                         right=_num(salt % 251)),
                              right=_num(modulus))
-                right = _num((((b.id + salt) * mul) + (salt % 251)) % modulus)
-            else:
-                left = A.Bin(
-                    op="%",
-                    left=A.Bin(op="+",
-                               left=A.Bin(op="*", left=_name(pc), right=_num(mul)),
-                               right=_num(salt)),
-                    right=_num(modulus),
-                )
-                right = _num(((b.id * mul) + salt) % modulus)
-            cond = A.Bin(op="==", left=left, right=right)
-            arms.append((cond, A.Block(body=self._block_body(proto, b, pc))))
+            return A.Bin(
+                op="%",
+                left=A.Bin(op="+",
+                           left=A.Bin(op="*", left=_name(pc), right=_num(mul)),
+                           right=_num(salt)),
+                right=_num(modulus),
+            )
+
+        encoded = {enc_of(b.id) for b in proto.blocks}
+        rate = float(self.split_arms_rate)
+        draw = self.vm_layout_rng if (rate > 0 and self.vm_layout_rng is not None) else None
+        arms: List[Tuple[A.Expr, A.Block]] = []
+        decoys: List[Tuple[int, int, int]] = []
+        for b in proto.blocks:
+            body = self._block_body(proto, b, pc)
+            cond = A.Bin(op="==", left=enc_expr(), right=_num(enc_of(b.id)))
+            arms.append((cond, A.Block(body=body)))
+            # R2's native-side split arm: an ``elseif`` whose encoded state
+            # no reachable pc can take (pc is only ever set to a block id,
+            # and the decoy value is outside the encoding's image of them),
+            # carrying a copy of the real block's tail assignments.  There is
+            # no dead branch -- only a branch the build can prove unreachable
+            # but a reader cannot without solving the flattened CFG.  The
+            # tail copy means even a bug that reached it would still land on
+            # the block's real successor.
+            if draw is not None and body and draw.chance(rate):
+                v = draw.randbelow(modulus)
+                steps = 0
+                while v in encoded and steps < 64:
+                    v = (v + 1) % modulus
+                    steps += 1
+                if v in encoded:
+                    continue            # a pathological block table; skip
+                tail_n = min(len(body), 1 + draw.randbelow(3))
+                tail = copy.deepcopy(body[-tail_n:])
+                arms.append((A.Bin(op="==", left=enc_expr(), right=_num(v)),
+                             A.Block(body=tail)))
+                decoys.append((b.id, v, tail_n))
+                self.split_arms_emitted += 1
+        self.split_log.append({
+            "proto": proto.proto_id,
+            "mode": mode,
+            "salt": salt,
+            "mul": mul,
+            "modulus": modulus,
+            "block_ids": [b.id for b in proto.blocks],
+            "encoded": [enc_of(b.id) for b in proto.blocks],
+            "decoys": decoys,
+        })
         stmts.append(A.While(
             cond=_name(pc),
             body=A.Block(body=[A.If(arms=arms,
@@ -884,6 +979,7 @@ def reconstruct_protected(module: IRModule,
                           vm_family: Any = "register",
                           block_permutation: bool = False,
                           opaque_predicates: bool = True,
+                          control_flow_level: int = 0,
                           layout_rng: Any = None,
                           dispatcher_family: Any = "mixed",
                           opcode_randomization: bool = True,
@@ -899,9 +995,11 @@ def reconstruct_protected(module: IRModule,
                           fusion_level: int = 0,
                           alias_ratio: float = 0.0,
                           alias_chance: float = 0.0,
+                          vm_upvalues: bool = False,
                           env_guard: int = 0,
                           dump_guard: int = 0,
                           guard_policy: str = "fail",
+                          blob_encoding: str = "hex",
                           names_out: Optional[Dict[str, Any]] = None) -> str:
     """Lower an IR module to protected, self-contained Luau source.
 
@@ -994,6 +1092,12 @@ def reconstruct_protected(module: IRModule,
                                  protos_by_id=({q.proto_id: q for q in module.protos}
                                                 if isa_subset else None),
                                  isa_subset=bool(isa_subset),
+                                 # R5's second increment: whether upvalue-capturing
+                                 # prototypes may ride the VM.  The eligibility and
+                                 # the native-home restriction were already decided
+                                 # by the selector; this only tells the stub whether
+                                 # to hand ``enter`` an accessor list.
+                                 upvalues_ok=bool(vm_upvalues),
                                  # wiring indexes this positionally as
                                  # (append, iter, iterpack, itercheck); passing
                                  # the dict would hand it the role *keys*.
@@ -1077,7 +1181,20 @@ def reconstruct_protected(module: IRModule,
                         pool_ticket=pool_ticket,
                         bank_ticket=bank_ticket)
     rec.vm_layout_rng = layout_rng if layout_rng is not None else vm_rng
+    # R2's native-side split arms ride the same honesty wire as the VM's
+    # predicate tap: `opaque_predicates` is the switch, and the
+    # control-flow level is the rate dial.  Level 0 flattens without arms,
+    # so the compact profile emits none.
+    rec.split_arms_rate = (
+        {0: 0.0, 1: 0.12, 2: 0.2, 3: 0.3}[max(0, min(3, int(control_flow_level)))]
+        if opaque_predicates else 0.0)
     body = rec.reconstruct(module)
+
+    # The native-side opaque arms are not the pool's, so the count lands here
+    # rather than at seal time; 0 when nothing was flattened or the knobs are
+    # off, which the report then says.
+    if names_out is not None:
+        names_out["split_arms"] = rec.split_arms_emitted
 
     # The VM's bytecode and constants are interned here, before the pool is
     # sealed below.  Doing it after would hand out slot numbers the encrypted
@@ -1102,7 +1219,7 @@ def reconstruct_protected(module: IRModule,
         pooled = lambda value: "%s(%d)" % (names["get"], pool_ticket(pool.slot(value)))
         vm_src = _wiring.prelude_source(plan, rec.vm_encoded, pooled, pooled,
                                         edges_expr=pooled,
-                                        entry_guard=(),
+                                        entry_guard=guard.entry_lines(),
                                         opaque_predicates=bool(opaque_predicates))
 
     # A program with no constants at all needs no pool: emitting the runtime
@@ -1125,9 +1242,31 @@ def reconstruct_protected(module: IRModule,
 
     runtime_guard_check = ""
 
+    # Sealed up front so the dense-encoding decision can measure what it is
+    # deciding about: the decoder preamble costs a fixed ~1 KB of artifact,
+    # and base85 saves ~2.75 source chars per sealed byte against the
+    # printer's decimal escapes, so below the threshold hex is the smaller
+    # spelling and dense would be pure overhead.
+    sealed = pool.seal() if need_pool else None
+    bank_sealed = bank.seal() if need_bank else None
+    dense_codec = None
+    dense_skipped = ""
+    if blob_encoding == "dense" and (need_pool or need_bank):
+        blob_bytes = 0
+        if sealed is not None:
+            blob_bytes += len(sealed.ciphertext) + len(sealed.aad) + 64
+        if bank_sealed is not None:
+            blob_bytes += (len(bank_sealed.blob) + len(bank_sealed.ticket_ct)
+                           + 64)
+        if blob_bytes >= 512:
+            from .runtime.dense import DenseCodec
+            dp = fresh_prefix(rng, prefixes)
+            dense_codec = DenseCodec(rng, {"dec": dp + "D", "rev": dp + "R"})
+        else:
+            dense_skipped = "dense-skipped:%d" % blob_bytes
+
     pool_src = ""
     if need_pool:
-        sealed = pool.seal()
         if names_out is not None:
             # Read here rather than where the pool was built: constants are
             # interned while the bodies are lowered, and the decoys are planted as
@@ -1142,7 +1281,8 @@ def reconstruct_protected(module: IRModule,
                                 guard_check=runtime_guard_check,
                                 ticket_mask=pool_ticket_mask,
                                 enc_domain=sealed.enc_domain,
-                                mac_domain=sealed.mac_domain)
+                                mac_domain=sealed.mac_domain,
+                                dense=dense_codec)
 
     bank_src = ""
     if need_bank:
@@ -1164,16 +1304,26 @@ def reconstruct_protected(module: IRModule,
             bn, cache_policy=string_cache_policy,
             emit_crypto=not crypto_src)
         bank_src = bank_runtime.emit(
-            bank.seal(),
+            bank_sealed,
             crypto_runtime({"xor": bn["c_xor"], "sha": bn["c_sha"],
                             "mac": bn["c_mac"], "open": bn["c_open"],
                             "seal": bn["c_seal"]},
                            enc_domain=crypto_enc_domain,
                            mac_domain=crypto_mac_domain) if not crypto_src else "",
             guard_check=runtime_guard_check,
-            ticket_mask=bank_ticket_mask)
+            ticket_mask=bank_ticket_mask,
+            dense=dense_codec)
 
+    dense_src = dense_codec.source(rng) if dense_codec is not None else ""
+    if names_out is not None:
+        if dense_codec is not None:
+            names_out["blob_encoding"] = "dense:" + dense_codec.digest
+        elif dense_skipped:
+            names_out["blob_encoding"] = dense_skipped
+        else:
+            names_out["blob_encoding"] = "hex"
     crypto_block = _parser.parse(crypto_src, "<crypto>") if crypto_src else None
+    dense_block = _parser.parse(dense_src, "<dense>") if dense_src else None
     pool_block = _parser.parse(pool_src, "<constpool>") if pool_src else None
     bank_block = _parser.parse(bank_src, "<stringbank>") if bank_src else None
     # The helper functions have to be in scope too; a loop or a multi-value
@@ -1190,8 +1340,8 @@ def reconstruct_protected(module: IRModule,
     # a ParseError whose line number points into source nobody wrote.
     vm_block = _parser.parse(vm_src, "<vm>") if vm_src else None
 
-    blocks = [b for b in (crypto_block, pool_block, bank_block, helpers,
-                          vm_block) if b is not None]
+    blocks = [b for b in (crypto_block, dense_block, pool_block, bank_block,
+                          helpers, vm_block) if b is not None]
     captured: Dict[str, str] = {}
     if guard.active and blocks:
         # The capture set is decided *here*, once the emitted scaffolding exists:
@@ -1233,6 +1383,7 @@ def reconstruct_protected(module: IRModule,
     component_blocks: Dict[str, List[A.Stmt]] = {
         "guard": _guard_stmts(),
         "crypto": list(crypto_block.body) if crypto_block is not None else [],
+        "dense": list(dense_block.body) if dense_block is not None else [],
         "pool": list(pool_block.body) if pool_block is not None else [],
         "bank": list(bank_block.body) if bank_block is not None else [],
         "helpers": list(helpers.body),
@@ -1243,6 +1394,11 @@ def reconstruct_protected(module: IRModule,
         deps["pool"].add("crypto")
     if "bank" in deps and "crypto" in deps:
         deps["bank"].add("crypto")
+    # The dense decoder must exist before the runtimes whose literals call it.
+    if "dense" in deps:
+        for dependent in ("pool", "bank"):
+            if dependent in deps:
+                deps[dependent].add("dense")
     # Integrity/decryption paths are intentionally independent of environment
     # detection.  The guard block can refuse on its own, but pool/string/VM code
     # does not branch on executor-surface checks while materializing payload.
@@ -1250,10 +1406,20 @@ def reconstruct_protected(module: IRModule,
         for need in ("pool", "helpers"):
             if need in deps:
                 deps["vm"].add(need)
+        # The interpreter's per-entry re-check calls the guard's own checker,
+        # so the guard block (which defines it) must land first; with no
+        # constraint the bootstrap shuffle could emit the VM before it.
+        if "guard" in deps:
+            deps["vm"].add("guard")
     order: List[str] = []
     pending_components = set(deps)
     while pending_components:
-        ready = [k for k in pending_components if deps[k] <= set(order)]
+        # Sorted before the shuffle: iterating the pending *set* follows the
+        # process hash seed, and a shuffle of a differently ordered list draws
+        # the same random values but lands on a different permutation -- which
+        # is how two processes with one seed produced two artifacts.  The
+        # canonical order makes the shuffle a function of the build stream only.
+        ready = sorted(k for k in pending_components if deps[k] <= set(order))
         try:
             rng.shuffle(ready)
         except AttributeError:

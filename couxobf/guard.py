@@ -301,8 +301,24 @@ class Guard:
             raise KeyError(f"guard has no local for role {role!r}") from exc
 
     def fail_literal(self, site: str) -> str:
-        token = hashlib.sha256((self.n("check") + ":" + site).encode()).digest()[:8]
-        return '"' + ''.join('\\x%02x' % b for b in token) + '"'
+        # The dispatcher's own words, assembled at runtime from escaped
+        # chunks: the artifact never carries the phrase as plaintext, so a
+        # dumper grepping for the guard finds nothing, and a guard trip
+        # sounds exactly like the fallthrough the dispatcher documents.
+        # The split between chunks is per-build, so the *spelling* is not a
+        # constant a matcher can key across artifacts even though the message
+        # it produces is fixed.
+        try:
+            seed = int(hashlib.sha256(
+                (self.n("check") + ":" + site).encode()).hexdigest(), 16)
+        except KeyError:
+            seed = 0
+        text, parts, i = REFUSAL, [], 0
+        while i < len(text):
+            size = 2 + (seed >> i) % 3
+            parts.append(text[i:i + size])
+            i += size
+        return " .. ".join(self.literal(p) for p in parts)
 
     @staticmethod
     def literal(text: str) -> str:

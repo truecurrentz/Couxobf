@@ -70,11 +70,8 @@ FIELD_RANGES: Dict[str, Tuple[float, float]] = {
     "string_protection_level": (0, 3),
     "constant_protection_level": (0, 1),
     "numeric_protection_level": (0, 2),
-    "chunking_level": (0, 3),
     "bounded_cache_size": (1, 4096),
-    "chunk_size": (256, 1 << 20),
     "decoy_constants": (0, 256),
-    "junk_level": (0, 3),
     "env_guard": (0, 2),
     "dump_guard": (0, 2),
     "max_vm_functions": (0, 4096),
@@ -86,11 +83,15 @@ FIELD_RANGES: Dict[str, Tuple[float, float]] = {
 FIELD_CHOICES: Dict[str, Tuple[str, ...]] = {
     "guard_policy": GUARD_POLICIES,
     "hash_comments": COMMENT_MODES,
-    # Not the enum: DispatcherFamily carries ``table``, ``segmented`` and
-    # ``indirect`` so a config file can express the intent, and the runtime
-    # raises for them.  Offering a value that is refused at build time is the same
-    # lie as a dead control, so this lists what a build can actually emit.
-    "dispatcher_family": ("none",) + DISPATCHERS + ("mixed",),
+    # Base85-over-per-build-alphabet vs the historical escaped spelling of
+    # sealed blobs.  Both carry the same protection; the UI offers the choice
+    # because a debugging session sometimes wants to read the bytes as shipped.
+    "blob_encoding": ("dense", "hex"),
+    # The selector itself has only two values since R12: decline (none) or
+    # don't care (mixed).  The legacy dispatch-shape names stay loadable in
+    # saved configs but are not offered, for the same reason as a dead
+    # control: offering a value that only normalizes away is a lie.
+    "dispatcher_family": ("none", "mixed"),
 }
 
 #: When a field only has an effect alongside another setting, this says which.
@@ -161,7 +162,7 @@ def describe() -> Dict[str, Any]:
     # The fields a config can name but the compiler does not read.  Listed rather
     # than offered: a control for one of these would be the dead knob this project
     # keeps having to remove, and leaving the name out entirely would be the other
-    # failure -- a user setting `junk_level = 2` and never learning it did nothing.
+    # failure -- a user setting `identifier_polymorphism = true` and never learning it did nothing.
     declared = {f.name for f in _fields(Config)}
     pending = sorted(declared - set(Config.IMPLEMENTED) - {"reproducible_seed"})
 

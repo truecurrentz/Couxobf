@@ -32,11 +32,12 @@ import textwrap
 import time
 import dataclasses
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import classify as _classify
 from . import comments as _comments
 from . import controlflow as _controlflow
+from . import index_to_num as _index_to_num
 from .vm import format as _vm_format
 from .vm import runtime as _vm_runtime
 from . import ir as _ir
@@ -65,36 +66,6 @@ def _alias_ratio(config) -> float:
     return {0: 0.0, 1: 0.35, 2: 0.6, 3: 0.8}[int(config.opcode_aliases)]
 
 
-def _family_rotation(vm_family) -> tuple:
-    """Every family this build can spread across, with the pinned one first.
-
-    ``state_distribution`` asks for different VMs in one artifact and
-    ``vm_family`` asks for a specific one.  Both are real options, so the
-    rotation honors the pin for group 0 and spreads the rest behind it, instead
-    of one silently cancelling the other.
-    """
-    wanted = str(getattr(vm_family, "value", vm_family))
-    ordered = [wanted] + [f.value for f in VMFamily if f.value != wanted]
-    return tuple(ordered)
-
-
-def _dispatcher_rotation(dispatcher_family) -> tuple:
-    """Every dispatcher shape this build can spread across, pinned one first.
-
-    The mirror of :func:`_family_rotation`, for the same reason: ``--dispatcher
-    bucket`` has to be observable.  Handing ``DISPATCHERS`` over directly let
-    ``_make_groups`` shuffle the pool and index it, so a build with a single group
-    drew a shape at random and the flag changed nothing an analyst could see.
-    ``mixed`` is the value that means "I do not care", so it is the only one that
-    leaves group 0 unpinned.
-    """
-    wanted = str(getattr(dispatcher_family, "value", dispatcher_family))
-    pool = list(_vm_runtime.DISPATCHERS)
-    if wanted not in pool or wanted in ("", "mixed", "none"):
-        return tuple(pool)
-    return tuple([wanted] + [d for d in pool if d != wanted])
-
-
 def _format_variety(config) -> int:
     """How much the instruction format is allowed to move. 0 means never."""
     if not config.operand_randomization:
@@ -120,6 +91,15 @@ class BuildStats:
     elapsed_ms: float = 0.0
     #: Virtualization level per prototype, from the classifier.
     decisions: List[Any] = field(default_factory=list)
+    #: R8 source directives that landed, by name (`no_virtualize` /
+    #: `virtualize`).  A directive that could not apply -- a `virtualize`
+    #: the config or the main chunk overrode, or one with no function after
+    #: it -- is counted under ``ignored`` so the report does not imply it ran.
+    directives: Dict[str, int] = field(default_factory=dict)
+    #: R9 index-to-num outcome: how many tables were rewritten, how many
+    #: candidate tables the safety check declined, and how many keys/sites
+    #: changed.  Empty when the pass is off or did nothing worth reporting.
+    index_to_num: Dict[str, int] = field(default_factory=dict)
     #: `#` comments removed from the input before parsing (#5's input side).
     hash_comments: int = 0
     #: Size ratio the build was asked to stay under, 0 when unset.
@@ -139,6 +119,9 @@ class BuildStats:
     #: Decoy constants planted in the pool, counted at seal time so it reflects the
     #: pool the artifact carries rather than the budget it was given.
     pool_decoys: int = 0
+    #: Split arms emitted into flattened native drivers (R2 native side):
+    #: opaque ``elseif`` arms whose encoded state the build proves unreachable.
+    split_arms: int = 0
     #: One entry per VM group this artifact carries: family, dispatcher, opcode
     #: count, instruction format and how many prototypes it runs.  Read out of the
     #: plan rather than derived from the config, because with `vm_variety` above 1
@@ -239,7 +222,7 @@ _BUDGET_TRIMS = (
     (("instruction_fusion", False), ("super_instructions", False)),
     (("opcode_aliases", 0),),
     (("metadata_fragmentation", False),),
-    (("vm_variety", 1), ("state_distribution", False)),
+    (("vm_variety", 1),),
     (("control_flow_level", 0), ("block_permutation", False)),
     (("edge_indirection", False), ("instruction_formats", 0)),
     (("pc_protection", False), ("opcode_randomization", False)),
@@ -357,6 +340,31 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
     except Exception as exc:
         raise BuildError(f"{name} failed semantic analysis: {exc}") from None
 
+    # `--!couxobf:` directives ride the source as comments.  They are
+    # extracted once, here, and consumed by the two passes they steer:
+    # index-to-num (just below) and the classifier (in selection).  A
+    # misspelled one is refused rather than ignored, because a directive
+    # that quietly did nothing is the same dead knob the rest of this
+    # tool keeps removing.
+    directives = [(d.line, d.name) for d in _comments.find_directives(source)]
+    unknown = sorted({n for _, n in directives}
+                     - set(_comments.DIRECTIVES))
+    if unknown:
+        raise BuildError(
+            "%s: unknown directive%s --!couxobf:%s; expected one of %s"
+            % (name, "s" if len(unknown) > 1 else "",
+               ", --!couxobf:".join(unknown),
+               ", ".join("--!couxobf:" + d for d in _comments.DIRECTIVES)))
+
+    # R9 (opt-in): rewrite the keys of provably-static local tables into
+    # per-build numeric handles.  Runs before lowering so the lowered
+    # constants are already numeric and table-key protection has nothing
+    # left to intern in those tables.
+    index_stats = None
+    if getattr(config, "index_to_num", False):
+        index_stats = _index_to_num.rewrite(
+            ast, domains.get("index-to-num"), directives=directives)
+
     # -- IR ---------------------------------------------------------------
     module = _ir.Lowerer(
         table_key_protection=bool(config.table_key_protection),
@@ -367,9 +375,11 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
     # The classifier runs before reconstruction so its decisions can be passed
     # down as an explicit selection.  It writes proto.virtualization as a side
     # effect, which the report reads back.
-    classification = _classify.classify_module(module, config,
-                                               domains.get("vm"))
-    selected = _select_for_vm(module, classification)
+    classification = _classify.classify_module(
+        module, config, domains.get("vm"),
+        directives=directives)
+    selected = _select_for_vm(module, classification,
+                              upvalues_ok=bool(config.vm_upvalues))
 
     # -- back end ---------------------------------------------------------
     runtime_names: Dict[str, Any] = {}
@@ -395,7 +405,9 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         vm_family=VMFamily.WOVEN,
         block_permutation=config.block_permutation,
         opaque_predicates=bool(config.opaque_predicates),
+        control_flow_level=int(config.control_flow_level),
         isa_subset=bool(config.vm_isa_subset),
+        vm_upvalues=bool(config.vm_upvalues),
         layout_rng=domains.get("cfg"),
         dispatcher_family=DispatcherFamily.MIXED,
         opcode_randomization=config.opcode_randomization,
@@ -407,9 +419,15 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         string_rng=domains.get("strings"),
         string_cache_policy=str(getattr(config.cache_policy, "value",
                                         config.cache_policy)),
-        # One VM per build: cloning interpreter families creates more fingerprint
-        # surface than it removes.
-        vm_variety=(1 if int(config.vm_variety) >= 0 else 1),
+        # The config's variety, honored: one interpreter family (woven -- the
+        # consolidation argument against cloning *engines* still holds), but N
+        # groups whose formats, opcode maps, ciphers, readers and dispatch
+        # keys are drawn independently, so a devirtualizer recovered from one
+        # group reads none of the others.  The size budget ladder already
+        # prices extra groups (`_BUDGET_TRIMS`), so the cost is not silent.
+        # Capped at the selection: an empty group would still emit a whole
+        # interpreter, buying nothing but kilobytes.
+        vm_variety=max(1, min(int(config.vm_variety), len(selected) or 1)),
         # Legacy family/dispatcher settings normalize to the single woven VM and
         # its guarded dispatcher.
         families=("woven",),
@@ -424,15 +442,19 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         env_guard=int(config.env_guard),
         dump_guard=int(config.dump_guard),
         guard_policy=str(config.guard_policy),
+        blob_encoding=str(config.blob_encoding),
         names_out=runtime_names,
     )
 
-    stats = _collect_stats(module, classification, out, source_size)
+    stats = _collect_stats(module, classification, out, source_size,
+                           index_stats, selected=selected,
+                           upvalues_ok=bool(config.vm_upvalues))
     stats.guard = dict(runtime_names.get("guard") or {})
     stats.fingerprint = str(runtime_names.get("fingerprint") or "")
     stats.fingerprint_requested = bool(runtime_names.get("fingerprint_requested"))
     stats.fingerprint_bound = bool(runtime_names.get("fingerprint_bound"))
     stats.pool_decoys = int(runtime_names.get("pool_decoys") or 0)
+    stats.split_arms = int(runtime_names.get("split_arms") or 0)
     stats.vm_groups = list(runtime_names.get("vm_plan") or [])
     stats.elapsed_ms = (time.perf_counter() - started) * 1000.0
 
@@ -474,14 +496,53 @@ def _guard_report(guard: Dict[str, Any]) -> List[str]:
     return ["", *obj.report_lines()]
 
 
-def _select_for_vm(module, classification) -> Set[int]:
+def _upvalue_home_map(module) -> Dict[int, Tuple[int, ...]]:
+    """For every prototype with upvalues, the prototype each upvalue's value
+    ultimately lives in.
+
+    Mirrors ``Lowerer._upvalue_home`` -- the same walk, run before the lowerer
+    exists, because the selector needs the answer to decide who may be
+    virtualized.  ``from_local`` descriptors home in the immediate parent's
+    register file; the rest relay through the parent's own upvalue, and the
+    walk ends wherever the chain started as a local.  The home matters because
+    an upvalue whose home is a *virtualized* prototype has its storage inside a
+    VM frame, which no Luau closure can see -- and the accessor trick R5 uses
+    is exactly such a closure.
+    """
+    parents: Dict[int, Any] = {}
+    for p in module.walk():
+        for c in p.children:
+            parents[c.proto_id] = p
+
+    def home(proto: Any, i: int) -> int:
+        desc = proto.upvalues[i]
+        par = parents[proto.proto_id]
+        if desc.from_local:
+            return par.proto_id
+        return home(par, desc.index)
+
+    return {p.proto_id: tuple(home(p, i) for i in range(len(p.upvalues)))
+            for p in module.walk() if p.upvalues}
+
+
+def _select_for_vm(module, classification, upvalues_ok: bool = False) -> Set[int]:
     """Prototypes the classifier picked that the encoder can actually take.
 
-    The classifier does not know the VM's constraints -- upvalues, varargs and
-    nested closures are out, because the VM frame is a table and anything a
-    real Luau closure must see cannot live in it.  Intersecting here means the
-    reported count is the count that will really be virtualized, not the count
-    the classifier wished for.
+    The classifier does not know the VM's constraints -- nested closures are
+    out, because the VM frame is a table and anything a real Luau closure must
+    see cannot live in it.  Varargs crossed that line in R5 (the entry point
+    stashes the caller's packed arguments in the frame, and nothing outside the
+    call can observe them); upvalue *reads and writes* cross it here when
+    ``upvalues_ok`` is set, because the stub hands the interpreter accessor
+    closures over the native storage instead of storing the value in the frame.
+
+    One line does not move even then: an upvalue whose home prototype is itself
+    virtualized has its storage inside a frame no closure can see, so any
+    selected prototype with such an upvalue is unselected again.  Selection and
+    homes are circular -- A may home B's upvalue while B homes A's -- so the
+    removal runs to a fixpoint.  Intersecting here means the reported count is
+    the count that will really be virtualized, not the count the classifier
+    wished for.
     """
     from .vm import encode as _encode
 
@@ -489,13 +550,24 @@ def _select_for_vm(module, classification) -> Set[int]:
     for proto in module.walk():
         if classification.level(proto.proto_id) <= 0:
             continue
-        ok, _reason = _encode.can_virtualize(proto)
+        ok, _reason = _encode.can_virtualize(proto, upvalues_ok=upvalues_ok)
         if ok:
             chosen.add(proto.proto_id)
+    if upvalues_ok and chosen:
+        homes = _upvalue_home_map(module)
+        changed = True
+        while changed:
+            changed = False
+            for pid in sorted(chosen):
+                if any(h in chosen for h in homes.get(pid, ())):
+                    chosen.discard(pid)
+                    changed = True
     return chosen
 
 
-def _collect_stats(module, classification, out: str, source_size: int) -> BuildStats:
+def _collect_stats(module, classification, out: str, source_size: int,
+                   index_stats=None, selected: Optional[Set[int]] = None,
+                   upvalues_ok: bool = False) -> BuildStats:
     from .vm import encode as _encode
 
     # ``source_size`` is the caller's, because the honest denominator for the
@@ -508,22 +580,40 @@ def _collect_stats(module, classification, out: str, source_size: int) -> BuildS
     # would hide the node floor, which is the reason most prototypes are left
     # alone and the first setting a user needs to find.
     reasons_by_proto = {d.proto_id: d.reason for d in classification.decisions}
-    encodable = {p.proto_id for p in module.walk()
-                 if _encode.can_virtualize(p)[0]}
+    # The selection is the caller's, not recomputed here: with upvalue support
+    # the final set is a fixpoint (prototypes whose upvalue homes are
+    # virtualized are removed after the first pass), and recomputing it
+    # independently is how the report drifts from what the build actually did.
+    if selected is None:
+        selected = _select_for_vm(module, classification,
+                                  upvalues_ok=upvalues_ok)
     reasons: Dict[str, int] = {}
     for proto in module.walk():
         stats.prototypes += 1
         pid = proto.proto_id
-        if pid in encodable and classification.level(pid) > 0:
+        if pid in selected:
             stats.virtualized += 1
             continue
-        if pid not in encodable:
-            key = _encode.can_virtualize(proto)[1] or "not encodable"
+        ok, reason = _encode.can_virtualize(proto, upvalues_ok=upvalues_ok)
+        if not ok:
+            key = reason or "not encodable"
+        elif classification.level(pid) > 0:
+            # Encodable and wanted by the classifier, yet not in the final
+            # selection: that only happens to upvalue-capturing prototypes
+            # whose home ended up virtualized, removed by the fixpoint.
+            key = ("an upvalue's home lives inside the VM, where no closure "
+                   "can reach it")
         else:
             key = reasons_by_proto.get(pid) or "not selected"
         reasons[key] = reasons.get(key, 0) + 1
     stats.native_reasons = reasons
     stats.decisions = list(classification.decisions)
+    stats.directives = dict(classification.directives_applied)
+    if index_stats is not None and (index_stats.tables or index_stats.skipped):
+        stats.index_to_num = {"tables": index_stats.tables,
+                              "keys": index_stats.keys,
+                              "sites": index_stats.sites,
+                              "skipped": index_stats.skipped}
     return stats
 
 
@@ -617,6 +707,39 @@ def cost_report(result: BuildResult) -> str:
             "                        running the payload against the pool." % s.pool_decoys)
     else:
         lines.append("pool decoys           : none.  Every entry in the pool is referenced.")
+    if s.split_arms:
+        lines.append(
+            "split arms            : %d opaque branches added to the flattened native\n"
+            "                        drivers.  Each is keyed to an encoded state the\n"
+            "                        build proves no reachable counter can take, so it\n"
+            "                        never runs -- but a reader cannot show that\n"
+            "                        without solving the control flow." % s.split_arms)
+    else:
+        lines.append("split arms            : none in this build.")
+    if s.directives:
+        kept = {k: v for k, v in sorted(s.directives.items()) if k != "ignored"}
+        ignored = s.directives.get("ignored", 0)
+        parts = ["%d %s" % (v, k) for k, v in kept.items() if v]
+        summary = ", ".join(parts) if parts else "none applied"
+        if ignored:
+            summary += "; %d could not apply and %s ignored" % (
+                ignored, "was" if ignored == 1 else "were")
+        lines.append(
+            "source directives     : %s.  A --!couxobf: comment names the function\n"
+            "                        declared after it." % summary)
+    if s.index_to_num:
+        lines.append(
+            "index-to-num          : %d table%s had %d literal key%s rewritten to\n"
+            "                        per-build numeric handles (%d access sites);\n"
+            "                        %d candidate table%s left untouched by the\n"
+            "                        safety check." % (
+                s.index_to_num["tables"],
+                "s" if s.index_to_num["tables"] != 1 else "",
+                s.index_to_num["keys"],
+                "s" if s.index_to_num["keys"] != 1 else "",
+                s.index_to_num["sites"],
+                s.index_to_num["skipped"],
+                "s were" if s.index_to_num["skipped"] != 1 else " was"))
     lines.append(f"elapsed             : {s.elapsed_ms:.1f} ms")
     lines.append("")
 

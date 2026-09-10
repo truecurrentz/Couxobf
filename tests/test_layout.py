@@ -32,7 +32,9 @@ from couxobf.vm.encode import (_CONDITIONAL_OPS, _NO_FALLTHROUGH_OPS,
                                EncodingError, _fallthrough)
 
 TOOLCHAIN = find_toolchain()
-CORPUS = sorted(glob.glob("/tmp/luau-src-0.700/tests/conformance/*.luau"))
+# Repo-local corpus first, external Luau checkout when present: the suite must
+# be green in a clean checkout, not merely in one where setup-luau.sh ran.
+from tests.corpus import CORPUS  # noqa: E402
 
 
 def _opmap(seed=b"\x09" * 16):

@@ -113,6 +113,18 @@ FORMATS: Dict[str, OperandSpec] = {
     # CALL base, argc, nres, tail: argc/nres/tail are wide so MULTIRET (-1)
     # survives; it is encoded as a bias, see encode.py.
     OP.CALL:         OperandSpec(regs=(0,), wides=("argc", "nres", "tail")),
+    # VARARG base, count: count is biased exactly like CALL's nres, because
+    # it carries the same MULTIRET (-1) meaning -- "every vararg the caller
+    # sent, packed into one register" -- and the same field cannot go
+    # negative.  The entry point stashes the caller's packed arguments in the
+    # frame, so the handler is a slice, not a reconstruction.
+    OP.VARARG:       OperandSpec(regs=(0,), wides=("count",)),
+    # GETUPVAL d, u / SETUPVAL u, a: ``u`` indexes the frame's accessor list
+    # (getter/setter closures the stub builds over the *native* variable the
+    # upvalue names), so it rides a wide slot like JMP's target -- it is an
+    # immediate, not a register.
+    OP.GETUPVAL:     OperandSpec(regs=(0,), wides=("up",), wide_first=True),
+    OP.SETUPVAL:     OperandSpec(regs=(1,), wides=("up",), wide_first=True),
     OP.TAILCALL:     OperandSpec(regs=(0,), wides=("argc", "tail")),
     OP.RETURN:       OperandSpec(regs=(0,), wides=("count",)),
     OP.RETURN0:      OperandSpec(),
@@ -153,12 +165,12 @@ SUPPORTED = frozenset(FORMATS)
 
 #: Opcodes that cannot be virtualized at all, and why.  These are not "not yet"
 #: in the sense of an oversight: each one needs VM state to be reachable from
-#: ordinary Luau closures, which is a different and harder design.
+#: ordinary Luau closures, which is a different and harder design.  (Upvalue
+#: reads and writes crossed this line in R5: the stub hands the interpreter
+#: accessor closures over the native storage, which is what GETUPVAL and
+#: SETUPVAL call -- see runtime.py.)
 UNSUPPORTED_REASON = {
     OP.CLOSURE: "creates a closure; its upvalues would have to point into VM state",
-    OP.GETUPVAL: "reads an upvalue; the VM frame is not a Luau closure",
-    OP.SETUPVAL: "writes an upvalue; the VM frame is not a Luau closure",
-    OP.VARARG: "varargs need the caller's frame, which the VM does not model",
     OP.NOP: "removed by the optimizer before encoding",
     OP.LABEL: "resolved away during lowering",
 }
@@ -381,4 +393,7 @@ IR_ARITY: Dict[str, int] = {
     OP.RETURNMULTI: 3, OP.SELF: 3, OP.SETLIST: 3, OP.SETTABLE: 3, OP.SUB: 3,
     OP.TAILCALL: 3,
     OP.CALL: 4,
+    OP.VARARG: 2,
+    OP.GETUPVAL: 2,
+    OP.SETUPVAL: 2,
 }

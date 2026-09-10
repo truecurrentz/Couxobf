@@ -94,6 +94,20 @@ def test_micro_roundtrip(path):
         assert_same(fh.read(), os.path.basename(path))
 
 
+# the repo-local corpus: multi-block programs the layout and integrity suites
+# also share, so the reconstruction path and the VM path see the same shapes.
+
+def _repo_corpus():
+    from tests.corpus import REPO_CORPUS
+    return REPO_CORPUS
+
+
+@pytest.mark.parametrize("path", _repo_corpus(), ids=lambda p: os.path.basename(p))
+def test_repo_corpus_roundtrip(path):
+    with open(path, encoding="utf-8") as fh:
+        assert_same(fh.read(), os.path.basename(path))
+
+
 # ---------------------------------------------------------------------------
 # semantic hazards found by earlier bugs, written out as prose so the next
 # person knows what each one is for

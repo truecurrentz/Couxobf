@@ -26,7 +26,7 @@ it is labelled as one rather than passed off as measurement.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .config import Config, VirtualizationLevel
 from .ir import IRModule, FuncIR
@@ -58,6 +58,10 @@ class Classification:
     levels: Dict[int, int] = field(default_factory=dict)
     families: Dict[int, Optional[str]] = field(default_factory=dict)
     decisions: List[Decision] = field(default_factory=list)
+    #: How many source directives landed, by name -- for the report.  A
+    #: directive that could not apply (a `virtualize` on the main chunk, or
+    #: one with no function after it) is counted under ``ignored``.
+    directives_applied: Dict[str, int] = field(default_factory=dict)
 
     def level(self, proto_id: int) -> int:
         return self.levels.get(proto_id, 0)
@@ -96,17 +100,60 @@ def _is_candidate(proto: FuncIR, module: IRModule, config: Config) -> Optional[s
     return None
 
 
-def classify_module(module: IRModule, config: Config, rng: Rng) -> Classification:
+def _bind_directives(directives: Sequence[Tuple[int, str]],
+                     module: IRModule) -> Tuple[Dict[int, str], int]:
+    """Map proto id -> directive name, Luaq-style: a directive names the first
+    function declared at or after its line.
+
+    Several directives before one declaration: the nearest wins, because the
+    later ones overwrite in line order.  Returns the binding and the count of
+    directives that had no declaration to bind to (they are moot, and the
+    report says so rather than pretending they did something).
+    """
+    decls = sorted((int(getattr(p.node, "line", 0)), p.proto_id)
+                   for p in module.walk() if p.node is not None)
+    bound: Dict[int, str] = {}
+    moot = 0
+    for line, name in sorted(directives, key=lambda d: (d[0], d[1])):
+        target: Optional[int] = None
+        for decl_line, pid in decls:
+            if decl_line >= line:
+                target = pid
+                break
+        if target is None:
+            moot += 1
+        else:
+            bound[target] = name
+    return bound, moot
+
+
+def classify_module(module: IRModule, config: Config, rng: Rng,
+                    directives: Optional[Sequence[Tuple[int, str]]] = None
+                    ) -> Classification:
     """Assign a virtualization level to every prototype in ``module``.
 
     Writes ``proto.virtualization`` and ``proto.vm_family`` as well as returning
     the classification, so downstream passes can read either.
+
+    ``directives`` carries ``--!couxobf:`` source directives as (line, name)
+    pairs; see :func:`_bind_directives` for how they attach to declarations.
+    ``no_virtualize`` keeps the function native whatever its score;
+    ``virtualize`` forces it in ahead of the budget ranking, capped by the
+    configured level and by the closure restriction, because a directive is a
+    request about *which* functions run in the VM, not a licence to ignore
+    what the VM cannot yet represent.
     """
     result = Classification()
+    bound, moot = _bind_directives(directives or (), module)
+    if moot:
+        result.directives_applied["ignored"] = result.directives_applied.get("ignored", 0) + moot
     # Accept the enum or its name: the CLI parses, but a Config built by
     # hand or from a dict may carry either, and int('maximum') is a
     # crash rather than a diagnosis.
     cap = int(VirtualizationLevel.parse(config.virtualization_level))
+
+    def _applied(name: str) -> None:
+        result.directives_applied[name] = result.directives_applied.get(name, 0) + 1
 
     if cap == 0:
         for proto in module.walk():
@@ -114,9 +161,14 @@ def classify_module(module: IRModule, config: Config, rng: Rng) -> Classificatio
             proto.vm_family = None
             result.levels[proto.proto_id] = 0
             result.families[proto.proto_id] = None
+            reason = "virtualization disabled by configuration"
+            if bound.get(proto.proto_id) == "virtualize":
+                # The user asked, and the config said no: the config wins, but
+                # the report must not read as though the directive vanished.
+                reason += " (directive --!couxobf:virtualize ignored)"
+                _applied("ignored")
             result.decisions.append(
-                Decision(proto.proto_id, proto.name, 0, 0.0,
-                         "virtualization disabled by configuration"))
+                Decision(proto.proto_id, proto.name, 0, 0.0, reason))
         return result
 
     # Rank candidates, then take the budget.  Ties are broken with the build
@@ -124,48 +176,80 @@ def classify_module(module: IRModule, config: Config, rng: Rng) -> Classificatio
     # a fixed seed still reproduces exactly.
     candidates = []
     for proto in module.walk():
+        directive = bound.get(proto.proto_id)
         excluded = _is_candidate(proto, module, config)
-        if excluded is not None:
+        if directive == "no_virtualize":
             proto.virtualization = 0
             proto.vm_family = None
             result.levels[proto.proto_id] = 0
             result.families[proto.proto_id] = None
             result.decisions.append(
-                Decision(proto.proto_id, proto.name, 0, 0.0, excluded))
+                Decision(proto.proto_id, proto.name, 0, 0.0,
+                         "directive --!couxobf:no_virtualize"))
+            _applied("no_virtualize")
             continue
+        if excluded is not None:
+            if directive == "virtualize" and excluded.startswith("trivial"):
+                # The point of the directive: a function the score would skip
+                # is protected anyway.  The other exclusions stand -- the main
+                # chunk bootstraps the VM and cannot run inside it.
+                excluded = None
+            else:
+                reason = excluded
+                if directive == "virtualize":
+                    reason += " (directive --!couxobf:virtualize ignored)"
+                    _applied("ignored")
+                proto.virtualization = 0
+                proto.vm_family = None
+                result.levels[proto.proto_id] = 0
+                result.families[proto.proto_id] = None
+                result.decisions.append(
+                    Decision(proto.proto_id, proto.name, 0, 0.0, reason))
+                continue
         # The rng draw is a tie-break only; adding it to the score would let a
         # small function outrank a large one on luck.
-        candidates.append((score(proto), rng.randbelow(1 << 20), proto))
+        forced = 1 if directive == "virtualize" else 0
+        candidates.append((forced, score(proto), rng.randbelow(1 << 20), proto))
 
-    candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    # Directive-forced functions rank ahead of score picks, so an explicit
+    # request is the last thing the budget gives up.
+    candidates.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
 
     budget = max(0, int(config.max_vm_functions))
-    for rank, (value, _tie, proto) in enumerate(candidates):
+    for rank, (forced, value, _tie, proto) in enumerate(candidates):
         if rank >= budget:
             proto.virtualization = 0
             proto.vm_family = None
             result.levels[proto.proto_id] = 0
             result.families[proto.proto_id] = None
+            reason = f"outside the budget of {budget} virtualized functions"
+            if forced:
+                reason += " (directive --!couxobf:virtualize ignored)"
+                _applied("ignored")
             result.decisions.append(
-                Decision(proto.proto_id, proto.name, 0, value,
-                         f"outside the budget of {budget} virtualized functions"))
+                Decision(proto.proto_id, proto.name, 0, value, reason))
             continue
 
-        level = _level_for(value, cap, config)
+        if forced:
+            level = cap
+            reason = "directive --!couxobf:virtualize"
+        else:
+            level = _level_for(value, cap, config)
+            reason = f"score {value:.1f}"
         # A prototype that creates closures cannot yet be virtualized above
         # LIGHT: the VM would have to build a closure whose upvalues point into
         # VM state, and that path is not implemented.  Excluding it is honest;
         # silently miscompiling it would not be.
         if proto.closure_count > 0 and level > int(VirtualizationLevel.LIGHT):
             level = int(VirtualizationLevel.LIGHT)
-            reason = "creates closures; capped at LIGHT"
-        else:
-            reason = f"score {value:.1f}"
+            reason += "; creates closures; capped at LIGHT"
 
         proto.virtualization = level
         if level > 0:
             proto.vm_family = ("polymorphic" if getattr(config, "vm_polymorphism", False)
                                else getattr(config.vm_family, "value", config.vm_family))
+            if forced:
+                _applied("virtualize")
         else:
             proto.vm_family = None
         result.levels[proto.proto_id] = level

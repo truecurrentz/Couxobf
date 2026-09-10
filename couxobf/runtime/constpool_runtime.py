@@ -13,7 +13,7 @@ carries no self-describing identifiers.
 from __future__ import annotations
 
 import hashlib
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from ..constpool import mask_params
 from .luau_crypto import crypto_runtime
@@ -76,9 +76,19 @@ def _literal_parts(data: bytes) -> List[Tuple[int, int, int, int, bytes]]:
     return parts
 
 
-def byte_expr(data: bytes, helper: str) -> str:
-    rows = ["{%d,%d,%d,%d,%s}" % (seed, mul, add, shift, byte_literal(masked))
-            for seed, mul, add, shift, masked in _literal_parts(data)]
+def byte_expr(data: bytes, helper: str, dense: Any = None) -> str:
+    """The masked-fragment expression for one blob.
+
+    With a dense codec, each fragment's stored bytes ride base85 under the
+    build's alphabet (1.25 source chars per byte) instead of ``\\xHH``
+    escapes (4 per byte); the decode is one call per fragment at load.  The
+    masking layer is unchanged: dense changes how the bytes are *spelled*,
+    not how they are protected.
+    """
+    rows = []
+    for seed, mul, add, shift, masked in _literal_parts(data):
+        lit = dense.expr(masked) if dense is not None else byte_literal(masked)
+        rows.append("{%d,%d,%d,%d,%s}" % (seed, mul, add, shift, lit))
     return "%s({%s})" % (helper, ",".join(rows))
 
 
@@ -103,7 +113,8 @@ class ConstantPoolRuntime:
              guard_check: str = "",
              ticket_mask: int = 0,
              enc_domain: bytes = None,
-             mac_domain: bytes = None) -> str:
+             mac_domain: bytes = None,
+             dense: Any = None) -> str:
         n = self.n
         ticket_mask &= 0xffffffff
         mask_mul, mask_add, mask_shift = mask_params(key + nonce + aad)
@@ -112,13 +123,13 @@ class ConstantPoolRuntime:
         trip = (f"  if not {guard_check}() then error({fail(b'guard')}) end\n"
                 if guard_check else "")
         meta_name = n.get("meta", n["key"] + "m")
-        aad_expr = byte_expr(aad, n["lit"])
+        aad_expr = byte_expr(aad, n["lit"], dense)
         key_mask_material = ciphertext + tag + nonce + aad
         key_image = _xor_bytes(key, hashlib.sha256(key_mask_material).digest())
         meta_items = [("key", key_image), ("nonce", nonce), ("tag", tag), ("ct", ciphertext)]
         meta_items.sort(key=lambda item: hashlib.sha256(tag + item[0].encode()).digest())
         meta_index = {name: i + 1 for i, (name, _data) in enumerate(meta_items)}
-        meta_rows = ",".join(byte_expr(data, n["lit"]) for _name, data in meta_items)
+        meta_rows = ",".join(byte_expr(data, n["lit"], dense) for _name, data in meta_items)
         unwrap_name = n.get("unwrap", n["key"] + "u")
         ticket_expr = '(string.unpack(">I4", %s, 1))' % byte_literal(ticket_mask.to_bytes(4, "big"))
         deticket = (f"  i = bit32.bxor(i, {ticket_expr})\n" if ticket_mask else "")
@@ -226,6 +237,8 @@ local function {n['load']}()
       q += 4 + string.unpack(">I4", p, q)
     elseif t == 4 then
       q += 12
+    elseif t == 6 then
+      q += 8
     elseif t == 5 then
       local c = string.unpack(">I2", p, q)
       q += 2
@@ -264,6 +277,12 @@ local function {n['mat']}(i)
   elseif t == 4 then
     local seed = string.unpack(">I4", p, q + 1)
     return string.unpack(">d", {n['dyn']}(string.sub(p, q + 5, q + 12), seed), 1)
+  elseif t == 6 then
+    -- Exact-integer split: two 32-bit halves rebuilt by integer arithmetic.
+    -- Both terms are exact doubles by the encoder's eligibility rule, so the
+    -- sum is the original value bit-for-bit -- no rounding anywhere.
+    local hi, lo = string.unpack(">i4I4", p, q + 1)
+    return hi * 4294967296 + lo
   else
     local parts = {{}}
     local m = 0

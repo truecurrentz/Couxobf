@@ -107,9 +107,14 @@ def test_the_instruction_set_follows_the_code_in_every_group():
     builds = _case("polymorphic", seeds=2, program=BIG_PROGRAM)
     sizes = [sorted(g["opcodes"] for g in build["groups"]) for build in builds]
     for size in sizes:
-        assert len(size) == 1, size
+        # The knob is honored again: variety=3 over four virtualizable
+        # prototypes really does ship three interpreters, and the pin that
+        # collapsed them to one is gone.
+        assert len(size) == 3, size
         assert all(n > 0 for n in size)
         assert max(size) < 43, "nothing was narrowed: %s" % size
+        # The point of per-group subsets: not all groups carry the same set.
+        assert len(set(size)) > 1, "every group drew the same subset: %s" % size
     # Same program, same selection rule, so the *sizes* are stable while the
     # numbers inside them are not.  That is the honest reading of this knob: the
     # count is a property of the code, the mapping is a property of the build.
@@ -117,6 +122,26 @@ def test_the_instruction_set_follows_the_code_in_every_group():
     a, b = builds
     score = audit_tool.compare(a, b)
     assert score["isa"] == 1.0 and score["numbering"] < 0.5
+
+
+def test_polymorphic_differs_from_hardened():
+    """The variety knob must move the artifact, not just the config.
+
+    While `vm_variety` was silently pinned to 1, the polymorphic case of the
+    audit scored identically to hardened -- the exact regression this test
+    exists to catch.  With the knob live, a variety build carries more than
+    one interpreter, and a matcher holding one recovered table meets a format
+    it cannot feed it into.
+    """
+    hard = _case("hardened", seeds=1, program=BIG_PROGRAM)[0]
+    poly = _case("polymorphic", seeds=1, program=BIG_PROGRAM)[0]
+    assert len(hard["groups"]) == 1
+    assert len(poly["groups"]) > 1, "vm_variety did not produce several VMs"
+    hard_seq = sorted(g["opcodes"] for g in hard["groups"])
+    poly_seq = sorted(g["opcodes"] for g in poly["groups"])
+    assert hard_seq != poly_seq, (
+        "the polymorphic build is indistinguishable from hardened by its "
+        "handler counts -- the variety knob changed nothing again")
 
 
 def test_the_cipher_is_what_separates_moved_numbers_from_meaningless_bytes():
