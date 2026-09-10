@@ -65,6 +65,28 @@ loop. Further wins therefore need both halves:
   which is where `vm=none` builds spend their time. Not addressed yet; see
   the roadmap in `research-comparison.md`.
 
+## The cost of opaque split arms (native side)
+
+R2's native half adds opaque `elseif` arms to the flattened drivers, keyed to
+an encoded state the build proves unreachable. They are extra comparisons in
+the dispatch chain and extra bytes in the artifact, so the cost is measured
+rather than assumed — `examples/maze.luau`, `reproducible_seed=42`, median of
+three protected runs (original 3.3 ms):
+
+| build                          | wall time | Δ vs arms off | out size | split arms |
+|--------------------------------|-----------|---------------|----------|------------|
+| arms off (`control_flow_level=0`) | 5888 ms | —             | 77 916 B | 0          |
+| arms on (`control_flow_level=2`)  | 6050 ms | +2.8 %        | 82 077 B | 33         |
+
+The runtime price is the per-dispatch extra comparison a decoy arm adds while
+the chain scans for the matching block — it never runs, but it is compared.
+At the hardened default's 0.2 draw rate that is +2.8 % on the hot maze
+program, comfortably inside the "a few tens of percent" bar this file holds
+changes to. The size price is the arm's encoded-state comparison plus a deep
+copy of the real block's tail statements (+5.3 %). Both scale with the rate
+dial, so a build that wants less pays less: level 0 emits none, and the
+`compact` profile (level 0) never sees them.
+
 ## Dispatch shape and operand reads (VM side)
 
 Measured on `examples/maze.luau` with the format forced per shape (chain
