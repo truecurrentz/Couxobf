@@ -123,6 +123,18 @@ counter was removed in R12: pc protection is what `pc_protection` (biased and
 relative jump targets) actually delivers, and a dead knob is not how the tool
 talks about protection.
 
+### Directives: per-function control (implemented, R8)
+
+A `--!couxobf:no_virtualize` or `--!couxobf:virtualize` comment names the
+first function declared after it, so the user can exempt a hot callback from
+the VM or force-protect a function the score would skip. The directive is a
+request about *which* functions run in the VM, not a licence to ignore what
+the VM cannot represent: a `virtualize` on a function that captures upvalues
+(the VM has no closure support yet), on the main chunk, or under
+`virtualization_level = none` is reported as ignored rather than implied to
+have run, and an unknown `--!couxobf:` spelling fails the build instead of
+silently doing nothing. See `docs/research-comparison.md` § R8.
+
 ### Constant pool encryption (implemented)
 
 Literals do not appear in the artifact. They live in one ChaCha20-sealed blob

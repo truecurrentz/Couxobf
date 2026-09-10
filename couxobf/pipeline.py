@@ -90,6 +90,11 @@ class BuildStats:
     elapsed_ms: float = 0.0
     #: Virtualization level per prototype, from the classifier.
     decisions: List[Any] = field(default_factory=list)
+    #: R8 source directives that landed, by name (`no_virtualize` /
+    #: `virtualize`).  A directive that could not apply -- a `virtualize`
+    #: the config or the main chunk overrode, or one with no function after
+    #: it -- is counted under ``ignored`` so the report does not imply it ran.
+    directives: Dict[str, int] = field(default_factory=dict)
     #: `#` comments removed from the input before parsing (#5's input side).
     hash_comments: int = 0
     #: Size ratio the build was asked to stay under, 0 when unset.
@@ -340,8 +345,23 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
     # The classifier runs before reconstruction so its decisions can be passed
     # down as an explicit selection.  It writes proto.virtualization as a side
     # effect, which the report reads back.
-    classification = _classify.classify_module(module, config,
-                                               domains.get("vm"))
+    #
+    # R8: `--!couxobf:` directives ride the source as comments and name the
+    # function that follows them.  A misspelled one is refused here rather than
+    # ignored, because a directive that quietly did nothing is the same dead
+    # knob the rest of this tool keeps removing.
+    directives = _comments.find_directives(source)
+    unknown = sorted({d.name for d in directives}
+                     - set(_comments.DIRECTIVES))
+    if unknown:
+        raise BuildError(
+            "%s: unknown directive%s --!couxobf:%s; expected one of %s"
+            % (name, "s" if len(unknown) > 1 else "",
+               ", --!couxobf:".join(unknown),
+               ", ".join("--!couxobf:" + d for d in _comments.DIRECTIVES)))
+    classification = _classify.classify_module(
+        module, config, domains.get("vm"),
+        directives=[(d.line, d.name) for d in directives])
     selected = _select_for_vm(module, classification)
 
     # -- back end ---------------------------------------------------------
@@ -506,6 +526,7 @@ def _collect_stats(module, classification, out: str, source_size: int) -> BuildS
         reasons[key] = reasons.get(key, 0) + 1
     stats.native_reasons = reasons
     stats.decisions = list(classification.decisions)
+    stats.directives = dict(classification.directives_applied)
     return stats
 
 
@@ -608,6 +629,17 @@ def cost_report(result: BuildResult) -> str:
             "                        without solving the control flow." % s.split_arms)
     else:
         lines.append("split arms            : none in this build.")
+    if s.directives:
+        kept = {k: v for k, v in sorted(s.directives.items()) if k != "ignored"}
+        ignored = s.directives.get("ignored", 0)
+        parts = ["%d %s" % (v, k) for k, v in kept.items() if v]
+        summary = ", ".join(parts) if parts else "none applied"
+        if ignored:
+            summary += "; %d could not apply and %s ignored" % (
+                ignored, "was" if ignored == 1 else "were")
+        lines.append(
+            "source directives     : %s.  A --!couxobf: comment names the function\n"
+            "                        declared after it." % summary)
     lines.append(f"elapsed             : {s.elapsed_ms:.1f} ms")
     lines.append("")
 

@@ -337,13 +337,13 @@ P3 = polish. Each item names the axes above.
 | R5 | Closure-capable virtualization (upvalues via shared cell tables; varargs via frame field) | our biggest coverage gap vs Prometheus/Clyde | **P2** |
 | R6 | Per-group constant pools with group-format AAD binding | one recovered accessor currently yields all constants | **P2** |
 | R7 | Exact integer arithmetic number encoding (split/add/fold) behind `numeric_protection_level=2` | numbers currently only get float-safe disguises | **P2 — done** |
-| R8 | `--!couxobf:` directives (`no_virtualize`, `virtualize`) | per-function user control, Luaq parity | **P2** |
+| R8 | `--!couxobf:` directives (`no_virtualize`, `virtualize`) | per-function user control, Luaq parity | **P2 — done** |
 | R9 | Index-to-number pass for provably-static table keys (opt-in) | structural transform at zero runtime cost | **P3** |
 | R10 | Inline-small-helpers AST pass (opt-in, node cap) | glue-code reduction, Luaq parity | **P3** |
 | R11 | Dispatcher speed option: inlined-chain dispatch for small groups | 2 closure calls/instruction is slow | **P2 — done** |
 | R12 | Remove dead config surface; every remaining field either wired or gone (see G) | 15 pending fields erode trust in the report | **P1 — done** |
 
-Status: R0, R1, R2, R3, R4, R7, R11 and R12 are implemented and measured
+Status: R0, R1, R2, R3, R4, R7, R8, R11 and R12 are implemented and measured
 (see `docs/benchmarks.md`); the fuzz battery is in
 `tests/test_fuzz_differential.py`, and the reuse-audit's verdict is pinned
 as a regression test in `tests/test_reuse_regression.py`.  Everything else
@@ -610,21 +610,41 @@ protected build that prints every split constant under the pinned
 toolchain (`tests/test_numeric_split.py`).
 *Default.* On at level 2 (the `maximum` profile sets it).
 
-### R8 — Directives (P2)
+### R8 — Directives (P2 — done)
 
 *Problem.* Users cannot exempt a hot callback or force-protect one function.
 
 *Reference.* Luaq `--!luaq:no_virtualize` / `LUAQ_NO_VIRTUALIZE`.
 
-*Design.* Comment directives parsed by `comments.prepare` (we already own
-that pass): `--!couxobf:no_virtualize` binds to the next function
-declaration; `--!couxobf:virtualize` overrides the floor. Classification
-reads the binding. Reserved-prefix guard: unknown `--!couxobf:` names fail
-the build rather than get ignored (Luaq's reserved-prefix lesson).
+*Design.* A `--!couxobf:no_virtualize` or `--!couxobf:virtualize` comment
+names the first function declared after it. `comments.find_directives`
+scans with the same string-aware pass the rest of the module uses, so a
+directive-shaped string or long comment is not a directive; the classifier
+binds each one to a prototype and overrides the score. `no_virtualize`
+keeps the function native whatever its score; `virtualize` ranks the
+function ahead of the budget so an explicit request is the last thing the
+budget gives up, and lifts a trivial function past the node floor.
 
-*Cost.* Zero runtime. *Risk.* Directive stripping must never touch string
-contents — covered by the existing re-parse-after-strip trick.
-*Default.* On.
+Two honesty rules, because a directive that quietly did nothing is the same
+dead knob the rest of this tool removes:
+
+* An unknown `--!couxobf:<name>` fails the build and names the valid
+  spellings (Luaq's reserved-prefix lesson).
+* A directive the config or the VM overrode is reported as ignored, not
+  implied to have run: a `virtualize` with virtualization disabled, on the
+  main chunk, on a function that captures upvalues (the VM has no closure
+  support yet — R5), or with no function after it all lands under
+  `ignored` in the report's `source directives` line.
+
+The directive never lifts what the VM cannot represent — the closure cap
+and the configured level ceiling still stand — because it is a request
+about *which* functions run in the VM, not a licence to ignore the VM's
+limits.
+
+*Cost.* Zero runtime. *Risk.* Directive extraction never touches string
+contents — the scanner is string-aware, and the build re-parses the prepared
+source anyway. Tests: `tests/test_directives.py`.
+*Default.* On (directives are read whenever present; no config needed).
 
 ### R9 — Index-to-number (P3)
 
