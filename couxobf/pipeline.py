@@ -428,6 +428,7 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         env_guard=int(config.env_guard),
         dump_guard=int(config.dump_guard),
         guard_policy=str(config.guard_policy),
+        roblox_mode=bool(config.roblox_mode),
         names_out=runtime_names,
     )
 
@@ -460,10 +461,13 @@ def _guard_report(guard: Dict[str, Any]) -> List[str]:
     second answer to the same question, and the two drift.
     """
     from . import guard as _guard
+    surfaces = (_guard.ROBLOX_SURFACES if guard.get("roblox_mode", True)
+                else _guard.GENERIC_SURFACES)
     obj = _guard.Guard(env_level=guard.get("env_guard", 0),
                        dump_level=guard.get("dump_guard", 0),
                        policy=guard.get("policy", "fail"),
-                       bound=tuple(guard.get("captured") or ()))
+                       bound=tuple(guard.get("captured") or ()),
+                       surfaces=surfaces)
     return ["", *obj.report_lines()]
 
 

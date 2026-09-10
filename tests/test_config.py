@@ -81,7 +81,7 @@ def test_the_defaults_request_features_that_are_not_built():
                  "integrity_level", "self_test",
                  "identifier_polymorphism", "fingerprint_reduction",
                  "chunking_level", "lazy_decode",
-                 "junk_level", "roblox_mode"):
+                 "junk_level"):
         assert name in pending, name
     assert len(pending) <= 20, sorted(pending)
 

@@ -660,7 +660,7 @@ def test_the_endpoint_names_the_fields_nothing_reads():
     assert set(body["pending"]) == declared - set(Config.IMPLEMENTED)
     # Refused on the way in, listed on the way out: a field the pipeline does not
     # read cannot be asked for, and cannot be quietly forgotten either.
-    for name in ("junk_level", "chunking_level", "roblox_mode"):
+    for name in ("junk_level", "chunking_level"):
         code, refused = handle({"source": "print(1)", "options": {name: 2}})
         assert code == 400, name
         assert "does not read it yet" in refused["error"], name

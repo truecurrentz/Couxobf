@@ -469,6 +469,7 @@ class Config:
         "env_guard",
         "dump_guard",
         "guard_policy",
+        "roblox_mode",
         "hash_comments",
         "fingerprint",
         "minify",

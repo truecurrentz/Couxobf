@@ -153,6 +153,10 @@ const SPEC = [
        "message that names the check. `ignore` keeps running, which is how you " +
        "measure the checks on a machine that legitimately has a hooked " +
        "environment."],
+      ["roblox_mode", "Roblox/executor surface", "bool",
+       "Watch Roblox and executor dump APIs such as getgc, hookfunction, " +
+       "getscriptbytecode and saveinstance. Turn off only for a smaller generic " +
+       "Luau artifact."],
     ],
   },
   {
@@ -857,6 +861,7 @@ const FALLBACK = {
   branch_inversion: { kind: "bool", default: true },
   env_guard: { kind: "int", min: 0, max: 2, default: 1 },
   dump_guard: { kind: "int", min: 0, max: 2, default: 1 },
+  roblox_mode: { kind: "bool", default: true },
   decoy_constants: { kind: "int", min: 0, max: 256, default: 12 },
   bounded_cache_size: { kind: "int", min: 1, max: 4096, default: 16 },
   max_vm_functions: { kind: "int", min: 0, max: 4096, default: 64 },

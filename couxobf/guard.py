@@ -69,19 +69,25 @@ CAPTURED: Tuple[str, ...] = (
 
 #: Dump and inspection surfaces the guard watches, as ``(table, field, call_it)``.
 #: A ``None`` table means "look it up on the environment", which is where the
-#: Roblox-only dump functions live.  Either half may be absent on a given
-#: platform, and absence is not a violation -- it is the norm off Roblox.
-SURFACES: Tuple[Tuple[Optional[str], str, bool], ...] = (
-    # Luau itself removes bytecode dumping in the sandbox, but exploit/testing
-    # hosts commonly add these names back.  Snapshot both the official-ish debug
-    # entry points and the executor-style global dump helpers so a mid-run swap
-    # is observable before the VM hands over plaintext payload rows.
+#: Roblox/executor-only dump functions live.  Either half may be absent on a
+#: given platform, and absence is not a violation.
+GENERIC_SURFACES: Tuple[Tuple[Optional[str], str, bool], ...] = (
+    # These exist in ordinary Lua/Luau-like hosts often enough to be worth
+    # checking without assuming an executor API.  ``debug.gethook`` is called
+    # because the interesting value is the current hook, not the function object.
     ("string", "dump", False),
     ("debug", "info", False),
     ("debug", "getinfo", False),
     ("debug", "traceback", False),
     ("debug", "gethook", True),
     ("debug", "sethook", False),
+)
+
+ROBLOX_SURFACES: Tuple[Tuple[Optional[str], str, bool], ...] = GENERIC_SURFACES + (
+    # Luau itself removes bytecode dumping in the sandbox, but exploit/testing
+    # hosts commonly add these names back.  Snapshot both the official-ish debug
+    # entry points and the executor-style global dump helpers so a mid-run swap
+    # is observable before the VM hands over plaintext payload rows.
     ("debug", "getstack", False),
     ("debug", "getlocals", False),
     ("debug", "getlocal", False),
@@ -107,6 +113,9 @@ SURFACES: Tuple[Tuple[Optional[str], str, bool], ...] = (
     (None, "getconnections", False),
     (None, "saveinstance", False),
 )
+
+#: Backwards-compatible name: Roblox mode is the default protection target.
+SURFACES = ROBLOX_SURFACES
 
 #: Metatable fields that matter for logging/proxying.  ``__index`` and
 #: ``__newindex`` are the classic environment logger; ``__namecall`` and
@@ -289,6 +298,9 @@ class Guard:
     #: ``index``, ``write``, ``check``, ``flag``) and one ``surface:<i>`` per
     #: watched surface.
     names: Dict[str, str] = field(default_factory=dict)
+    #: Dump/debug surfaces this build watches.  Roblox mode uses the executor
+    #: superset; generic mode keeps the smaller portable set.
+    surfaces: Tuple[Tuple[Optional[str], str, bool], ...] = SURFACES
     #: The library names this build actually binds, after :meth:`bind` has seen
     #: the scaffolding.  Empty until then, which is also what an inactive capture
     #: block looks like -- a build whose runtime happens to touch no library
@@ -338,7 +350,7 @@ class Guard:
         out = ["_G", "getfenv", "getmetatable", "rawget", "rawequal", "error"]
         if self.neutralises:
             out += ["pcall", "rawset"]
-        for table, _name, _call in SURFACES:
+        for table, _name, _call in self.surfaces:
             if table:
                 out.append(table)
         return tuple(dict.fromkeys(out))
@@ -387,7 +399,7 @@ class Guard:
             lines.append("local %s = %s and (%s)(%s, \"%s\")"
                          % (self.n(_META_ROLE[key]), self.n("meta"), rawget,
                             self.n("meta"), key))
-        for index, (table, name, call_it) in enumerate(SURFACES):
+        for index, (table, name, call_it) in enumerate(self.surfaces):
             slot = self.n(f"surface:{index}")
             lines.append("local %s = %s" % (slot, self._read_surface(table, name,
                                                                      call_it)))
@@ -419,7 +431,7 @@ class Guard:
             body.append("  if not (%s)((%s)(m, \"%s\"), %s) then return false end"
                         % (raweq, rawget, key, self.n(_META_ROLE[key])))
         body.append("end")
-        for index, (table, name, call_it) in enumerate(SURFACES):
+        for index, (table, name, call_it) in enumerate(self.surfaces):
             body.append("if %s ~= %s then return false end"
                         % (self._read_surface(table, name, call_it),
                            self.n(f"surface:{index}")))
@@ -491,8 +503,9 @@ class Guard:
             "env_guard": self.env_level,
             "dump_guard": self.dump_level,
             "policy": self.policy,
+            "roblox_mode": self.surfaces == ROBLOX_SURFACES,
             "captured": list(self.bound),
-            "surfaces": [f"{t or 'env'}.{n}" for t, n, _ in SURFACES],
+            "surfaces": [f"{t or 'env'}.{n}" for t, n, _ in self.surfaces],
             "refuses": self.refuses,
             "neutralises": self.neutralises,
             # The emitted names, so a report or a verification pass can find the
@@ -519,7 +532,7 @@ class Guard:
             "reads" % (bound, plural),
             "                    locals, which no environment hook can see",
             "  surfaces checked: %d dump/debug slots and %d metatable slots"
-            " at load and at each VM entry" % (len(SURFACES), len(_META_KEYS)),
+            " at load and at each VM entry" % (len(self.surfaces), len(_META_KEYS)),
             "  neutralise      : "
             + ("yes" if self.neutralises else "no (level 1 observes only)"),
             "  refuse on trip  : " + refusal,
@@ -527,7 +540,8 @@ class Guard:
 
 
 def make(env_level: int = 0, dump_level: int = 0, policy: str = "fail",
-         prefix: str = "", capture: Optional[Mapping[str, str]] = None) -> Guard:
+         prefix: str = "", capture: Optional[Mapping[str, str]] = None,
+         roblox_mode: bool = True) -> Guard:
     """Build the guard for one build.
 
     ``prefix`` is the build's per-runtime name prefix, drawn from the same set the
@@ -543,8 +557,9 @@ def make(env_level: int = 0, dump_level: int = 0, policy: str = "fail",
         for index, name in enumerate(CAPTURED)
     }
     names.update({f"capture:{k}": v for k, v in (capture or {}).items()})
+    surfaces = ROBLOX_SURFACES if roblox_mode else GENERIC_SURFACES
     taken = set(names.values())
-    for index, role in enumerate(_ROLES + tuple(f"surface:{i}" for i in range(len(SURFACES)))):
+    for index, role in enumerate(_ROLES + tuple(f"surface:{i}" for i in range(len(surfaces)))):
         name = (prefix + _token(prefix, role, index + 97) if prefix
                 else "_" + _ALIAS[role])
         while name in taken:
@@ -553,7 +568,7 @@ def make(env_level: int = 0, dump_level: int = 0, policy: str = "fail",
         taken.add(name)
     return Guard(env_level=max(0, min(2, int(env_level))),
                  dump_level=max(0, min(2, int(dump_level))),
-                 policy=policy, names=names)
+                 policy=policy, names=names, surfaces=surfaces)
 
 
 def _token(prefix: str, role: str, salt: int) -> str:
@@ -599,5 +614,6 @@ def guard_block(guard: Guard) -> str:
     return "\n".join(lines) + "\n"
 
 
-__all__ = ["CAPTURED", "POLICIES", "REFUSAL", "SURFACES", "Guard",
-           "guard_block", "make", "mapping_for", "rewrite", "used_globals"]
+__all__ = ["CAPTURED", "POLICIES", "REFUSAL", "GENERIC_SURFACES",
+           "ROBLOX_SURFACES", "SURFACES", "Guard", "guard_block", "make",
+           "mapping_for", "rewrite", "used_globals"]

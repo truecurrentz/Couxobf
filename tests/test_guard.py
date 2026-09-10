@@ -170,6 +170,19 @@ def test_dump_guard_watches_luau_and_executor_dump_surfaces():
         assert literal in text
 
 
+def test_roblox_mode_controls_executor_surface_budget():
+    generic = guardmod.make(1, 1, roblox_mode=False)
+    roblox = guardmod.make(1, 1, roblox_mode=True)
+
+    assert len(generic.surfaces) < len(roblox.surfaces)
+    assert (None, "getgc", False) not in generic.surfaces
+    assert (None, "getgc", False) in roblox.surfaces
+    assert "getgc" not in guardmod.guard_block(generic)
+    assert "getgc" in guardmod.guard_block(roblox)
+    assert generic.summary()["roblox_mode"] is False
+    assert roblox.summary()["roblox_mode"] is True
+
+
 def test_guard_role_names_do_not_expose_fixed_suffixes_when_prefixed():
     one = guardmod.make(2, 2, prefix="_aa")
     two = guardmod.make(2, 2, prefix="_bb")
