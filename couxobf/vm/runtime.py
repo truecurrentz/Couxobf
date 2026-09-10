@@ -118,12 +118,13 @@ class OperandView:
         reg_names = REG_VARS.get(self.op, ())
         wide_names = WIDE_VARS.get(self.op, {})
         out: Dict[Tuple[Any, ...], str] = {}
-        seen_reg = 0
+        from .isa import FORMATS
+        reg_order = {pos: idx for idx, pos in enumerate(FORMATS[self.op].regs)}
         for key in self.fmt.fields(self.op):
             if key[0] == "r":
-                out[key] = (reg_names[seen_reg] if seen_reg < len(reg_names)
-                            else "r%d" % seen_reg)
-                seen_reg += 1
+                reg_index = reg_order.get(key[1], 0)
+                out[key] = (reg_names[reg_index] if reg_index < len(reg_names)
+                            else "r%d" % reg_index)
             else:
                 out[key] = wide_names.get(key[1], key[1])
         return out
@@ -586,22 +587,35 @@ def _local_ident(seed: int, tag: int) -> str:
     return "".join(chars)
 
 
+def _handler_line(line: str, ret_name: str) -> List[str]:
+    stripped = line.lstrip()
+    prefix = line[:len(line) - len(stripped)]
+    if stripped == "return":
+        return [f"{prefix}{ret_name} = _pack()", f"{prefix}return true"]
+    if stripped.startswith("return "):
+        return [f"{prefix}{ret_name} = _pack({stripped[7:]})", f"{prefix}return true"]
+    return [line]
+
+
 def _emit_handler_bank(lines: List[str], entries: Sequence[_Entry],
                        n: Dict[str, str], fam: Family, fmt: FormatSpec,
                        trace: Optional[List[Tuple[Tuple[int, ...], Tuple[str, ...]]]] = None
-                       ) -> Tuple[str, str, int]:
+                       ) -> Tuple[str, str, str, int]:
     seed = _dispatch_key_seed(entries, fmt)
     table_name = _local_ident(seed, 1)
     call_name = _local_ident(seed, 2)
+    ret_name = _local_ident(seed, 4)
     bucket_count = 2 << (seed & 1)  # two or four tables, build-specific.
     lines.append(f"  local {table_name} = {{}}")
+    lines.append(f"  local {ret_name} = nil")
     for bucket in range(1, bucket_count + 1):
         lines.append(f"  {table_name}[{bucket}] = {{}}")
     for idx, entry in enumerate(entries, 1):
         func_name = _local_ident(seed, 16 + idx)
         lines.append(f"  local function {func_name}()")
         for body_line in entry.body(n, fam, fmt):
-            lines.append(f"    {body_line}")
+            for emitted in _handler_line(body_line, ret_name):
+                lines.append(f"    {emitted}")
         lines.append("  end")
         for number in entry.numbers:
             key = _dispatch_key_number(number, seed, fmt)
@@ -609,7 +623,7 @@ def _emit_handler_bank(lines: List[str], entries: Sequence[_Entry],
             lines.append(f"  {table_name}[{bucket}][{key}] = {func_name}")
         if trace is not None:
             trace.append((tuple(entry.numbers), (_plain_cond(tuple(entry.numbers)),)))
-    return table_name, call_name, bucket_count
+    return table_name, call_name, ret_name, bucket_count
 
 
 def _emit_chain(lines: List[str], indent: str, entries: Sequence[_Entry],
@@ -682,13 +696,15 @@ def _emit_dispatch(lines: List[str], entries: Sequence[_Entry],
                    trace: Optional[List[Tuple[Tuple[int, ...],
                                               Tuple[str, ...]]]] = None,
                    table_name: str = "", call_name: str = "",
-                   bucket_count: int = 1
+                   ret_name: str = "", bucket_count: int = 1
                    ) -> None:
     seed = _dispatch_key_seed(entries, fmt)
     if not table_name:
         table_name = _local_ident(seed, 1)
     if not call_name:
         call_name = _local_ident(seed, 2)
+    if not ret_name:
+        ret_name = _local_ident(seed, 4)
     key_name = _local_ident(seed, 3)
     lines.append(f"    local {key_name} = {_dispatch_key_expr('op', seed, fmt)}")
     if bucket_count > 1:
@@ -696,7 +712,7 @@ def _emit_dispatch(lines: List[str], entries: Sequence[_Entry],
     else:
         lines.append(f"    local {call_name} = {table_name}[{key_name}]")
     lines.append(f"    if {call_name} == nil then error({_vm_fail(fmt, 1)}) end")
-    lines.append(f"    {call_name}()")
+    lines.append(f"    if {call_name}() then return _unpack({ret_name}, 1, {ret_name}.n) end")
 
 
 #: The interpreter's local that holds a prototype's control-flow edge table.
@@ -787,16 +803,18 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         "  local f = R[base]",
         "  if tail >= 0 then",
         "    local t = R[tail + 1]",
-        "    local args = {}",
-        "    for i = 1, argc do",
-        "      args[i] = R[base + i]",
+        "    if t ~= nil then",
+        "      local args = {}",
+        "      for i = 1, argc do",
+        "        args[i] = R[base + i]",
+        "      end",
+        "      local m = argc",
+        "      for i = 1, t.n do",
+        "        m += 1",
+        "        args[m] = t[i]",
+        "      end",
+        "      return f(_unpack(args, 1, m))",
         "    end",
-        "    local m = argc",
-        "    for i = 1, t.n do",
-        "      m += 1",
-        "      args[m] = t[i]",
-        "    end",
-        "    return f(_unpack(args, 1, m))",
         "  end",
         "  if argc == 0 then",
         "    return f()",
@@ -826,7 +844,7 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         f"  local pc = {entry_expr}",
     ] + ["  " + decl for decl in fam.state]
     entries = dispatch_entries(opmap, spec)
-    handler_table, handler_call, handler_buckets = _emit_handler_bank(lines, entries, n, fam, spec, trace)
+    handler_table, handler_call, handler_ret, handler_buckets = _emit_handler_bank(lines, entries, n, fam, spec, trace)
     lines += [
         "  while true do",
         # The selector comes from the generated reader, not from a `byte(code, pc)`
@@ -842,7 +860,7 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
     ]
 
     _emit_dispatch(lines, entries, n, fam, dispatcher,
-                   spec, trace, handler_table, handler_call, handler_buckets)
+                   spec, trace, handler_table, handler_call, handler_ret, handler_buckets)
     lines += [
         "  end",
         "end",

@@ -120,7 +120,7 @@ class ConstantPoolRuntime:
         meta_index = {name: i + 1 for i, (name, _data) in enumerate(meta_items)}
         meta_rows = ",".join(byte_expr(data, n["lit"]) for _name, data in meta_items)
         unwrap_name = n.get("unwrap", n["key"] + "u")
-        ticket_expr = 'string.unpack(">I4", %s, 1)' % byte_literal(ticket_mask.to_bytes(4, "big"))
+        ticket_expr = '(string.unpack(">I4", %s, 1))' % byte_literal(ticket_mask.to_bytes(4, "big"))
         deticket = (f"  i = bit32.bxor(i, {ticket_expr})\n" if ticket_mask else "")
         literal_helper = f"""local function {n['lit']}(parts)
   local out = table.create(#parts)

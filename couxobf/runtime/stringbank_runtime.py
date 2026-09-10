@@ -55,6 +55,18 @@ def default_names(prefix: str = "_kS") -> Dict[str, str]:
         "load": prefix + "d",
         "unmask": prefix + "e",
         "frag": prefix + "f",
+        "f_off": prefix + "A",
+        "f_len": prefix + "B",
+        "f_seed": prefix + "C",
+        "f_page": prefix + "D",
+        "f_stored": prefix + "E",
+        "f_inpage": prefix + "F",
+        "f_at": prefix + "G",
+        "f_ct": prefix + "H",
+        "f_block": prefix + "I",
+        "f_intra": prefix + "J",
+        "f_ks": prefix + "K",
+        "f_out": prefix + "L",
         "resolve": prefix + "p",
         "resolve_alt": prefix + "u",
         "resolve_alt2": prefix + "v",
@@ -98,7 +110,7 @@ class StringBankRuntime:
             return byte_literal(hashlib.sha256(sealed.ticket_key + sealed.ticket_nonce + sealed.ticket_tag + site).digest()[:8])
         trip = (f"  if not {guard_check}() then error({fail(b'guard')}) end\n"
                 if guard_check else "")
-        ticket_expr = 'string.unpack(">I4", %s, 1)' % byte_literal(ticket_mask.to_bytes(4, "big"))
+        ticket_expr = '(string.unpack(">I4", %s, 1))' % byte_literal(ticket_mask.to_bytes(4, "big"))
         deticket = (f"  ticket = bit32.bxor(ticket, {ticket_expr})\n"
                     if ticket_mask else "")
         meta_name = n.get("meta", n["tkey"] + "m")
@@ -193,15 +205,6 @@ local function {n['load']}()
     return
   end
   {n['loaded']} = true
-  -- Verified before anything is decrypted.  One MAC over the whole blob, so
-  -- per-string laziness is untouched; without it, editing a page would yield
-  -- garbage strings instead of an error.
-  --
-  -- Every failure path in this runtime raises the same neutral message.  A
-  -- message reading "failed authentication" tells an analyst both where the
-  -- check is and that the edit they just made was detected, and it is a stable
-  -- string to grep for.  "invalid state" is what an ordinary bad lookup says
-  -- too, so the two are not distinguishable from the outside.
   if {n['crypto']}.{n['c_mac']}({unwrap_name}({meta_name}[{meta_index['bkey']}], {n['blob']} .. {meta_name}[{meta_index['btag']}]), {n['blob']}) ~= {meta_name}[{meta_index['btag']}] then
     error({fail(b'blob')})
   end
@@ -211,7 +214,6 @@ local function {n['load']}()
   end
   {n['plain']} = p
   local tickets, pages = string.unpack(">I4I4", p, 1)
-  -- the page size is a constant here, so it is read back only to check it
   local psize = string.unpack(">I4", p, 9)
   if psize ~= {n['psize']} then
     error({fail(b'psize')})
@@ -221,7 +223,6 @@ local function {n['load']}()
     pm[i] = string.unpack(">I4", p, 13 + (i - 1) * 4) + 1
   end
   {n['perm']} = pm
-  -- index every ticket once, rather than walking the table on every read
   local q = 13 + pages * 4
   local ix = {{}}
   for i = 1, tickets do
@@ -244,23 +245,20 @@ local function {n['unmask']}(s, seed)
   end
   return table.concat(t)
 end
-local function {n['frag']}(off, len, seed)
-  -- 0-based logical offset in, 1-based string.sub indices out.  Written out
-  -- rather than folded together: an off-by-one here reads plausible bytes from
-  -- the wrong place instead of failing.
-  local page = off // {n['psize']}
-  local stored = {n['perm']}[page + 1]
-  local inpage = off - page * {n['psize']}
-  local at = (stored - 1) * {n['psize']} + inpage
-  local ct = string.sub({n['blob']}, at + 1, at + len)
-  local block = off // 64
-  local intra = off - block * 64
-  local ks = {n['crypto']}.{n['c_xor']}({unwrap_name}({meta_name}[{meta_index['skey']}], {n['blob']} .. {meta_name}[{meta_index['btag']}] .. {meta_name}[{meta_index['snonce']}]), {meta_name}[{meta_index['snonce']}], string.rep("\\0", intra + len), 1 + block)
-  local out = table.create(len)
-  for i = 1, len do
-    out[i] = string.char(bit32.bxor(string.byte(ct, i), string.byte(ks, intra + i)))
+local function {n['frag']}({n['f_off']}, {n['f_len']}, {n['f_seed']})
+  local {n['f_page']} = {n['f_off']} // {n['psize']}
+  local {n['f_stored']} = {n['perm']}[{n['f_page']} + 1]
+  local {n['f_inpage']} = {n['f_off']} - {n['f_page']} * {n['psize']}
+  local {n['f_at']} = ({n['f_stored']} - 1) * {n['psize']} + {n['f_inpage']}
+  local {n['f_ct']} = string.sub({n['blob']}, {n['f_at']} + 1, {n['f_at']} + {n['f_len']})
+  local {n['f_block']} = {n['f_off']} // 64
+  local {n['f_intra']} = {n['f_off']} - {n['f_block']} * 64
+  local {n['f_ks']} = {n['crypto']}.{n['c_xor']}({unwrap_name}({meta_name}[{meta_index['skey']}], {n['blob']} .. {meta_name}[{meta_index['btag']}] .. {meta_name}[{meta_index['snonce']}]), {meta_name}[{meta_index['snonce']}], string.rep("\\0", {n['f_intra']} + {n['f_len']}), 1 + {n['f_block']})
+  local {n['f_out']} = table.create({n['f_len']})
+  for i = 1, {n['f_len']} do
+    {n['f_out']}[i] = string.char(bit32.bxor(string.byte({n['f_ct']}, i), string.byte({n['f_ks']}, {n['f_intra']} + i)))
   end
-  return {n['unmask']}(table.concat(out), seed)
+  return {n['unmask']}(table.concat({n['f_out']}), {n['f_seed']})
 end
 local function {n['resolve']}(ticket)
   local p = {n['plain']}

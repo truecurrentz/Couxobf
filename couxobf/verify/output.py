@@ -74,6 +74,9 @@ class ValidationReport:
     compiled: bool = False
     ast_nodes: int = 0
     helper_counts: Dict[str, int] = field(default_factory=dict)
+    #: Whether the original/protected execution round-trip was run.
+    differential: bool = False
+    differential_reason: str = ""
     #: APIs present in the output that were not present in the input.
     added_apis: List[str] = field(default_factory=list)
     problems: List[str] = field(default_factory=list)

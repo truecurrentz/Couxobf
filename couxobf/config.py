@@ -223,7 +223,7 @@ class Config:
     #: infinities stay on the exact path because no arithmetic encoding is safe
     #: for them.
     numeric_protection_level: int = 1
-    constant_protection_level: int = 2
+    constant_protection_level: int = 1
     table_key_protection: bool = True
     cache_policy: CachePolicy = CachePolicy.NONE
     bounded_cache_size: int = 16
@@ -233,7 +233,7 @@ class Config:
 
     # ---- integrity -------------------------------------------------------
     integrity_level: IntegrityLevel = IntegrityLevel.TAG_AND_HASH
-    self_test: bool = True
+    self_test: bool = False
 
     # ---- output shaping --------------------------------------------------
     #: Dead-but-valid padding in the flattened dispatcher: 0 none, 1 a few
@@ -378,7 +378,7 @@ class Config:
             control_flow_level=3,
             string_protection_level=3,
             numeric_protection_level=2,
-            constant_protection_level=3,
+            constant_protection_level=1,
             chunking_level=3,
             junk_level=2,
             # One hardened VM, every format knob, aliases and indirect edges.

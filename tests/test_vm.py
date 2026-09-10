@@ -99,7 +99,7 @@ class _VMReconstructor(lower_back.Reconstructor):
             body=A.Block(body=[A.Return(values=[A.Call(
                 fn=A.Name(name=self.plan.enter_for(proto.proto_id)),
                 args=[A.Index(obj=A.Name(name=self.plan.rows_table),
-                              key=A.Number(value=proto.proto_id,
+                              key=A.Number(value=self.plan.row_key(proto.proto_id),
                                            is_float=False)),
                       A.Call(fn=A.Name(name=NAMES["getfenv"]),
                              args=[A.Number(value=1, is_float=False)]),

@@ -101,8 +101,8 @@ const SPEC = [
        "0 off, 1 encoded, 2/3 fragmented, ChaCha20 encrypted, HMAC-SHA256 checked, " +
        "lazy, ticketed and indirectly referenced through randomized string IDs."],
       ["constant_protection_level", "Constant pool", "select",
-       "Controls inner dynamic encodings inside the encrypted constant pool. At 2+ " +
-       "string constants in the pool are fragmented and reconstructed dynamically."],
+       "0 disables the pool, 1 uses the verified encrypted pool. Higher experimental " +
+       "modes are withheld until differential execution is clean across runtimes."],
       ["numeric_protection_level", "Numbers", "select",
        "Masks IEEE-754 double bytes inside the encrypted pool so number materializing " +
        "is generated dynamically while preserving exact Luau float semantics."],
@@ -844,7 +844,7 @@ const FALLBACK = {
   instruction_formats: { kind: "int", min: 0, max: 2, default: 1 },
   opcode_aliases: { kind: "int", min: 0, max: 4, default: 1 },
   string_protection_level: { kind: "int", min: 0, max: 3, default: 2 },
-  constant_protection_level: { kind: "int", min: 0, max: 3, default: 2 },
+  constant_protection_level: { kind: "int", min: 0, max: 1, default: 1 },
   numeric_protection_level: { kind: "int", min: 0, max: 2, default: 1 },
   table_key_protection: { kind: "bool", default: true },
   control_flow_level: { kind: "int", min: 0, max: 3, default: 2 },

@@ -68,7 +68,7 @@ FIELD_RANGES: Dict[str, Tuple[float, float]] = {
     "vm_variety": (1, 4),
     "control_flow_level": (0, 3),
     "string_protection_level": (0, 3),
-    "constant_protection_level": (0, 3),
+    "constant_protection_level": (0, 1),
     "numeric_protection_level": (0, 2),
     "chunking_level": (0, 3),
     "bounded_cache_size": (1, 4096),

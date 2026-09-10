@@ -46,7 +46,9 @@ from . import sema as _sema
 from .config import Config, DispatcherFamily, VirtualizationLevel, VMFamily
 from .crypto.kdf import KeyMaterial
 from .rng import make_domains
-from .verify.output import ValidationReport, validate_or_raise, validate_output
+from .verify.difftest import run_pair
+from .verify.output import (OutputValidationError, ValidationReport,
+                            validate_or_raise, validate_output)
 
 #: How many bytes of seed material a build uses.
 SEED_BYTES = 16
@@ -441,6 +443,17 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
                      or _lower_back.DEFAULT_HELPERS).values())
     validation = (validate_or_raise(out, source, toolchain, helpers) if verify
                   else validate_output(out, source, toolchain, helpers))
+    if verify and bool(getattr(config, "self_test", False)) and toolchain is not None \
+            and getattr(toolchain, "can_execute", False):
+        diff = run_pair(toolchain, source, out, timeout=30.0)
+        validation.differential = True
+        validation.differential_reason = diff.reason
+        if not diff.ok:
+            detail = diff.reason
+            if diff.details:
+                detail += ": " + repr(diff.details)[:500]
+            validation.problems.append("differential execution failed: " + detail)
+            raise OutputValidationError(validation.problems[-1])
 
     return BuildResult(source=out, seed=seed, config=config, stats=stats,
                        validation=validation, runtime_names=runtime_names)
