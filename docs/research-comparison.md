@@ -334,7 +334,7 @@ P3 = polish. Each item names the axes above.
 | R2 | Real opaque predicates + opaque dispatch arms (build-keyed, never foldable, never dead) | `opaque_predicates` is a tautology today; docs admit the gap | **P1 — done** (VM tap + native split arms) |
 | R3 | Regression automation: reuse-audit thresholds as a test; seeded differential fuzz battery | "detect and prevent regressions automatically" | **P0/P1** |
 | R4 | Dense blob encoding: per-build 85-alphabet encoder for pool/bank/payload literals | `\xHH` = 4 chars/byte; hello.luau at 739×; size ceiling forces dropping real protection | **P1 — done** |
-| R5 | Closure-capable virtualization (upvalues via shared cell tables; varargs via frame field) | our biggest coverage gap vs Prometheus/Clyde | **P2** |
+| R5 | Closure-capable virtualization (upvalues via shared cell tables; varargs via frame field) | our biggest coverage gap vs Prometheus/Clyde | **P2 — varargs done** |
 | R6 | Per-group constant pools with group-format AAD binding | one recovered accessor currently yields all constants | **P2** |
 | R7 | Exact integer arithmetic number encoding (split/add/fold) behind `numeric_protection_level=2` | numbers currently only get float-safe disguises | **P2 — done** |
 | R8 | `--!couxobf:` directives (`no_virtualize`, `virtualize`) | per-function user control, Luaq parity | **P2 — done** |
@@ -535,11 +535,31 @@ skip-threshold behaviour, and dense-vs-hex differential on a real example.
 *Default.* On, with the threshold escape above; `Config.blob_encoding =
 "dense" | "hex"` is wired through the API option surface and the web form.
 
-### R5 — Closure-capable virtualization (P2)
+### R5 — Closure-capable virtualization (P2 — varargs done)
 
 *Problem.* `can_virtualize` refuses any prototype with upvalues, varargs, or
 nested closures — i.e. most real Roblox code (callbacks, state objects).
 Prometheus and Clyde both cross this line.
+
+*As built (vararg increment).* The vararg refusal is gone. The entry point
+already packed every argument the caller sent; it now stashes that pack in
+the frame (one table write, the named-parameter count riding it as a field),
+and the VM grows a `VARARG` handler that is just a slice of the pack —
+`count < 0` packs every vararg into one register, exactly like CALL's
+MULTIRET, with which it shares the biased-count encoding. Nothing outside the
+call can observe the stash, which is precisely why varargs could cross the
+boundary while upvalues — visible to real Luau closures outside the call —
+still cannot. Coverage is measured in `tests/test_vm_varargs.py` (fixed reads
+and nil padding, splice into calls and returns, `table.pack(...).n` bit-exact
+including trailing nils, tail calls, multi-group, maximum profile, native↔VM
+callers). The one honesty note it surfaced is pre-existing and documented:
+`#` on a table with nil holes is undefined in Luau itself, and a table the VM
+fills sequentially can report a different length than one the native compiler
+builds with a size hint — the content is exact, the holey length is not
+pinned, and code that needs the true count should use `table.pack(...).n`.
+
+*Still to come (upvalues and nested closures).* Below is the design for the
+remaining two barriers.
 
 *Reference.* Prometheus' upvalue proxies; Clyde's `LOAD_UPVAL/STORE_UPVAL/
 CLOSE_UPVAL` with an `openUVs` table. We do it our way, at the IR level.

@@ -496,9 +496,11 @@ def _guard_report(guard: Dict[str, Any]) -> List[str]:
 def _select_for_vm(module, classification) -> Set[int]:
     """Prototypes the classifier picked that the encoder can actually take.
 
-    The classifier does not know the VM's constraints -- upvalues, varargs and
-    nested closures are out, because the VM frame is a table and anything a
-    real Luau closure must see cannot live in it.  Intersecting here means the
+    The classifier does not know the VM's constraints -- upvalues and nested
+    closures are out, because the VM frame is a table and anything a real
+    Luau closure must see cannot live in it.  Varargs crossed that line in R5
+    (the entry point stashes the caller's packed arguments in the frame, and
+    nothing outside the call can observe them).  Intersecting here means the
     reported count is the count that will really be virtualized, not the count
     the classifier wished for.
     """

@@ -204,7 +204,7 @@ def test_the_refusal_is_the_dispatchers_own_error():
     names = {k: "n_" + k for k in ("code", "exec", "enter", "call", "getfenv",
                                    "acc", "stack", "sp", "append", "iter",
                                    "iterpack", "itercheck", "pc", "regs", "consts",
-                                   "env", "edges")}
+                                   "env", "edges", "vpack", "vnp")}
     assert guardmod.REFUSAL not in vmruntime.interpreter_source(
         OpcodeMap.identity(), names)
 

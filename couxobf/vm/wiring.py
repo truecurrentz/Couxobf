@@ -207,7 +207,12 @@ _ROLES = ("code", "exec", "enter", "call", "getfenv", "acc", "stack", "sp",
           "ro", "r8", "rr", "rw", "rk", "rp", "rt",
           # Appended last so the draws before it do not move: the dispatch
           # key's payload-tap local, renamed like every other working name.
-          "pt")
+          "pt",
+          # R5: where the entry point stashes the caller's packed arguments so
+          # a VARARG instruction is a slice of them.  ``vpack`` is the frame
+          # key the pack travels under; ``vnp`` is the pack field that records
+          # how many of those arguments were named parameters.
+          "vpack", "vnp")
 
 
 def make_plan(rng: Rng, protos: Iterable[int],

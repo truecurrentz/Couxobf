@@ -144,9 +144,12 @@ def can_virtualize(proto: FuncIR, fmt: Optional[FormatSpec] = None
     """Whether this prototype can run in the VM, and why not if it cannot.
 
     The boundary is about *reachability*: the VM frame is an ordinary table, so
-    anything that must be visible to real Luau closures -- upvalues, varargs,
-    nested closures -- cannot live in it.  Refusing those is the honest option;
-    approximating them is how a VM ends up subtly wrong.
+    anything that must be visible to real Luau closures -- upvalues and the
+    closures that capture them -- cannot live in it.  Refusing those is the
+    honest option; approximating them is how a VM ends up subtly wrong.
+    Varargs crossed this line in R5: the entry point stashes the caller's
+    packed arguments in the frame, which is all a VARARG instruction ever
+    needed -- nothing outside the call can observe them.
 
     ``fmt`` adds the size constraints that belong to a *format*: a jump target
     has to fit in the field that carries it, and an absolute target has to fit
@@ -156,8 +159,6 @@ def can_virtualize(proto: FuncIR, fmt: Optional[FormatSpec] = None
     """
     if proto.proto_id == 0:
         return False, "main chunk bootstraps the runtime"
-    if proto.is_vararg:
-        return False, "varargs need the caller's frame"
     if proto.num_regs > MAX_REGISTERS:
         return False, f"{proto.num_regs} registers exceeds the VM's {MAX_REGISTERS}"
     if proto.children:
@@ -438,6 +439,9 @@ def _field_values(ins: Instr, op: str, fmt: FormatSpec, nconsts: int,
         values[("w", "argc")] = _wide(int(a[1]), op, "argc", limit)
         values[("w", "nres")] = _biased(int(a[2]), op, "nres", limit)
         values[("w", "tail")] = _biased(int(a[3]), op, "tail", limit)
+    elif op == OP.VARARG:
+        values[("r", 0)] = r(0)
+        values[("w", "count")] = _biased(int(a[1]), op, "count", limit)
     elif op == OP.TAILCALL:
         values[("r", 0)] = r(0)
         values[("w", "argc")] = _wide(int(a[1]), op, "argc", limit)

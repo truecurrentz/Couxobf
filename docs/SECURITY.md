@@ -289,6 +289,20 @@ and numeric-for coercion through `tonumber`. Every one of those is a place a
 more aggressive transformation would be wrong. Correctness is not negotiable
 here, which caps how far obfuscation can go.
 
+**`#` on a table with nil holes is reproduced in content, not in length.**
+When a multi-value result -- a call return, a vararg list (R5) -- is appended
+into a table, the VM copies all `n` values including trailing nils, so every
+*element* is present and correctly placed. But `#t` on a table containing nil
+holes is undefined in Luau itself: the result depends on the internal
+array/hash split, which depends on how the table was built. The native
+compiler builds `{ ... }` with a size hint; the VM fills the table
+sequentially. For a holey table the two can report different lengths. This is
+undefined-behaviour territory the language itself does not pin down (the same
+source rebuilt with different allocation could move it), and it predates R5 --
+the call-return path has always had it. Code that needs the true count of a
+possibly-holey pack should use `table.pack(...).n`, which is exact and which
+the VM reproduces bit-for-bit.
+
 ## Verification
 
 Every claim above is checked by execution, not asserted:

@@ -50,6 +50,7 @@ REG_VARS: Dict[str, Tuple[str, ...]] = {
     OP.LE: ("a", "x", "y"), OP.GT: ("a", "x", "y"), OP.GE: ("a", "x", "y"),
     OP.UNM: ("a", "x"), OP.NOT: ("a", "x"), OP.LEN: ("a", "x"),
     OP.CALL: ("base",),
+    OP.VARARG: ("base",),
     OP.TAILCALL: ("base",),
     OP.RETURN: ("base",),
     OP.RETURN0: (),
@@ -275,6 +276,30 @@ def _body(op: str, fam: Family, n: Dict[str, str], fmt: FormatSpec,
             "  for i = 1, nres do",
         ] + ["    " + line for line in fam.store("R[base + i - 1]", "res[i]")] + \
             ["  end", "end"]
+    if op == OP.VARARG:
+        # count arrives biased like nres, so -1 ("every vararg, packed") is 0
+        # on the wire and `< 0` here after the bias is removed.  The pack the
+        # entry point stashed holds every argument the caller sent; the named
+        # parameters are its first slots, so the varargs start just past the
+        # count it recorded.  Reading past `.n` yields nil, which is exactly
+        # what a short vararg list must produce.
+        va = "R." + n["vpack"]
+        np = "va." + n["vnp"]
+        return [
+            "local va = " + va,
+            "if count < 0 then",
+            "  local t = {}",
+            "  local m = 0",
+            "  for i = " + np + " + 1, va.n do",
+            "    m += 1",
+            "    t[m] = va[i]",
+            "  end",
+            "  t.n = m",
+            "  R[base] = t",
+            "else",
+            "  for i = 1, count do",
+        ] + ["    " + line for line in fam.store("R[base + i - 1]", "va[" + np + " + i]")] + \
+            ["  end", "end"]
     if op == OP.TAILCALL:
         return ["return " + n["call"] + "(R, base, argc, tail)"]
     if op == OP.RETURN:
@@ -370,11 +395,12 @@ def _body(op: str, fam: Family, n: Dict[str, str], fmt: FormatSpec,
 
 
 def _fix_bias(op: str, fmt: FormatSpec, view: OperandView) -> List[str]:
-    """Adjust the two operands that are biased rather than raw.
+    """Adjust the operands that are biased rather than raw.
 
-    ``nres`` and ``tail`` carry ``+1`` so that ``-1`` ("absent") survives a
-    field that cannot go negative; ``tail`` additionally names a register slot,
-    which only matters because the register file is one-based.
+    ``nres``, ``tail`` and VARARG's ``count`` carry ``+1`` so that ``-1``
+    ("absent" / "all of them") survives a field that cannot go negative;
+    ``tail`` additionally names a register slot, which only matters because
+    the register file is one-based.
     """
     out: List[str] = []
     if op == OP.CALL:
@@ -382,6 +408,8 @@ def _fix_bias(op: str, fmt: FormatSpec, view: OperandView) -> List[str]:
         out.append("tail = tail - 1")
     elif op == OP.TAILCALL:
         out.append("tail = tail - 1")
+    elif op == OP.VARARG:
+        out.append("count = count - 1")
     return out
 
 
@@ -977,6 +1005,13 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         "  for i = 1, %s do" % nparams_expr,
         "    R[i] = args[i]",
         "  end",
+        # R5: the vararg tail rides the frame.  A VARARG instruction is then a
+        # slice of this pack -- nothing outside the call can observe it, which
+        # is why varargs could join the VM while upvalues still cannot.  The
+        # named-parameter count travels as a field of the pack itself, because
+        # `args` is fresh per call and nothing that reads it looks past `.n`.
+        "  args.%s = %s" % (n["vnp"], nparams_expr),
+        "  R.%s = args" % n["vpack"],
         f"  return {n['exec']}(p, R, E, _ec)",
         "end",
     ]

@@ -35,6 +35,9 @@ NAMES = {
     "append": "_kapp", "iter": "_kiter", "iterpack": "_kiterpack",
     "itercheck": "_kitercheck", "pc": "_kPc", "regs": "_kR",
     "consts": "_kK", "env": "_kE", "edges": "_kEG",
+    # R5: the frame key holding the caller's packed arguments and the pack
+    # field recording the named-parameter count
+    "vpack": "_kVp", "vnp": "_kVn",
 }
 
 #: The layouts worth crossing with the shapes: the historical one, a padded
@@ -277,14 +280,22 @@ def test_a_tapped_build_executes_like_its_source():
 
     def forced(rng, prefs=None, **kw):
         spec = orig_draw(rng, prefs, **kw)
-        if spec.key_taps or spec.header.legacy:
+        if spec.key_taps:
             return spec
-        _p, filler_at, _t = spec.header._map()
+        header = spec.header
+        if header.legacy:
+            # A legacy header carries no filler byte, and this test is about
+            # the tap's wiring, not which header the stream happens to draw.
+            # Swap the same fields in as a non-legacy layout so a filler slot
+            # -- and therefore a tap -- can exist.
+            header = HeaderLayout(fields=header.fields, filler=header.filler,
+                                  entry_bias=header.entry_bias, legacy=False)
+        _p, filler_at, _t = header._map()
         if not filler_at:
-            spec = replace(spec, header=replace(spec.header,
-                                                filler=((1, 0x5A),)))
-            _p, filler_at, _t = spec.header._map()
-        return replace(spec, key_taps=(sorted(filler_at)[0],))
+            header = replace(header, filler=((1, 0x5A),))
+            _p, filler_at, _t = header._map()
+        return replace(spec, header=header,
+                       key_taps=(sorted(filler_at)[0],))
 
     from couxobf.config import Config
     from couxobf.pipeline import build

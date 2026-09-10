@@ -66,6 +66,10 @@ NAMES = {
     "iter": "_kiter",
     "iterpack": "_kiterpack",
     "itercheck": "_kitercheck",
+    # R5: frame key the entry point stashes the caller's argument pack under,
+    # and the pack field recording the named-parameter count
+    "vpack": "_kVp",
+    "vnp": "_kVn",
 }
 
 
