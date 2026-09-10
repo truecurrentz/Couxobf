@@ -145,18 +145,14 @@ const SPEC = [
        "own library lookups become chunk locals, so an __index logger does not see " +
        "them at all."],
       ["dump_guard", "Anti dump", "select",
-       "Checks Luau and executor-style dump/introspection surfaces -- debug.info, " +
-       "debug.getconstants/protos/upvalues, string.dump, getgc, hookfunction, " +
-       "getbytecode/saveinstance -- and, at 2, refuses before plaintext access."],
+       "Checks portable Luau dump/introspection surfaces such as debug.info, " +
+       "debug.getinfo, debug.traceback, debug.gethook and string.dump, then " +
+       "refuses before plaintext access at level 2."],
       ["guard_policy", "When a guard fires", "select",
        "`fail` refuses the same way a corrupt payload does, so the trip is not a " +
        "message that names the check. `ignore` keeps running, which is how you " +
        "measure the checks on a machine that legitimately has a hooked " +
        "environment."],
-      ["roblox_mode", "Roblox/executor surface", "bool",
-       "Watch Roblox and executor dump APIs such as getgc, hookfunction, " +
-       "getscriptbytecode and saveinstance. Turn off only for a smaller generic " +
-       "Luau artifact."],
     ],
   },
   {
@@ -861,7 +857,6 @@ const FALLBACK = {
   branch_inversion: { kind: "bool", default: true },
   env_guard: { kind: "int", min: 0, max: 2, default: 1 },
   dump_guard: { kind: "int", min: 0, max: 2, default: 1 },
-  roblox_mode: { kind: "bool", default: true },
   decoy_constants: { kind: "int", min: 0, max: 256, default: 12 },
   bounded_cache_size: { kind: "int", min: 1, max: 4096, default: 16 },
   max_vm_functions: { kind: "int", min: 0, max: 4096, default: 64 },

@@ -270,11 +270,6 @@ class Config:
     guard_policy: str = "fail"
 
     # ---- environment -----------------------------------------------------
-    #: Compile-check the emitted runtime against the Roblox API surface, and use
-    #: only globals Roblox actually provides.  It does not make the build run
-    #: Roblox code -- there is no runtime here to run it against, and pretending
-    #: otherwise would be the fake verification the design rules out.
-    roblox_mode: bool = True
     debug_build: bool = False
 
     # ---- source handling -------------------------------------------------
@@ -469,7 +464,6 @@ class Config:
         "env_guard",
         "dump_guard",
         "guard_policy",
-        "roblox_mode",
         "hash_comments",
         "fingerprint",
         "minify",

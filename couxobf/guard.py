@@ -30,20 +30,12 @@ so that a runner which replaced those functions to intercept the artifact's own
 decryption is detected, and the artifact can react before it hands plaintext to
 the thing doing the reading.
 
-**Neutralise, at the intrusive level only.**  When the platform exposes
-``getrawmetatable``/``setreadonly`` (Roblox does, the reference interpreter does
-not) and a logging metatable is present, level 2 clears its ``__index`` and
-``__newindex`` under ``pcall``, and clears a script hook the same way.  That
-mutates shared state: a framework which installed the metatable for its own
-reasons loses it.  Hence the numbering -- 1 observes, 2 acts -- and level 2 not
-being the default.
-
-``guard_policy`` decides what a detected violation costs the artifact.  ``fail``
-raises the same generic error a corrupt payload raises, which is worth something
-precisely because a dumper cannot tell the two apart.  ``ignore`` keeps running
-after neutralising, which is the setting for measuring whether a given runner
-trips a check at all -- and it is why the check is never dead code: its result
-always drives the neutralisation, and only the refusal is conditional.
+**Refuse, never fight the executor.**  Level 2 does not mutate metatables,
+clear hooks, or call executor-only APIs.  This project is free for everyone, so
+the guard should not punish a user's chosen runner.  ``guard_policy`` decides
+what a detected violation costs the artifact: ``fail`` raises the same generic
+error a corrupt payload raises, while ``ignore`` keeps running so the checks can
+be measured on a machine that legitimately has a hooked environment.
 
 The emitted text is generated from this build's name set, so none of it can be
 found by grepping for a marker string.
@@ -68,13 +60,13 @@ CAPTURED: Tuple[str, ...] = (
 )
 
 #: Dump and inspection surfaces the guard watches, as ``(table, field, call_it)``.
-#: A ``None`` table means "look it up on the environment", which is where the
-#: Roblox/executor-only dump functions live.  Either half may be absent on a
-#: given platform, and absence is not a violation.
-GENERIC_SURFACES: Tuple[Tuple[Optional[str], str, bool], ...] = (
-    # These exist in ordinary Lua/Luau-like hosts often enough to be worth
-    # checking without assuming an executor API.  ``debug.gethook`` is called
-    # because the interesting value is the current hook, not the function object.
+#: Only ordinary Lua/Luau surfaces are watched.  Executor-specific globals are
+#: intentionally excluded: this obfuscator is meant to run for everyone, and it
+#: should not punish the environment the user chooses to execute in.
+SURFACES: Tuple[Tuple[Optional[str], str, bool], ...] = (
+    # ``debug.gethook`` is called because the interesting value is the current
+    # hook, not the function object.  Each lookup is nil-safe; absence is normal
+    # on sandboxed Luau and is not a violation.
     ("string", "dump", False),
     ("debug", "info", False),
     ("debug", "getinfo", False),
@@ -83,44 +75,9 @@ GENERIC_SURFACES: Tuple[Tuple[Optional[str], str, bool], ...] = (
     ("debug", "sethook", False),
 )
 
-ROBLOX_SURFACES: Tuple[Tuple[Optional[str], str, bool], ...] = GENERIC_SURFACES + (
-    # Luau itself removes bytecode dumping in the sandbox, but exploit/testing
-    # hosts commonly add these names back.  Snapshot both the official-ish debug
-    # entry points and the executor-style global dump helpers so a mid-run swap
-    # is observable before the VM hands over plaintext payload rows.
-    ("debug", "getstack", False),
-    ("debug", "getlocals", False),
-    ("debug", "getlocal", False),
-    ("debug", "getupvalues", False),
-    ("debug", "getupvalue", False),
-    ("debug", "getconstants", False),
-    ("debug", "getconstant", False),
-    ("debug", "getproto", False),
-    ("debug", "getprotos", False),
-    ("debug", "getregistry", False),
-    ("debug", "setconstant", False),
-    ("debug", "setupvalue", False),
-    ("debug", "setstack", False),
-    ("debug", "setproto", False),
-    (None, "getbytecode", False),
-    (None, "getscriptbytecode", False),
-    (None, "getgc", False),
-    (None, "getreg", False),
-    (None, "hookfunction", False),
-    (None, "replaceclosure", False),
-    (None, "clonefunction", False),
-    (None, "islclosure", False),
-    (None, "getconnections", False),
-    (None, "saveinstance", False),
-)
-
-#: Backwards-compatible name: Roblox mode is the default protection target.
-SURFACES = ROBLOX_SURFACES
-
 #: Metatable fields that matter for logging/proxying.  ``__index`` and
-#: ``__newindex`` are the classic environment logger; ``__namecall`` and
-#: ``__metatable`` catch Roblox/executor proxy tricks without assuming those
-#: fields exist on the reference interpreter.
+#: ``__newindex`` are the classic environment logger; the others catch proxy
+#: state without using executor-only APIs or mutating the table.
 _META_KEYS: Tuple[str, ...] = ("__index", "__newindex", "__namecall",
                               "__metatable", "__mode", "__call")
 
@@ -298,8 +255,7 @@ class Guard:
     #: ``index``, ``write``, ``check``, ``flag``) and one ``surface:<i>`` per
     #: watched surface.
     names: Dict[str, str] = field(default_factory=dict)
-    #: Dump/debug surfaces this build watches.  Roblox mode uses the executor
-    #: superset; generic mode keeps the smaller portable set.
+    #: Dump/debug surfaces this build watches.
     surfaces: Tuple[Tuple[Optional[str], str, bool], ...] = SURFACES
     #: The library names this build actually binds, after :meth:`bind` has seen
     #: the scaffolding.  Empty until then, which is also what an inactive capture
@@ -314,13 +270,17 @@ class Guard:
 
     @property
     def neutralises(self) -> bool:
-        """Level 2 on either axis: clear what the check found, not just flag it."""
-        return self.active and (self.env_level >= 2 or self.dump_level >= 2)
+        """Whether this build mutates the host to clear hooks/proxies.
+
+        Always false by design: Couxobf may refuse when a protected runtime is
+        being inspected, but it does not alter executor or framework state.
+        """
+        return False
 
     @property
     def refuses(self) -> bool:
         """Refuse to run on a violation: level 2 plus the failing policy."""
-        return self.neutralises and self.policy == "fail"
+        return self.active and (self.env_level >= 2 or self.dump_level >= 2) and self.policy == "fail"
 
     def n(self, role: str) -> str:
         try:
@@ -451,35 +411,8 @@ class Guard:
         return lines
 
     def neutralise_lines(self) -> List[str]:
-        """Clear a logging metatable and a script hook, where the platform allows.
-
-        Every action is under ``pcall``: ``getrawmetatable`` and ``setreadonly`` are
-        Roblox extensions, and on the reference interpreter calling a nil is an
-        error that would take the script down over a check that was supposed to be
-        optional.  The hook is cleared through whatever ``debug.sethook`` the
-        environment has, which on Roblox is itself protected -- so if it throws, the
-        pcall swallows it and the guard's flag still reflects what was seen.
-        """
-        rawget, pcall, env = self.cap("rawget"), self.cap("pcall"), self.n("env")
-        debug = self.cap("debug")
-        return [
-            f"local raw = ({rawget})({env}, \"getrawmetatable\")",
-            f"local lock = ({rawget})({env}, \"setreadonly\")",
-            f"local unhook = ({debug}) and ({debug}).sethook",
-            "if raw and lock then",
-            f"  ({pcall})(function()",
-            f"    local m = raw({env})",
-            "    if m then",
-            "      lock(m, false)",
-            "      %s(m, \"__index\", nil)" % self.cap("rawset"),
-            "      %s(m, \"__newindex\", nil)" % self.cap("rawset"),
-            "      %s(m, \"__namecall\", nil)" % self.cap("rawset"),
-            "      lock(m, true)",
-            "    end",
-            "  end)",
-            "end",
-            f"if unhook then ({pcall})(unhook, nil) end",
-        ]
+        """No host mutation is emitted.  Kept for callers/tests of old guards."""
+        return []
 
     def entry_lines(self) -> List[str]:
         """The per-call check, at the top of each VM entry point.
@@ -503,7 +436,6 @@ class Guard:
             "env_guard": self.env_level,
             "dump_guard": self.dump_level,
             "policy": self.policy,
-            "roblox_mode": self.surfaces == ROBLOX_SURFACES,
             "captured": list(self.bound),
             "surfaces": [f"{t or 'env'}.{n}" for t, n, _ in self.surfaces],
             "refuses": self.refuses,
@@ -534,14 +466,13 @@ class Guard:
             "  surfaces checked: %d dump/debug slots and %d metatable slots"
             " at load and at each VM entry" % (len(self.surfaces), len(_META_KEYS)),
             "  neutralise      : "
-            + ("yes" if self.neutralises else "no (level 1 observes only)"),
+            + "no (host state is never mutated)",
             "  refuse on trip  : " + refusal,
         ]
 
 
 def make(env_level: int = 0, dump_level: int = 0, policy: str = "fail",
-         prefix: str = "", capture: Optional[Mapping[str, str]] = None,
-         roblox_mode: bool = True) -> Guard:
+         prefix: str = "", capture: Optional[Mapping[str, str]] = None) -> Guard:
     """Build the guard for one build.
 
     ``prefix`` is the build's per-runtime name prefix, drawn from the same set the
@@ -557,9 +488,8 @@ def make(env_level: int = 0, dump_level: int = 0, policy: str = "fail",
         for index, name in enumerate(CAPTURED)
     }
     names.update({f"capture:{k}": v for k, v in (capture or {}).items()})
-    surfaces = ROBLOX_SURFACES if roblox_mode else GENERIC_SURFACES
     taken = set(names.values())
-    for index, role in enumerate(_ROLES + tuple(f"surface:{i}" for i in range(len(surfaces)))):
+    for index, role in enumerate(_ROLES + tuple(f"surface:{i}" for i in range(len(SURFACES)))):
         name = (prefix + _token(prefix, role, index + 97) if prefix
                 else "_" + _ALIAS[role])
         while name in taken:
@@ -568,7 +498,7 @@ def make(env_level: int = 0, dump_level: int = 0, policy: str = "fail",
         taken.add(name)
     return Guard(env_level=max(0, min(2, int(env_level))),
                  dump_level=max(0, min(2, int(dump_level))),
-                 policy=policy, names=names, surfaces=surfaces)
+                 policy=policy, names=names)
 
 
 def _token(prefix: str, role: str, salt: int) -> str:
@@ -614,6 +544,5 @@ def guard_block(guard: Guard) -> str:
     return "\n".join(lines) + "\n"
 
 
-__all__ = ["CAPTURED", "POLICIES", "REFUSAL", "GENERIC_SURFACES",
-           "ROBLOX_SURFACES", "SURFACES", "Guard", "guard_block", "make",
-           "mapping_for", "rewrite", "used_globals"]
+__all__ = ["CAPTURED", "POLICIES", "REFUSAL", "SURFACES", "Guard",
+           "guard_block", "make", "mapping_for", "rewrite", "used_globals"]

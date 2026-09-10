@@ -138,18 +138,18 @@ def test_guards_off_emit_nothing_at_all():
 
 
 @pytest.mark.parametrize("level", (1, 2))
-def test_level_one_observes_and_level_two_acts(level):
+def test_level_one_observes_and_level_two_refuses_without_executor_mutation(level):
     guard = guardmod.make(level, level)
     assert guard.active
-    assert guard.neutralises == (level >= 2)
+    assert guard.neutralises is False
     assert guard.refuses == (level >= 2)
+    text = "\n".join(guardmod.guard_block(guard).splitlines())
+    assert "getrawmetatable" not in text
+    assert "setreadonly" not in text
     if level == 1:
         assert guard.entry_lines() == []
-        text = "\n".join(guardmod.guard_block(guard).splitlines())
-        assert "getrawmetatable" not in text, "level 1 must not mutate anything"
     else:
         assert guard.entry_lines()
-        assert "getrawmetatable" in guardmod.guard_block(guard)
 
 
 def test_levels_are_clamped_and_a_bad_policy_is_refused():
@@ -159,28 +159,23 @@ def test_levels_are_clamped_and_a_bad_policy_is_refused():
         guardmod.make(1, 1, policy="shrug")
 
 
-def test_dump_guard_watches_luau_and_executor_dump_surfaces():
+def test_dump_guard_watches_portable_luau_surfaces_only():
     watched = set(guardmod.SURFACES)
-    for probe in (("debug", "info", False), ("debug", "getconstants", False),
-                  ("debug", "getproto", False), (None, "hookfunction", False),
-                  (None, "getgc", False), (None, "saveinstance", False)):
+    for probe in (("debug", "info", False), ("debug", "getinfo", False),
+                  ("debug", "traceback", False), ("debug", "gethook", True),
+                  ("string", "dump", False)):
         assert probe in watched
+    for executor_probe in (("debug", "getconstants", False),
+                           ("debug", "getproto", False),
+                           (None, "hookfunction", False),
+                           (None, "getgc", False),
+                           (None, "saveinstance", False)):
+        assert executor_probe not in watched
     text = guardmod.guard_block(guardmod.make(2, 2))
-    for literal in ("debug", "getconstants", "hookfunction", "getgc", "__namecall"):
+    for literal in ("getconstants", "hookfunction", "getgc", "saveinstance"):
+        assert literal not in text
+    for literal in ("debug", "getinfo", "traceback", "__namecall"):
         assert literal in text
-
-
-def test_roblox_mode_controls_executor_surface_budget():
-    generic = guardmod.make(1, 1, roblox_mode=False)
-    roblox = guardmod.make(1, 1, roblox_mode=True)
-
-    assert len(generic.surfaces) < len(roblox.surfaces)
-    assert (None, "getgc", False) not in generic.surfaces
-    assert (None, "getgc", False) in roblox.surfaces
-    assert "getgc" not in guardmod.guard_block(generic)
-    assert "getgc" in guardmod.guard_block(roblox)
-    assert generic.summary()["roblox_mode"] is False
-    assert roblox.summary()["roblox_mode"] is True
 
 
 def test_guard_role_names_do_not_expose_fixed_suffixes_when_prefixed():

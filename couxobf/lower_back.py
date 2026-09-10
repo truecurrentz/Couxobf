@@ -877,7 +877,6 @@ def reconstruct_protected(module: IRModule,
                           env_guard: int = 0,
                           dump_guard: int = 0,
                           guard_policy: str = "fail",
-                          roblox_mode: bool = True,
                           names_out: Optional[Dict[str, Any]] = None) -> str:
     """Lower an IR module to protected, self-contained Luau source.
 
@@ -906,8 +905,7 @@ def reconstruct_protected(module: IRModule,
     # it refuses on.
     from . import guard as _guard
     guard = _guard.make(env_guard, dump_guard, guard_policy,
-                        prefix=fresh_prefix(rng, prefixes),
-                        roblox_mode=bool(roblox_mode))
+                        prefix=fresh_prefix(rng, prefixes))
     names = names or default_names(fresh_prefix(rng, prefixes))
     # Drawn from the same `used` set as the pool and bank prefixes, so a helper
     # name cannot collide with either runtime's identifiers.

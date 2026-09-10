@@ -142,7 +142,7 @@ is unbreakable.
 | 57 | Test method calls and `NAMECALL` | 🔶 | `SELF` semantics mirrored from `lower_back`. | (shared) |
 | 58 | Test coroutine / yield behaviour | ⬜ | **Zero tests.** `coroutine` appears in the codebase only as an entry in the globals whitelist in `sema.py`. Not VM-supported, not tested. | 0 |
 | 59 | Test `nil`, `false`, `0`, `NaN`, infinities, int/float edges | 🔶 | Fold rules are careful (no folding of CONCAT/LEN/comparisons, `bool` excluded, `-0.0` not merged into `0.0`), but only one named edge-case test. | 1 |
-| 60 | Test Roblox APIs without executing untrusted source | ⬜ | `roblox_mode` is inert. Compile-only validation is in place, which is the part that matters for safety. | — |
+| 60 | Executor-specific guard APIs | — | Deliberately not emitted. The project is free for everyone, so guards stay on portable Luau dump/debug surfaces and do not call executor-only APIs. | — |
 
 ## 8. Measurement and self-attack
 
