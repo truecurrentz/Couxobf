@@ -84,6 +84,7 @@ class Stats:
     """What each pass did -- reported so a build can be checked for sanity."""
 
     folded: int = 0
+    copy_rewrites: int = 0
     dead_removed: int = 0
     unreachable_removed: int = 0
     nops_removed: int = 0
@@ -97,6 +98,18 @@ class Stats:
     @property
     def total_removed(self) -> int:
         return self.dead_removed + self.unreachable_removed + self.nops_removed
+
+
+#: Instructions whose register uses are explicit operands rather than implicit
+#: contiguous ranges.  Copy propagation is deliberately limited to these because
+#: CALL, RETURN, loop control and SETLIST encode base-register layouts as part of
+#: their semantics.
+_COPY_PROP_SAFE = frozenset({
+    OP.MOV, OP.ADD, OP.SUB, OP.MUL, OP.DIV, OP.IDIV, OP.MOD, OP.POW,
+    OP.UNM, OP.NOT, OP.LEN, OP.CONCAT,
+    OP.EQ, OP.NE, OP.LT, OP.LE, OP.GT, OP.GE,
+    OP.GETTABLE, OP.SETTABLE,
+})
 
 
 def _is_number(value: Any) -> bool:
@@ -220,6 +233,77 @@ def fold_constants(proto: FuncIR, stats: Stats) -> int:
 
 def _idx(operand: Any) -> Optional[int]:
     return operand.index if isinstance(operand, Reg) else None
+
+
+def _resolve_alias(alias: Dict[int, int], reg: int) -> int:
+    seen = set()
+    cur = reg
+    while cur in alias and cur not in seen:
+        seen.add(cur)
+        cur = alias[cur]
+    return cur
+
+
+def _rewrite_arg(arg: Any, alias: Dict[int, int]) -> Tuple[Any, bool]:
+    if not isinstance(arg, Reg):
+        return arg, False
+    resolved = _resolve_alias(alias, arg.index)
+    if resolved == arg.index:
+        return arg, False
+    return Reg(resolved), True
+
+
+def propagate_register_copies(proto: FuncIR, stats: Stats) -> int:
+    """Forward copy propagation inside each basic block.
+
+    This is an anti-bloat pass rather than a clever deobfuscation trick: many
+    source-level and lowering transformations introduce temporary ``MOV`` chains.
+    Rewriting later arithmetic/table uses to the original register lets constant
+    folding and dead-store removal clean them up.  The pass is intra-block and
+    skips instructions whose operands describe implicit register ranges, so it
+    cannot disturb Luau call/return or loop-frame layouts.
+    """
+    escaped = _escaped_registers(proto)
+    rewrites = 0
+    for block in proto.blocks:
+        alias: Dict[int, int] = {}
+        for ins in block.instrs:
+            op = ins.op
+            defs, _uses = def_use(ins)
+            if op in _COPY_PROP_SAFE:
+                args = list(ins.args)
+                start = 0 if op == OP.SETTABLE else 1
+                for i in range(start, len(args)):
+                    new, changed = _rewrite_arg(args[i], alias)
+                    if changed:
+                        args[i] = new
+                        rewrites += 1
+                        stats.record(proto.proto_id, copy_rewrites=1)
+                ins.args = tuple(args)
+                defs, _uses = def_use(ins)
+
+            # Any write kills aliases for that destination and aliases that read
+            # that destination.  Captured registers are never made aliases: a
+            # closure must keep observing the real upvalue cell.
+            for d in defs:
+                alias.pop(d, None)
+            if defs:
+                alias = {dst: src for dst, src in alias.items()
+                         if src not in defs}
+
+            if op == OP.MOV and len(ins.args) == 2:
+                dst, src = ins.args
+                if isinstance(dst, Reg) and isinstance(src, Reg) and dst.index not in escaped:
+                    resolved = _resolve_alias(alias, src.index)
+                    if resolved != dst.index:
+                        alias[dst.index] = resolved
+
+            # Conservatively forget aliases across instructions that can call
+            # arbitrary Luau or write register ranges.
+            if op not in _COPY_PROP_SAFE and op not in (OP.LOADK, OP.GETGLOBAL, OP.GETUPVAL, OP.NOP):
+                alias.clear()
+    stats.copy_rewrites += rewrites
+    return rewrites
 
 
 def _escaped_registers(proto: FuncIR) -> Set[int]:
@@ -365,16 +449,17 @@ def optimize_proto(proto: FuncIR, stats: Optional[Stats] = None,
     """
     stats = stats if stats is not None else Stats()
     for _ in range(max(1, passes)):
-        before = (stats.folded, stats.dead_removed, stats.unreachable_removed,
-                  stats.nops_removed)
+        before = (stats.folded, stats.copy_rewrites, stats.dead_removed,
+                  stats.unreachable_removed, stats.nops_removed)
         remove_unreachable_blocks(proto, stats)
         remove_nops(proto, stats)
+        propagate_register_copies(proto, stats)
         compute_liveness(proto)
         fold_constants(proto, stats)
         compute_liveness(proto)
         eliminate_dead_stores(proto, stats)
-        after = (stats.folded, stats.dead_removed, stats.unreachable_removed,
-                 stats.nops_removed)
+        after = (stats.folded, stats.copy_rewrites, stats.dead_removed,
+                 stats.unreachable_removed, stats.nops_removed)
         if after == before:
             break
     compute_liveness(proto)

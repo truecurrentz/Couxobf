@@ -90,6 +90,28 @@ def test_folded_value_is_verified_by_execution():
     assert run("print(10 % 3, -7 // 2, 2 ^ 10, 7.5 // 2)\n") == "1\t-4\t1024\t3\n"
 
 
+def test_copy_propagation_exposes_folds_and_removes_move_chains():
+    proto = main("local a=1\nlocal b=a\nreturn b+a\n")
+    stats = optimize.optimize_proto(proto)
+    assert stats.copy_rewrites >= 1
+    assert stats.folded >= 1
+    assert stats.dead_removed >= 1
+    assert OP.MOV not in ops(proto)
+    assert any(ins.op == OP.LOADK and proto.consts[ins.args[1].index] == 2.0
+               for ins in instrs(proto))
+
+
+@pytest.mark.skipif(not TOOLCHAIN.can_execute, reason="luau runtime unavailable")
+def test_copy_propagation_preserves_calls_and_multivalue_layouts():
+    assert_same('''
+local function pair() return 3, 4 end
+local function take(a, b, c) return a .. b .. c end
+local x = pair()
+local y = x
+print(take("v", y, select(2, pair())))
+''')
+
+
 @pytest.mark.parametrize("expr", [
     "1 / 0",       # inf in Luau; ZeroDivisionError in Python
     "0 / 0",       # NaN
@@ -155,7 +177,9 @@ def test_folding_is_idempotent():
     s1 = optimize.optimize_proto(once, passes=2)
     s2 = optimize.optimize_proto(twice, passes=2)
     s3 = optimize.optimize_proto(twice, passes=2)
-    assert s3.folded == s2.folded, "a second run must find nothing new"
+    assert (s3.folded, s3.copy_rewrites, s3.dead_removed,
+            s3.unreachable_removed, s3.nops_removed) == (0, 0, 0, 0, 0), (
+        "a second run must find nothing new")
 
 
 # ---------------------------------------------------------------------------
@@ -171,10 +195,10 @@ def test_dead_store_is_removed():
 
 
 def test_live_store_is_kept():
-    proto = main("local a = 1\nreturn a + 1\n")
+    proto = main('local a = "1"\nreturn a + 1\n')
     optimize.optimize_proto(proto)
     values = [proto.consts[i.args[1].index] for i in instrs(proto) if i.op == OP.LOADK]
-    assert 1 in values
+    assert b"1" in values
 
 
 def test_calls_are_never_removed_even_when_unused():
