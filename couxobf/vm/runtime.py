@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..ir import OP
-from .families import Family, _register, family as _family, substitute
+from .families import Family, family as _family, substitute
 from .format import FormatSpec, FusionRule, LEGACY_SPEC, reader_source
 from .isa import (FUSED_PREFIX, REGISTER_IN_WIDE, OP_GETTABLEK, OP_SETTABLEK,
                    OpcodeMap)
@@ -388,7 +388,7 @@ def _handler(op: str, n: Dict[str, str], fam: Optional[Family] = None,
     local names.
     """
     if fam is None:
-        fam = _register()
+        fam = _family("woven", n)
     spec = fmt if fmt is not None else LEGACY_SPEC
     v = view if view is not None else OperandView(spec, op)
     advance = spec.body_size(op)

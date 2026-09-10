@@ -216,7 +216,7 @@ def test_reads_precede_the_pc_advance():
             # advancing, but those never look at the code string, so keying on
             # the code-string reference (rather than on `pc = `) is what makes
             # this catch a misordered read.
-            if seen_advance and NAMES["code"] in line:
+            if seen_advance and re.search(r"\b%s\b" % re.escape(NAMES["code"]), line):
                 offenders.append(op)
     assert not offenders, f"these handlers read operands after advancing: {offenders}"
 
