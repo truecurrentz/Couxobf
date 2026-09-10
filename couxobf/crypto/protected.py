@@ -31,9 +31,10 @@ import hashlib
 import hmac as _hmac
 import os
 import struct
-from typing import Tuple
+from typing import Optional, Tuple
 
 from .chacha20 import chacha20_xor
+from .cipher import CipherSpec
 
 NONCE_BYTES = 12
 TAG_BYTES = 32  # HMAC-SHA256
@@ -80,9 +81,24 @@ def compute_tag(key: bytes, nonce: bytes, ciphertext: bytes, aad: bytes,
     return _hmac.new(mac_key(key, nonce, aad, mac_domain), covered, hashlib.sha256).digest()
 
 
+def _stream_xor(cipher: Optional[CipherSpec], key: bytes, nonce: bytes,
+                data: bytes, counter: int) -> bytes:
+    """Keystream XOR through whichever core this payload was sealed with.
+
+    ``None`` means the historical ChaCha20 form, which is what every saved key
+    and every existing test outside :mod:`couxobf.crypto.cipher` uses; passing
+    a spec is how a build that drew AES-128 seals a payload the Luau side can
+    open.
+    """
+    if cipher is None:
+        return chacha20_xor(key, nonce, data, counter)
+    return cipher.xor_bytes(key, nonce, data, counter)
+
+
 def seal(key: bytes, plaintext: bytes, aad: bytes = b"",
          nonce: bytes = None, enc_domain: bytes = ENC_DOMAIN,
-         mac_domain: bytes = MAC_DOMAIN) -> Tuple[bytes, bytes, bytes]:
+         mac_domain: bytes = MAC_DOMAIN,
+         cipher: Optional[CipherSpec] = None) -> Tuple[bytes, bytes, bytes]:
     """Return ``(nonce, ciphertext, tag)``."""
     if len(key) != KEY_BYTES:
         raise ValueError("payload key must be 32 bytes")
@@ -90,35 +106,41 @@ def seal(key: bytes, plaintext: bytes, aad: bytes = b"",
         nonce = os.urandom(NONCE_BYTES)
     if len(nonce) != NONCE_BYTES:
         raise ValueError("nonce must be 12 bytes")
-    ct = chacha20_xor(enc_key(key, nonce, aad, enc_domain), nonce, plaintext, counter=1)
+    ct = _stream_xor(cipher, enc_key(key, nonce, aad, enc_domain), nonce,
+                     plaintext, 1)
     return nonce, ct, compute_tag(key, nonce, ct, aad, mac_domain)
 
 
 def open_(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes,
           aad: bytes = b"", enc_domain: bytes = ENC_DOMAIN,
-          mac_domain: bytes = MAC_DOMAIN) -> bytes:
+          mac_domain: bytes = MAC_DOMAIN,
+          cipher: Optional[CipherSpec] = None) -> bytes:
     """Verify then decrypt.  Raises ``ValueError`` on any mismatch."""
     expected = compute_tag(key, nonce, ciphertext, aad, mac_domain)
     if not _hmac.compare_digest(expected, tag):
         raise ValueError("authentication tag mismatch")
-    return chacha20_xor(enc_key(key, nonce, aad, enc_domain), nonce, ciphertext, counter=1)
+    return _stream_xor(cipher, enc_key(key, nonce, aad, enc_domain), nonce,
+                       ciphertext, 1)
 
 
 def sealed_blob(key: bytes, plaintext: bytes, aad: bytes = b"",
                 enc_domain: bytes = ENC_DOMAIN,
-                mac_domain: bytes = MAC_DOMAIN) -> bytes:
+                mac_domain: bytes = MAC_DOMAIN,
+                cipher: Optional[CipherSpec] = None) -> bytes:
     """Wire format: ``nonce || tag || ciphertext``."""
     nonce, ct, tag = seal(key, plaintext, aad, enc_domain=enc_domain,
-                          mac_domain=mac_domain)
+                          mac_domain=mac_domain, cipher=cipher)
     return nonce + tag + ct
 
 
 def open_blob(key: bytes, blob: bytes, aad: bytes = b"",
               enc_domain: bytes = ENC_DOMAIN,
-              mac_domain: bytes = MAC_DOMAIN) -> bytes:
+              mac_domain: bytes = MAC_DOMAIN,
+              cipher: Optional[CipherSpec] = None) -> bytes:
     if len(blob) < NONCE_BYTES + TAG_BYTES:
         raise ValueError("sealed blob too short")
     nonce = blob[:NONCE_BYTES]
     tag = blob[NONCE_BYTES : NONCE_BYTES + TAG_BYTES]
     return open_(key, nonce, blob[NONCE_BYTES + TAG_BYTES :], tag, aad,
-                 enc_domain=enc_domain, mac_domain=mac_domain)
+                 enc_domain=enc_domain, mac_domain=mac_domain,
+                 cipher=cipher)

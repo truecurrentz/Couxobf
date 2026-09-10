@@ -93,7 +93,12 @@ def byte_expr(data: bytes, helper: str, dense: Any = None) -> str:
 
 
 class ConstantPoolRuntime:
-    """Emits the decoder and remembers the accessor name to call."""
+    """Emits the decoder and remembers the accessor name to call.
+
+    ``cipher`` and ``shape_rng`` are the build's drawn crypto core and the
+    stream the module's shape is drawn from; both come from the pipeline so a
+    build's report can describe what it emitted.
+    """
 
     def __init__(self, names: Dict[str, str], cache_policy: str = "full",
                  cache_bound: int = 64) -> None:
@@ -114,7 +119,9 @@ class ConstantPoolRuntime:
              ticket_mask: int = 0,
              enc_domain: bytes = None,
              mac_domain: bytes = None,
-             dense: Any = None) -> str:
+             dense: Any = None,
+             cipher: Any = None,
+             shape_rng: Any = None) -> str:
         n = self.n
         ticket_mask &= 0xffffffff
         mask_mul, mask_add, mask_shift = mask_params(key + nonce + aad)
@@ -155,6 +162,7 @@ end
             {"xor": n["c_xor"], "sha": n["c_sha"], "mac": n["c_mac"],
              "open": n["c_open"], "seal": n["c_seal"]},
             enc_domain=enc_domain, mac_domain=mac_domain,
+            cipher=cipher, rng=shape_rng,
         )
 
         if self.cache_policy == "none":
