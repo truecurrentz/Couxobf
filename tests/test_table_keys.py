@@ -39,13 +39,34 @@ print(t.secretToken)
     assert all(piece != b"secretToken" for piece in key_pieces)
 
 
+def test_table_key_protection_splits_method_names_without_self_opcode():
+    src = """
+local t = {}
+function t:secretMethod(x)
+  return x + 1
+end
+print(t:secretMethod(4))
+"""
+    protected = _lower(src, True).main
+    plain = _lower(src, False).main
+
+    assert b"secretMethod" in plain.consts
+    assert b"secretMethod" not in protected.consts
+    assert any(ins.op == OP.CONCAT for block in protected.blocks for ins in block.instrs)
+    assert any(ins.op == OP.GETTABLE for block in protected.blocks for ins in block.instrs)
+    assert not any(ins.op == OP.SELF for block in protected.blocks for ins in block.instrs)
+
+
 @pytest.mark.skipif(not TOOLCHAIN.can_execute, reason="luau runtime unavailable")
 @pytest.mark.parametrize("enabled", (False, True))
 def test_table_key_protection_preserves_property_semantics(enabled):
     src = """
 local t = {secretToken = 40, other = 2}
+function t:secretMethod(x)
+  return self.secretToken + x
+end
 t.secretToken += t.other
-print(t.secretToken)
+print(t.secretToken, t:secretMethod(3))
 """
     out = build(src, Config(reproducible_seed=9,
                             virtualization_level="none",

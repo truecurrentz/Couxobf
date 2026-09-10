@@ -695,8 +695,23 @@ class Lowerer:
         if isinstance(e, A.MethodCall):
             obj = fb.new_reg()
             self._expr(fb, e.obj, obj)
-            key = fb.proto.add_const(e.method.encode("utf-8", "surrogatepass"))
-            fb.emit(OP.SELF, base, obj, key, line=line, origin=e)
+            raw_method = e.method.encode("utf-8", "surrogatepass")
+            if self.table_key_protection and len(raw_method) >= 2:
+                # `obj:method(a)` is `obj[method](obj, a)`, with `obj`
+                # evaluated once and before the arguments.  Building the key in
+                # registers lets table-key protection cover method names too;
+                # otherwise SELF would keep the whole name as a constant-wide
+                # operand for the VM/runtime to expose as one vocabulary item.
+                key = self._table_key_operand(fb, e.method, line)
+                if not isinstance(key, Reg):  # pragma: no cover - length guard
+                    kreg = fb.new_reg()
+                    fb.emit(OP.LOADK, kreg, key, line=line)
+                    key = kreg
+                fb.emit(OP.GETTABLE, base, obj, key, line=line, origin=e)
+                fb.emit(OP.MOV, base + 1, obj, line=line, origin=e)
+            else:
+                key = fb.proto.add_const(raw_method)
+                fb.emit(OP.SELF, base, obj, key, line=line, origin=e)
             argstart = 2
         else:
             self._expr(fb, e.fn, base)
