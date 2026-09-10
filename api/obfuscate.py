@@ -102,13 +102,11 @@ FIELD_CHOICES: Dict[str, Tuple[str, ...]] = {
 FIELD_REQUIRES: Dict[str, Dict[str, Any]] = {
     "bounded_cache_size": {"field": "cache_policy", "op": "==", "value": "bounded"},
     "decoy_constants": {"field": "decoys", "op": "==", "value": True},
-    "super_instructions": {"field": "instruction_fusion", "op": "==", "value": True},
     "opcode_aliases": {"field": "opcode_randomization", "op": "==", "value": True},
     "vm_variety": {"field": "vm_polymorphism", "op": "==", "value": True},
     "instruction_formats": {"field": "operand_randomization", "op": "==", "value": True},
     "operand_randomization": {"field": "virtualization_level", "op": "!=", "value": "none"},
     "register_randomization": {"field": "virtualization_level", "op": "!=", "value": "none"},
-    "instruction_fusion": {"field": "virtualization_level", "op": "!=", "value": "none"},
     "pc_protection": {"field": "virtualization_level", "op": "!=", "value": "none"},
     "edge_indirection": {"field": "virtualization_level", "op": "!=", "value": "none"},
     "opcode_cipher": {"field": "virtualization_level", "op": "!=", "value": "none"},
@@ -128,7 +126,7 @@ _ENUM_FIELDS: Dict[str, Any] = {
 #: Implemented compatibility fields that remain available to config files/CLI but
 #: are deliberately not exposed by the web/API surface; `vm_polymorphism` is the
 #: single public best-mode switch now.
-_HIDDEN_SURFACE_FIELDS = {"vm_family", "dispatcher_family"}
+_HIDDEN_SURFACE_FIELDS = {"vm_family", "dispatcher_family", "instruction_fusion", "super_instructions"}
 
 
 def _plain(value: Any) -> Any:

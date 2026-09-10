@@ -263,6 +263,18 @@ def test_runtime_accepts_build_specific_ticket_images():
     assert result.stdout.strip() == "true"
 
 
+def test_string_bank_key_material_is_not_emitted_as_adjacent_named_locals():
+    bank = make_bank(randomized_ids=True)
+    bank.ticket(b"alpha")
+    sealed = bank.seal()
+    names = default_names()
+    src = emit(sealed, names)
+    assert "local %s =" % names["meta"] in src
+    for key in ("tkey", "tnonce", "ttag", "tct", "skey", "snonce", "bkey", "btag"):
+        assert "local %s =" % names[key] not in src
+
+
+
 def test_reconstructed_string_calls_do_not_expose_raw_bank_tickets():
     runtime_names = {}
     out = _protected('local function f() return "left" .. "right" end\nprint(f())\n',

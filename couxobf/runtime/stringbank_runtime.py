@@ -23,7 +23,7 @@ from __future__ import annotations
 import hashlib
 from typing import Dict
 
-from .constpool_runtime import byte_literal
+from .constpool_runtime import byte_literal, _xor_bytes
 
 
 def default_names(prefix: str = "_kS") -> Dict[str, str]:
@@ -45,6 +45,8 @@ def default_names(prefix: str = "_kS") -> Dict[str, str]:
         "snonce": prefix + "7",
         "bkey": prefix + "q",
         "btag": prefix + "r",
+        "meta": prefix + "w",
+        "unwrap": prefix + "x",
         "plain": prefix + "8",
         "perm": prefix + "9",
         "index": prefix + "a",
@@ -99,6 +101,24 @@ class StringBankRuntime:
         ticket_expr = 'string.unpack(">I4", %s, 1)' % byte_literal(ticket_mask.to_bytes(4, "big"))
         deticket = (f"  ticket = bit32.bxor(ticket, {ticket_expr})\n"
                     if ticket_mask else "")
+        meta_name = n.get("meta", n["tkey"] + "m")
+        unwrap_name = n.get("unwrap", n["tkey"] + "u")
+        ticket_aad_expr = byte_literal(sealed.ticket_aad)
+        tkey_material = sealed.ticket_ct + sealed.ticket_tag + sealed.ticket_nonce + sealed.ticket_aad
+        skey_material = sealed.blob + sealed.blob_tag + sealed.stream_nonce
+        bkey_material = sealed.blob + sealed.blob_tag
+        meta_items = [
+            ("tkey", _xor_bytes(sealed.ticket_key, hashlib.sha256(tkey_material).digest())),
+            ("tnonce", sealed.ticket_nonce), ("ttag", sealed.ticket_tag),
+            ("tct", sealed.ticket_ct),
+            ("skey", _xor_bytes(sealed.key, hashlib.sha256(skey_material).digest())),
+            ("snonce", sealed.stream_nonce),
+            ("bkey", _xor_bytes(sealed.blob_key, hashlib.sha256(bkey_material).digest())),
+            ("btag", sealed.blob_tag),
+        ]
+        meta_items.sort(key=lambda item: hashlib.sha256(sealed.ticket_tag + item[0].encode()).digest())
+        meta_index = {name: i + 1 for i, (name, _data) in enumerate(meta_items)}
+        meta_rows = ",".join(byte_literal(data) for _name, data in meta_items)
         if self.emit_crypto:
             if not crypto_src:
                 from .luau_crypto import crypto_runtime
@@ -154,14 +174,15 @@ class StringBankRuntime:
             )
 
         return f"""{head}local {n['blob']} = {byte_literal(sealed.blob)}
-local {n['tkey']} = {byte_literal(sealed.ticket_key)}
-local {n['tnonce']} = {byte_literal(sealed.ticket_nonce)}
-local {n['ttag']} = {byte_literal(sealed.ticket_tag)}
-local {n['tct']} = {byte_literal(sealed.ticket_ct)}
-local {n['skey']} = {byte_literal(sealed.key)}
-local {n['snonce']} = {byte_literal(sealed.stream_nonce)}
-local {n['bkey']} = {byte_literal(sealed.blob_key)}
-local {n['btag']} = {byte_literal(sealed.blob_tag)}
+local {meta_name} = {{{meta_rows}}}
+local function {unwrap_name}(v, m)
+  local h = {n['crypto']}.{n['c_sha']}(m)
+  local t = table.create(#v)
+  for i = 1, #v do
+    t[i] = string.char(bit32.bxor(string.byte(v, i), string.byte(h, ((i - 1) % #h) + 1)))
+  end
+  return table.concat(t)
+end
 local {n['plain']} = nil
 local {n['perm']} = nil
 local {n['index']} = nil
@@ -181,10 +202,10 @@ local function {n['load']}()
   -- check is and that the edit they just made was detected, and it is a stable
   -- string to grep for.  "invalid state" is what an ordinary bad lookup says
   -- too, so the two are not distinguishable from the outside.
-  if {n['crypto']}.{n['c_mac']}({n['bkey']}, {n['blob']}) ~= {n['btag']} then
+  if {n['crypto']}.{n['c_mac']}({unwrap_name}({meta_name}[{meta_index['bkey']}], {n['blob']} .. {meta_name}[{meta_index['btag']}]), {n['blob']}) ~= {meta_name}[{meta_index['btag']}] then
     error({fail(b'blob')})
   end
-  local p = {n['crypto']}.{n['c_open']}({n['tkey']}, {n['tnonce']}, {n['tct']}, {n['ttag']}, {byte_literal(sealed.ticket_aad)})
+  local p = {n['crypto']}.{n['c_open']}({unwrap_name}({meta_name}[{meta_index['tkey']}], {meta_name}[{meta_index['tct']}] .. {meta_name}[{meta_index['ttag']}] .. {meta_name}[{meta_index['tnonce']}] .. {ticket_aad_expr}), {meta_name}[{meta_index['tnonce']}], {meta_name}[{meta_index['tct']}], {meta_name}[{meta_index['ttag']}], {ticket_aad_expr})
   if p == nil then
     error({fail(b'open')})
   end
@@ -234,7 +255,7 @@ local function {n['frag']}(off, len, seed)
   local ct = string.sub({n['blob']}, at + 1, at + len)
   local block = off // 64
   local intra = off - block * 64
-  local ks = {n['crypto']}.{n['c_xor']}({n['skey']}, {n['snonce']}, string.rep("\\0", intra + len), 1 + block)
+  local ks = {n['crypto']}.{n['c_xor']}({unwrap_name}({meta_name}[{meta_index['skey']}], {n['blob']} .. {meta_name}[{meta_index['btag']}] .. {meta_name}[{meta_index['snonce']}]), {meta_name}[{meta_index['snonce']}], string.rep("\\0", intra + len), 1 + block)
   local out = table.create(len)
   for i = 1, len do
     out[i] = string.char(bit32.bxor(string.byte(ct, i), string.byte(ks, intra + i)))

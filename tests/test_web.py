@@ -24,7 +24,7 @@ from obfuscate import MAX_INPUT_BYTES, handle  # noqa: E402
 from couxobf.toolchain import execute, find_toolchain  # noqa: E402
 
 TOOLCHAIN = find_toolchain()
-HIDDEN_VM_SURFACE = {"vm_family", "dispatcher_family"}
+HIDDEN_VM_SURFACE = {"vm_family", "dispatcher_family", "instruction_fusion", "super_instructions"}
 
 INVENTORY = (os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "examples", "inventory.luau"))

@@ -167,9 +167,12 @@ class Config:
     #: this does.
     register_randomization: bool = True
     #: Fuse independent instruction pairs into super-instructions (#6).
-    instruction_fusion: bool = True
+    #: Disabled by default: distinctive fused semantics can be easier to match
+    #: than smaller primitive handlers.  The option remains for compatibility.
+    instruction_fusion: bool = False
     #: Offer fused pairs as distinct opcodes, growing the handler set.
-    super_instructions: bool = True
+    #: Disabled by default for the same reason as instruction_fusion.
+    super_instructions: bool = False
     handler_splitting: bool = True
     dispatcher_family: DispatcherFamily = DispatcherFamily.MIXED
     #: When several VMs are emitted, give each one a different dispatch shape
@@ -378,10 +381,12 @@ class Config:
             constant_protection_level=3,
             chunking_level=3,
             junk_level=2,
-            # Two VMs, every format knob, fused super-ops, indirect edges.  The
-            # price is stated in the report rather than hidden: roughly one
-            # extra interpreter.
+            # One hardened VM, every format knob, aliases and indirect edges.
+            # Fused super-ops are intentionally not enabled by default: they make
+            # highly distinctive semantic signatures for a static matcher.
             vm_polymorphism=True,
+            instruction_fusion=False,
+            super_instructions=False,
             vm_variety=3,
             instruction_formats=2,
             opcode_aliases=2,

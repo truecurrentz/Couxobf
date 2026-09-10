@@ -76,10 +76,6 @@ const SPEC = [
        "How many numbers can reach one instruction: 0 one number per opcode, 1 " +
        "some opcodes get a second alias, 2 widens both the alias set and the " +
        "numbering space."],
-      ["instruction_fusion", "Fuse pairs", "bool",
-       "Fuse independent instruction pairs into super-instructions."],
-      ["super_instructions", "Super-instructions", "bool",
-       "Offer fused pairs as distinct opcodes, growing the handler set."],
       ["register_randomization", "Register numbering", "bool",
        "Register fields are widened and masked. A full permutation is not " +
        "implemented: FORLOOP, CALL and SETLIST address base+1..+3."],

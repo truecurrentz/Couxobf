@@ -589,11 +589,14 @@ def _local_ident(seed: int, tag: int) -> str:
 def _emit_handler_bank(lines: List[str], entries: Sequence[_Entry],
                        n: Dict[str, str], fam: Family, fmt: FormatSpec,
                        trace: Optional[List[Tuple[Tuple[int, ...], Tuple[str, ...]]]] = None
-                       ) -> Tuple[str, str]:
+                       ) -> Tuple[str, str, int]:
     seed = _dispatch_key_seed(entries, fmt)
     table_name = _local_ident(seed, 1)
     call_name = _local_ident(seed, 2)
+    bucket_count = 2 << (seed & 1)  # two or four tables, build-specific.
     lines.append(f"  local {table_name} = {{}}")
+    for bucket in range(1, bucket_count + 1):
+        lines.append(f"  {table_name}[{bucket}] = {{}}")
     for idx, entry in enumerate(entries, 1):
         func_name = _local_ident(seed, 16 + idx)
         lines.append(f"  local function {func_name}()")
@@ -601,10 +604,12 @@ def _emit_handler_bank(lines: List[str], entries: Sequence[_Entry],
             lines.append(f"    {body_line}")
         lines.append("  end")
         for number in entry.numbers:
-            lines.append(f"  {table_name}[{_dispatch_key_number(number, seed, fmt)}] = {func_name}")
+            key = _dispatch_key_number(number, seed, fmt)
+            bucket = ((key + (seed & 0xff)) % bucket_count) + 1
+            lines.append(f"  {table_name}[{bucket}][{key}] = {func_name}")
         if trace is not None:
             trace.append((tuple(entry.numbers), (_plain_cond(tuple(entry.numbers)),)))
-    return table_name, call_name
+    return table_name, call_name, bucket_count
 
 
 def _emit_chain(lines: List[str], indent: str, entries: Sequence[_Entry],
@@ -676,14 +681,20 @@ def _emit_dispatch(lines: List[str], entries: Sequence[_Entry],
                    fmt: FormatSpec,
                    trace: Optional[List[Tuple[Tuple[int, ...],
                                               Tuple[str, ...]]]] = None,
-                   table_name: str = "", call_name: str = ""
+                   table_name: str = "", call_name: str = "",
+                   bucket_count: int = 1
                    ) -> None:
     seed = _dispatch_key_seed(entries, fmt)
     if not table_name:
         table_name = _local_ident(seed, 1)
     if not call_name:
         call_name = _local_ident(seed, 2)
-    lines.append(f"    local {call_name} = {table_name}[{_dispatch_key_expr('op', seed, fmt)}]")
+    key_name = _local_ident(seed, 3)
+    lines.append(f"    local {key_name} = {_dispatch_key_expr('op', seed, fmt)}")
+    if bucket_count > 1:
+        lines.append(f"    local {call_name} = {table_name}[(({key_name} + {seed & 0xff}) % {bucket_count}) + 1][{key_name}]")
+    else:
+        lines.append(f"    local {call_name} = {table_name}[{key_name}]")
     lines.append(f"    if {call_name} == nil then error({_vm_fail(fmt, 1)}) end")
     lines.append(f"    {call_name}()")
 
@@ -815,7 +826,7 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         f"  local pc = {entry_expr}",
     ] + ["  " + decl for decl in fam.state]
     entries = dispatch_entries(opmap, spec)
-    handler_table, handler_call = _emit_handler_bank(lines, entries, n, fam, spec, trace)
+    handler_table, handler_call, handler_buckets = _emit_handler_bank(lines, entries, n, fam, spec, trace)
     lines += [
         "  while true do",
         # The selector comes from the generated reader, not from a `byte(code, pc)`
@@ -831,7 +842,7 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
     ]
 
     _emit_dispatch(lines, entries, n, fam, dispatcher,
-                   spec, trace, handler_table, handler_call)
+                   spec, trace, handler_table, handler_call, handler_buckets)
     lines += [
         "  end",
         "end",
