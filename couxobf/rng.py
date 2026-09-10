@@ -231,6 +231,7 @@ DOMAINS = (
     "decoys",  # decoy blocks / constants / handlers
     "emission",  # statement ordering inside generated blocks
     "pc",  # program-counter / epoch encoding
+    "index-to-num",  # R9 table-key -> numeric-handle bijection
 )
 
 

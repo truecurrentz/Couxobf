@@ -173,6 +173,22 @@ actually broken rather than merely bypassable. Confidentiality, integrity and
 obfuscation are kept separate: the tag detects tampering, the cipher hides
 bytes, and neither one obscures program structure.
 
+### Index-to-number table keys (implemented, R9, opt-in)
+
+The pool hides key *strings*, but breaking the pool once yields the shape of
+every record. `index_to_num` (CLI `--index-to-num`, off by default) goes a
+step further for tables it can prove safe: it rewrites the keys to per-build
+numeric handles *before lowering*, so the key strings never enter the pool at
+all. The safety rule is a strict whitelist -- the table must be a plain local
+bound once to a literal-string-key constructor, never reassigned, never captured
+as an upvalue, and used only as `t.name` or `t["literal"]`. Any value-flow
+(passing, returning, aliasing, dynamic indexing, method call, operator operand)
+declines the table, and a table can opt out with
+`--!couxobf:no_index_to_num` above its declaration. Runtime cost is zero
+(numeric indexing is marginally faster); a corpus-wide run rewrote 0 tables and
+declined 7, with every build still verifying, which is the point of a
+whitelist: it is allowed to do nothing, it is never allowed to change behaviour.
+
 ### Per-build variation (implemented)
 
 Key material, nonces, and name assignments derive from a 128-bit build seed

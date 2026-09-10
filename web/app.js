@@ -109,6 +109,10 @@ const SPEC = [
       ["table_key_protection", "Table keys", "bool",
        "Assemble syntactic property names from protected fragments so field access " +
        "does not expose a stable GETTABLEK/SETTABLEK key vocabulary."],
+      ["index_to_num", "Table keys to numbers", "bool",
+       "Rewrite the keys of provably-static local tables to per-build numeric " +
+       "handles, so the key strings never enter the constant pool at all. " +
+       "Opt-in whitelist; a table can bow out with --!couxobf:no_index_to_num above it."],
       ["cache_policy", "Decoded-string cache", "select",
        "How much plaintext sits in the heap: `none` re-materialises on every read, " +
        "`full` keeps everything, `bounded` keeps a rolling window."],
@@ -854,6 +858,7 @@ const FALLBACK = {
   constant_protection_level: { kind: "int", min: 0, max: 1, default: 1 },
   numeric_protection_level: { kind: "int", min: 0, max: 2, default: 1 },
   table_key_protection: { kind: "bool", default: true },
+  index_to_num: { kind: "bool", default: false },
   control_flow_level: { kind: "int", min: 0, max: 3, default: 2 },
   branch_inversion: { kind: "bool", default: true },
   env_guard: { kind: "int", min: 0, max: 2, default: 1 },

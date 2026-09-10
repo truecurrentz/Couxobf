@@ -338,12 +338,12 @@ P3 = polish. Each item names the axes above.
 | R6 | Per-group constant pools with group-format AAD binding | one recovered accessor currently yields all constants | **P2** |
 | R7 | Exact integer arithmetic number encoding (split/add/fold) behind `numeric_protection_level=2` | numbers currently only get float-safe disguises | **P2 — done** |
 | R8 | `--!couxobf:` directives (`no_virtualize`, `virtualize`) | per-function user control, Luaq parity | **P2 — done** |
-| R9 | Index-to-number pass for provably-static table keys (opt-in) | structural transform at zero runtime cost | **P3** |
+| R9 | Index-to-number pass for provably-static table keys (opt-in) | structural transform at zero runtime cost | **P3 — done** |
 | R10 | Inline-small-helpers AST pass (opt-in, node cap) | glue-code reduction, Luaq parity | **P3** |
 | R11 | Dispatcher speed option: inlined-chain dispatch for small groups | 2 closure calls/instruction is slow | **P2 — done** |
 | R12 | Remove dead config surface; every remaining field either wired or gone (see G) | 15 pending fields erode trust in the report | **P1 — done** |
 
-Status: R0, R1, R2, R3, R4, R7, R8, R11 and R12 are implemented and measured
+Status: R0, R1, R2, R3, R4, R7, R8, R9, R11 and R12 are implemented and measured
 (see `docs/benchmarks.md`); the fuzz battery is in
 `tests/test_fuzz_differential.py`, and the reuse-audit's verdict is pinned
 as a regression test in `tests/test_reuse_regression.py`.  Everything else
@@ -646,21 +646,38 @@ contents — the scanner is string-aware, and the build re-parses the prepared
 source anyway. Tests: `tests/test_directives.py`.
 *Default.* On (directives are read whenever present; no config needed).
 
-### R9 — Index-to-number (P3)
+### R9 — Index-to-number (P3 — done)
 
-*Problem.* Table keys are protected by interning, but plain-table shape is
-still readable where tables are constructed and consumed locally.
+*Problem.* Table keys are protected by interning, but the key strings still
+ride the encrypted constant pool: break the pool once and the shape of every
+local record comes with it.
 
 *Reference.* Luaq `LUAQ_INDEX_TO_NUM`.
 
-*Design.* Sema marks tables whose keys are all static literals and whose
-every access site in-module is a literal-key index; the pass rewrites keys
-and sites to per-build numeric handles. Escape hatch directive; never applied
-to tables passed to calls or returned.
+*As built.* `index_to_num` (opt-in, CLI `--index-to-num`) rewrites the keys
+of provably-static local tables to per-build numeric handles, before lowering
+-- so the keys are small integers and the strings never reach the pool at
+all.  `couxobf/index_to_num.py` owns the pass.  The safety rule is a strict
+whitelist, not a heuristic: the table must be a plain local bound once to
+a literal-string-key constructor (no array part, no computed keys), never
+reassigned, never captured as an upvalue, and every use of it anywhere in the
+program must be `t.name` or `t["literal"]` -- checked by resolving every
+`Name` node to its symbol and inspecting the parent node.  Any other parent
+(a call argument, a return, an aliasing assignment, a dynamic index, a method
+call, an operator operand) declines the table.  Because the pass only accepts
+tables whose whole shape it can see, the key set is exactly the union of the
+constructor's keys and the access sites' keys, and the per-build bijection
+covers all of it.  A table bows out with `--!couxobf:no_index_to_num` above
+its declaration (R8 directive syntax).
 
-*Cost.* Zero at runtime (numeric indexing is faster). *Risk.* Medium — the
-safety analysis must be conservative; opt-in.
-*Default.* Off initially (`index_to_num = false`).
+*Cost.* Zero at runtime -- numeric indexing is if anything marginally faster
+than string indexing, and the pass removes work from table-key interning.
+*Risk.* Contained by the whitelist and by being opt-in: the default build is
+byte-for-byte what it was before (a corpus-wide run rewrote 0 tables and
+declined 7, with every build still verifying).  Tests: `tests/
+test_index_to_num.py` (23), including the discriminating check that the keys
+leave the lowered constant pool and per-seed handle agreement/disagreement.
+*Default.* Off (`index_to_num = false`).
 
 ### R10 — Inline small helpers (P3)
 

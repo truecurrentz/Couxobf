@@ -82,6 +82,8 @@ def _config_from_args(args) -> Config:
         config.env_guard = args.env_guard
     if getattr(args, "dump_guard", None) is not None:
         config.dump_guard = args.dump_guard
+    if getattr(args, "index_to_num", False):
+        config.index_to_num = True
     if args.minify:
         config.minify = True
     if args.no_strip_types:
@@ -250,6 +252,10 @@ def _add_protection_knobs(sp) -> None:
                     help="size budget ratio; 0 disables trimming")
     sp.add_argument("--env-guard", type=int, choices=(0, 1, 2), default=None,
                     help="environment logging guard level")
+    sp.add_argument("--index-to-num", action="store_true",
+                    help="rewrite the keys of provably-static local tables to\n"
+                         "per-build numeric handles (R9; opt-in, whitelist-safe;\n"
+                         "exempt a table with --!couxobf:no_index_to_num above it)")
     sp.add_argument("--dump-guard", type=int, choices=(0, 1, 2), default=None,
                     help="dump surface guard level")
 

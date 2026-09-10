@@ -111,11 +111,12 @@ def find_all(source: str) -> List[HashComment]:
 #: string becomes a setting.
 _DIRECTIVE = re.compile(r"^--!couxobf:\s*([A-Za-z_][A-Za-z0-9_]*)\s*$")
 
-#: The directive names the classifier understands.  ``no_virtualize`` keeps the
+#: The directive names the build understands.  ``no_virtualize`` keeps the
 #: following function native; ``virtualize`` forces it into the VM regardless
-#: of its complexity score.  Luaq's per-function opt-out was the reference; the
-#: spelling is this tool's own.
-DIRECTIVES = ("no_virtualize", "virtualize")
+#: of its complexity score; ``no_index_to_num`` exempts the following local
+#: declaration from the R9 key-rewriting pass.  Luaq's per-function opt-outs
+#: were the reference; the spellings are this tool's own.
+DIRECTIVES = ("no_virtualize", "virtualize", "no_index_to_num")
 
 
 class Directive(NamedTuple):

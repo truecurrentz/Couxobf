@@ -215,6 +215,12 @@ class Config:
     numeric_protection_level: int = 1
     constant_protection_level: int = 1
     table_key_protection: bool = True
+    #: R9: rewrite the keys of provably-static local tables to per-build
+    #: numeric handles, so the key strings never reach the artifact.  Opt-in:
+    #: the safety rule is a strict whitelist (see couxobf/index_to_num.py),
+    #: so nothing a default build does today changes when this stays off.
+    #: A table can bow out with ``--!couxobf:no_index_to_num`` above it.
+    index_to_num: bool = False
     cache_policy: CachePolicy = CachePolicy.NONE
     bounded_cache_size: int = 16
 
@@ -445,6 +451,7 @@ class Config:
         "constant_protection_level",
         "numeric_protection_level",
         "table_key_protection",
+        "index_to_num",
         "cache_policy",
         "bounded_cache_size",
         "decoys",

@@ -37,6 +37,7 @@ from typing import Any, Dict, List, Optional, Set
 from . import classify as _classify
 from . import comments as _comments
 from . import controlflow as _controlflow
+from . import index_to_num as _index_to_num
 from .vm import format as _vm_format
 from .vm import runtime as _vm_runtime
 from . import ir as _ir
@@ -95,6 +96,10 @@ class BuildStats:
     #: the config or the main chunk overrode, or one with no function after
     #: it -- is counted under ``ignored`` so the report does not imply it ran.
     directives: Dict[str, int] = field(default_factory=dict)
+    #: R9 index-to-num outcome: how many tables were rewritten, how many
+    #: candidate tables the safety check declined, and how many keys/sites
+    #: changed.  Empty when the pass is off or did nothing worth reporting.
+    index_to_num: Dict[str, int] = field(default_factory=dict)
     #: `#` comments removed from the input before parsing (#5's input side).
     hash_comments: int = 0
     #: Size ratio the build was asked to stay under, 0 when unset.
@@ -335,6 +340,31 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
     except Exception as exc:
         raise BuildError(f"{name} failed semantic analysis: {exc}") from None
 
+    # `--!couxobf:` directives ride the source as comments.  They are
+    # extracted once, here, and consumed by the two passes they steer:
+    # index-to-num (just below) and the classifier (in selection).  A
+    # misspelled one is refused rather than ignored, because a directive
+    # that quietly did nothing is the same dead knob the rest of this
+    # tool keeps removing.
+    directives = [(d.line, d.name) for d in _comments.find_directives(source)]
+    unknown = sorted({n for _, n in directives}
+                     - set(_comments.DIRECTIVES))
+    if unknown:
+        raise BuildError(
+            "%s: unknown directive%s --!couxobf:%s; expected one of %s"
+            % (name, "s" if len(unknown) > 1 else "",
+               ", --!couxobf:".join(unknown),
+               ", ".join("--!couxobf:" + d for d in _comments.DIRECTIVES)))
+
+    # R9 (opt-in): rewrite the keys of provably-static local tables into
+    # per-build numeric handles.  Runs before lowering so the lowered
+    # constants are already numeric and table-key protection has nothing
+    # left to intern in those tables.
+    index_stats = None
+    if getattr(config, "index_to_num", False):
+        index_stats = _index_to_num.rewrite(
+            ast, domains.get("index-to-num"), directives=directives)
+
     # -- IR ---------------------------------------------------------------
     module = _ir.Lowerer(
         table_key_protection=bool(config.table_key_protection),
@@ -345,23 +375,9 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
     # The classifier runs before reconstruction so its decisions can be passed
     # down as an explicit selection.  It writes proto.virtualization as a side
     # effect, which the report reads back.
-    #
-    # R8: `--!couxobf:` directives ride the source as comments and name the
-    # function that follows them.  A misspelled one is refused here rather than
-    # ignored, because a directive that quietly did nothing is the same dead
-    # knob the rest of this tool keeps removing.
-    directives = _comments.find_directives(source)
-    unknown = sorted({d.name for d in directives}
-                     - set(_comments.DIRECTIVES))
-    if unknown:
-        raise BuildError(
-            "%s: unknown directive%s --!couxobf:%s; expected one of %s"
-            % (name, "s" if len(unknown) > 1 else "",
-               ", --!couxobf:".join(unknown),
-               ", ".join("--!couxobf:" + d for d in _comments.DIRECTIVES)))
     classification = _classify.classify_module(
         module, config, domains.get("vm"),
-        directives=[(d.line, d.name) for d in directives])
+        directives=directives)
     selected = _select_for_vm(module, classification)
 
     # -- back end ---------------------------------------------------------
@@ -428,7 +444,8 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         names_out=runtime_names,
     )
 
-    stats = _collect_stats(module, classification, out, source_size)
+    stats = _collect_stats(module, classification, out, source_size,
+                           index_stats)
     stats.guard = dict(runtime_names.get("guard") or {})
     stats.fingerprint = str(runtime_names.get("fingerprint") or "")
     stats.fingerprint_requested = bool(runtime_names.get("fingerprint_requested"))
@@ -497,7 +514,8 @@ def _select_for_vm(module, classification) -> Set[int]:
     return chosen
 
 
-def _collect_stats(module, classification, out: str, source_size: int) -> BuildStats:
+def _collect_stats(module, classification, out: str, source_size: int,
+                   index_stats=None) -> BuildStats:
     from .vm import encode as _encode
 
     # ``source_size`` is the caller's, because the honest denominator for the
@@ -527,6 +545,11 @@ def _collect_stats(module, classification, out: str, source_size: int) -> BuildS
     stats.native_reasons = reasons
     stats.decisions = list(classification.decisions)
     stats.directives = dict(classification.directives_applied)
+    if index_stats is not None and (index_stats.tables or index_stats.skipped):
+        stats.index_to_num = {"tables": index_stats.tables,
+                              "keys": index_stats.keys,
+                              "sites": index_stats.sites,
+                              "skipped": index_stats.skipped}
     return stats
 
 
@@ -640,6 +663,19 @@ def cost_report(result: BuildResult) -> str:
         lines.append(
             "source directives     : %s.  A --!couxobf: comment names the function\n"
             "                        declared after it." % summary)
+    if s.index_to_num:
+        lines.append(
+            "index-to-num          : %d table%s had %d literal key%s rewritten to\n"
+            "                        per-build numeric handles (%d access sites);\n"
+            "                        %d candidate table%s left untouched by the\n"
+            "                        safety check." % (
+                s.index_to_num["tables"],
+                "s" if s.index_to_num["tables"] != 1 else "",
+                s.index_to_num["keys"],
+                "s" if s.index_to_num["keys"] != 1 else "",
+                s.index_to_num["sites"],
+                s.index_to_num["skipped"],
+                "s were" if s.index_to_num["skipped"] != 1 else " was"))
     lines.append(f"elapsed             : {s.elapsed_ms:.1f} ms")
     lines.append("")
 
