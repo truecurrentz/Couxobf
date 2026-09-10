@@ -37,8 +37,7 @@ from couxobf.crypto.protected import open_
 from couxobf.runtime.luau_crypto import crypto_runtime
 from couxobf.runtime.constpool_runtime import FAILURE_MESSAGE
 from couxobf.runtime.stringbank_runtime import StringBankRuntime, default_names
-from couxobf.strings.bank import (MASK_MOD, MASK_MUL, StringBank,
-                                  StringBankError)
+from couxobf.strings.bank import MASK_MOD, StringBank, StringBankError
 from couxobf.toolchain import execute, find_toolchain
 
 TOOLCHAIN = find_toolchain()
@@ -163,13 +162,13 @@ def test_no_fragment_straddles_a_page():
 
 
 def test_mask_stays_exact_under_doubles():
-    """Luau numbers are exact only below 2^53.
-
-    The usual glibc LCG multiplier (1103515245) would reach ~2^61 and silently
-    round, so the Python mask and the Luau mask would disagree.
-    """
-    worst = (MASK_MOD - 1) * MASK_MUL + 12345
+    bank = StringBank(KeyMaterial.from_seed(b"\x21" * 16),
+                      rngmod.make_domains(b"\x22" * 16).get("strings"), b"c")
+    bank.ticket("abc")
+    sealed = bank.seal()
+    worst = (MASK_MOD - 1) * sealed.mask_mul + sealed.mask_add
     assert worst < 2 ** 53, f"mask intermediate {worst} is not exact in Luau"
+    assert (sealed.mask_mul, sealed.mask_add) != (((0x10 << 16) | 0xd69b), ((0x30 << 8) | 0x39))
 
 
 def test_page_size_constraints():
@@ -271,6 +270,8 @@ def test_reconstructed_string_calls_do_not_expose_raw_bank_tickets():
     mask = runtime_names["bank_ticket_mask"]
     assert mask
     assert "bit32.bxor(ticket," in out
+    assert "ticket % 3" not in out
+    assert "couxobf/stringbank" not in out
     # Raw ticket ids are encrypted into the ticket table; call sites carry their
     # build-specific images, so an argument scrape is not the runtime index map.
     for raw in re.findall(r"ix\[(\d+)\]", out):

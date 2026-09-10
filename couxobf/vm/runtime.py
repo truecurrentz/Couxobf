@@ -466,25 +466,26 @@ class _Entry:
     def key(self) -> int:
         return self.numbers[0]
 
-    def condition(self, fmt: FormatSpec, var: str = "op") -> str:
+    def condition(self, fmt: FormatSpec, var: str = "op", roll: str = "_vr") -> str:
         def one(number: int) -> str:
-            seed = (getattr(fmt, "arm_seed", 0) ^ (number * 1103515245)
-                    ^ (self.variant * 2654435761)) & 0xffffffff
-            # Equality does not have to be written as a plain `op == N`.  These
-            # are bijective one-line checks over the opcode field's modulus, so
-            # they are real routing conditions, not dead predicates, and their
-            # shape changes with the build's format/arm seed.
+            seed = (getattr(fmt, "arm_seed", 0) ^ ((number + 0x9E37) << 7)
+                    ^ (self.variant * 0x45D9F3B)) & 0xffffffff
             mod = 1 << (8 * max(1, int(getattr(fmt, "op_bytes", 1))))
-            mode = seed % 3
+            mask = mod - 1
+            salt = ((seed ^ (seed >> 11) ^ (seed << 5)) & mask)
+            salt2 = (((seed >> 3) ^ (seed << 9) ^ 0xA5A5) & mask)
+            mode = seed & 3
             if mode == 1:
-                add = 1 + ((seed >> 8) % (mod - 1))
-                return "((%s + %d) %% %d) == %d" % (
-                    var, add, mod, (number + add) % mod)
+                return "bit32.band(bit32.bxor(%s, %d, %s), %d) == bit32.band(bit32.bxor(%d, %d, %s), %d)" % (
+                    var, salt, roll, mask, number, salt, roll, mask)
             if mode == 2:
-                sub = 1 + ((seed >> 11) % (mod - 1))
-                return "((%s - %d) %% %d) == %d" % (
-                    var, sub, mod, (number - sub) % mod)
-            return f"{var} == {number}"
+                return "bit32.band((%s + bit32.band(%s, %d) + %d), %d) == bit32.band((%d + bit32.band(%s, %d) + %d), %d)" % (
+                    var, roll, mask, salt, mask, number, roll, mask, salt, mask)
+            if mode == 3:
+                return "bit32.band(bit32.bxor((%s + %d), %s, %d), %d) == bit32.band(bit32.bxor((%d + %d), %s, %d), %d)" % (
+                    var, salt, roll, salt2, mask, number, salt, roll, salt2, mask)
+            return "bit32.band(bit32.bxor(%s, %d), %d) == %d" % (
+                var, salt, mask, (number ^ salt) & mask)
 
         if len(self.numbers) == 1:
             return one(self.numbers[0])
@@ -543,6 +544,12 @@ def dispatch_entries(opmap: OpcodeMap, fmt: Optional[FormatSpec] = None
     return entries
 
 
+def _plain_cond(numbers: Tuple[int, ...]) -> str:
+    if len(numbers) == 1:
+        return "op == %d" % numbers[0]
+    return "(" + " or ".join("op == %d" % x for x in numbers) + ")"
+
+
 def _emit_chain(lines: List[str], indent: str, entries: Sequence[_Entry],
                 n: Dict[str, str], fam: Family, fmt: FormatSpec,
                 path: Tuple[str, ...] = (),
@@ -558,11 +565,11 @@ def _emit_chain(lines: List[str], indent: str, entries: Sequence[_Entry],
     """
     first = True
     for entry in entries:
-        cond = entry.condition(fmt)
+        cond = entry.condition(fmt, roll="_vr")
         lines.append(f"{indent}{'if' if first else 'elseif'} {cond} then")
         first = False
         if trace is not None:
-            trace.append((tuple(entry.numbers), path + (cond,)))
+            trace.append((tuple(entry.numbers), path + (_plain_cond(tuple(entry.numbers)),)))
         for body_line in entry.body(n, fam, fmt):
             lines.append(f"{indent}  {body_line}")
     lines.append(f"{indent}else")
@@ -629,12 +636,12 @@ def _emit_tree_range(lines: List[str], indent: str,
                 groups[slot][1].append(number)
         first = True
         for entry, numbers in groups:
-            cond = ("op == %d" % numbers[0] if len(numbers) == 1 else
-                    "(" + " or ".join("op == %d" % x for x in numbers) + ")")
+            cond = _Entry(entry.op, tuple(numbers), entry.pair,
+                          entry.variant).condition(fmt, roll="_vr")
             lines.append(f"{indent}{'if' if first else 'elseif'} {cond} then")
             first = False
             if trace is not None:
-                trace.append((tuple(numbers), path + (cond,)))
+                trace.append((tuple(numbers), path + (_plain_cond(tuple(numbers)),)))
             for body_line in entry.body(n, fam, fmt):
                 lines.append(f"{indent}  {body_line}")
         lines.append(f"{indent}else")
@@ -732,7 +739,7 @@ def _emit_threaded(lines: List[str], entries: Sequence[_Entry],
         lines.append(f"    {'if' if first else 'elseif'} {cond} then")
         first = False
         if trace is not None:
-            trace.append((tuple(entry.numbers), (entry.condition(fmt),)))
+            trace.append((tuple(entry.numbers), (_plain_cond(tuple(entry.numbers)),)))
         for body_line in entry.body(n, fam, fmt):
             lines.append(f"      {body_line}")
     lines.append("    else")
@@ -758,11 +765,11 @@ def _emit_state_transition(lines: List[str], entries: Sequence[_Entry],
     lines.append("    while true do")
     first = True
     for entry in entries:
-        cond = entry.condition(fmt, state_name)
+        cond = entry.condition(fmt, state_name, "_vr")
         lines.append(f"      {'if' if first else 'elseif'} {cond} then")
         first = False
         if trace is not None:
-            trace.append((tuple(entry.numbers), (entry.condition(fmt),)))
+            trace.append((tuple(entry.numbers), (_plain_cond(tuple(entry.numbers)),)))
         body_lines = entry.body(n, fam, fmt)
         for body_line in body_lines:
             lines.append(f"        {body_line}")
@@ -874,6 +881,14 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         # cannot push the stored value out of the slot it lives in.
         entry_expr = "(%s - %d) %% %d + 1" % (raw, spec.header.entry_bias,
                                               1 << (8 * entry_w))
+    loop_guard: List[str] = []
+    if entry_guard:
+        gseed = (getattr(spec, "arm_seed", 0) ^ len(opmap.to_op) ^ 0x6D2B79F5) & 0xffff
+        gmask = 3 + (gseed & 3)
+        loop_guard.append("if bit32.band(bit32.bxor(pc, op, %d), %d) == 0 then" % (gseed, gmask))
+        loop_guard += ["  " + line for line in entry_guard]
+        loop_guard.append("end")
+
     opaque_line = ([
         # A short opaque branch whose truth depends on the bytecode and the
         # decoded opcode for this execution, not on a repetitive algebraic
@@ -947,7 +962,9 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         # also happens to be the anchor a matcher looks for first.
         "    local op = _ro(pc)",
         *opaque_line,
+        "    local _vr = bit32.bxor(op, bit32.band(pc, 65535))",
         f"    pc = pc + {spec.op_bytes}",
+        *["    " + line for line in loop_guard],
     ]
 
     _emit_dispatch(lines, dispatch_entries(opmap, spec), n, fam, dispatcher,

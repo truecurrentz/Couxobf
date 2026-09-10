@@ -46,13 +46,14 @@ program and instruments it.
 
 from __future__ import annotations
 
+import hashlib
 import hmac as _hmac
 import struct
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..crypto.chacha20 import chacha20_xor
-from ..crypto.protected import open_ as _open
+from ..crypto.protected import ENC_DOMAIN, MAC_DOMAIN, open_ as _open
 from ..crypto.protected import seal as _seal
 from ..rng import Rng
 
@@ -63,8 +64,6 @@ DEFAULT_PAGE_SIZE = 512
 #: Fragments are between these sizes, chosen per fragment.
 MIN_FRAGMENT = 3
 MAX_FRAGMENT = 11
-
-AAD = b"couxobf/stringbank/v1\0"
 
 
 class StringBankError(Exception):
@@ -109,32 +108,22 @@ class SealedBank:
     page_count: int
     ticket_count: int
     indirect_ids: bool = False
+    enc_domain: bytes = b""
+    mac_domain: bytes = b""
+    mask_mul: int = 0
+    mask_add: int = 0
+    mask_shift: int = 0
 
 
-#: LCG constants for the reversible mask.
-#:
-#: The multiplier is small on purpose.  Luau has no integer subtype -- every
-#: number is an IEEE-754 double, exact only below 2^53 -- so with the state
-#: kept under 2^31 the product ``x * 1103515`` stays under 2^52 and is exact.
-#: The usual glibc multiplier 1103515245 would reach ~2^61 and silently round,
-#: producing a mask the Python side and the Luau side disagree about.
-MASK_MUL = 1103515
-MASK_ADD = 12345
 MASK_MOD = 1 << 31
 
 
-def _mask_bytes(seed: int, length: int) -> bytes:
-    """The reversible pre-transform mask.
-
-    Both this and the Luau runtime compute
-    ``x = (x * MASK_MUL + MASK_ADD) mod 2^31`` and take bits 16..23, so the two
-    agree by construction rather than by hope.
-    """
+def _mask_bytes(seed: int, length: int, mul: int, add: int, shift: int) -> bytes:
     out = bytearray()
     x = seed % MASK_MOD
     for _ in range(length):
-        x = (x * MASK_MUL + MASK_ADD) % MASK_MOD
-        out.append((x >> 16) & 0xFF)
+        x = (x * mul + add) % MASK_MOD
+        out.append((x >> shift) & 0xFF)
     return bytes(out)
 
 
@@ -148,7 +137,9 @@ class StringBank:
     def __init__(self, keys: Any, rng: Rng, context: bytes,
                  page_size: int = DEFAULT_PAGE_SIZE,
                  per_occurrence: bool = True,
-                 randomized_ids: bool = False) -> None:
+                 randomized_ids: bool = False,
+                 enc_domain: bytes = None,
+                 mac_domain: bytes = None) -> None:
         if page_size < 64:
             raise StringBankError("page size must be at least 64 bytes")
         if page_size % 64 != 0:
@@ -162,9 +153,18 @@ class StringBank:
         self.page_size = page_size
         self.per_occurrence = per_occurrence
         self.randomized_ids = bool(randomized_ids)
+        self.enc_domain = enc_domain
+        self.mac_domain = mac_domain
         self._tickets: List[Tuple[int, List[_Fragment]]] = []
         self._used_ids = set()
         self._flat = bytearray()
+        self._mask_mul = (self.rng.randbelow(0x1F0000) + 0x10000) | 1
+        if self._mask_mul == ((0x10 << 16) | 0xd69b):
+            self._mask_mul ^= 0x2041
+        self._mask_add = (self.rng.randbelow(MASK_MOD - 1) + 1) | 1
+        if self._mask_add == ((0x30 << 8) | 0x39):
+            self._mask_add ^= 0x4041
+        self._mask_shift = 8 + self.rng.randbelow(16)
         self._sealed: Optional[SealedBank] = None
         #: When occurrences share fragments, one value maps to one fragment
         #: list.  Off by default: sharing is what makes per-occurrence tickets
@@ -222,7 +222,9 @@ class StringBank:
             piece = raw[pos:pos + size]
             start = self._reserve(size)
             seed = self.rng.randbelow(0x7FFFFFFF)
-            masked = _xor(piece, _mask_bytes(seed, len(piece)))
+            masked = _xor(piece, _mask_bytes(seed, len(piece),
+                                          self._mask_mul, self._mask_add,
+                                          self._mask_shift))
             self._flat[start:start + size] = masked
             frags.append(_Fragment(offset=start, length=size, mask_seed=seed))
             pos += size
@@ -289,16 +291,20 @@ class StringBank:
         # recovery should not hand over the others.
         blob_key = self.keys.region_key("string-bank",
                                         b"blob\0" + self._region)
-        nonce, ct, tag = _seal(ticket_key, ticket_plain,
-                               AAD + self.context,
-                               nonce=self.rng.bytes(12))
+        ticket_aad = hashlib.sha256(b"bank-aad" + self.context + self._region).digest()
+        enc_domain = self.enc_domain if self.enc_domain is not None else ENC_DOMAIN
+        mac_domain = self.mac_domain if self.mac_domain is not None else MAC_DOMAIN
+        nonce, ct, tag = _seal(ticket_key, ticket_plain, ticket_aad,
+                               nonce=self.rng.bytes(12),
+                               enc_domain=enc_domain,
+                               mac_domain=mac_domain)
 
         self._sealed = SealedBank(
             blob=bytes(blob),
             ticket_nonce=nonce,
             ticket_tag=tag,
             ticket_ct=ct,
-            ticket_aad=AAD + self.context,
+            ticket_aad=ticket_aad,
             key=key,
             ticket_key=ticket_key,
             blob_key=blob_key,
@@ -308,6 +314,11 @@ class StringBank:
             page_count=page_count,
             ticket_count=len(self._tickets),
             indirect_ids=self.randomized_ids,
+            enc_domain=enc_domain,
+            mac_domain=mac_domain,
+            mask_mul=self._mask_mul,
+            mask_add=self._mask_add,
+            mask_shift=self._mask_shift,
         )
         return self._sealed
 
@@ -337,7 +348,8 @@ class StringBank:
         plain = _open(self.keys.region_key("string-bank",
                                            b"tickets\0" + self._region),
                       sealed.ticket_nonce, sealed.ticket_ct, sealed.ticket_tag,
-                      sealed.ticket_aad)
+                      sealed.ticket_aad, enc_domain=sealed.enc_domain,
+                      mac_domain=sealed.mac_domain)
         if plain is None:
             raise StringBankError("ticket table failed authentication")
         tickets, page_count, page_size = struct.unpack_from(">III", plain, 0)
@@ -386,5 +398,6 @@ class StringBank:
             ks = chacha20_xor(key, sealed.stream_nonce,
                               bytes(intra + length), counter=1 + block)
             masked = _xor(ct, ks[intra:])
-            out += _xor(masked, _mask_bytes(seed, length))
+            out += _xor(masked, _mask_bytes(seed, length, sealed.mask_mul,
+                                           sealed.mask_add, sealed.mask_shift))
         return bytes(out)

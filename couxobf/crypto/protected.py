@@ -39,11 +39,12 @@ NONCE_BYTES = 12
 TAG_BYTES = 32  # HMAC-SHA256
 KEY_BYTES = 32
 
-ENC_DOMAIN = b"couxobf-enc-v2\x00"
-MAC_DOMAIN = b"couxobf-mac-v2\x00"
+ENC_DOMAIN = bytes.fromhex("6b7a2d8e317445a994c06fd53b987120")
+MAC_DOMAIN = bytes.fromhex("c50f19a6e8774c2b901d4e65b82733da")
 
 
-def enc_key(key: bytes, nonce: bytes, aad: bytes = b"") -> bytes:
+def enc_key(key: bytes, nonce: bytes, aad: bytes = b"",
+            domain: bytes = ENC_DOMAIN) -> bytes:
     """Derive the actual stream-cipher key for one payload.
 
     The key stored beside a protected payload is now a wrapping input, not the
@@ -52,20 +53,22 @@ def enc_key(key: bytes, nonce: bytes, aad: bytes = b"") -> bytes:
     keystream keys, and an analyst cannot test a guessed key by applying raw
     ChaCha20 without first reproducing the KDF step.
     """
-    return hashlib.sha256(ENC_DOMAIN + key + nonce + aad + struct.pack("<Q", len(aad))).digest()
+    return hashlib.sha256(domain + key + nonce + aad + struct.pack("<Q", len(aad))).digest()
 
 
-def mac_key(key: bytes, nonce: bytes, aad: bytes = b"") -> bytes:
+def mac_key(key: bytes, nonce: bytes, aad: bytes = b"",
+            domain: bytes = MAC_DOMAIN) -> bytes:
     """Derive the MAC key from the payload key, nonce and AAD.
 
     Separate keys for cipher and MAC (never the same value in both roles), and
     the nonce/AAD in the derivation means the MAC key changes per message and
     per authenticated context.
     """
-    return hashlib.sha256(MAC_DOMAIN + key + nonce + aad + struct.pack("<Q", len(aad))).digest()
+    return hashlib.sha256(domain + key + nonce + aad + struct.pack("<Q", len(aad))).digest()
 
 
-def compute_tag(key: bytes, nonce: bytes, ciphertext: bytes, aad: bytes) -> bytes:
+def compute_tag(key: bytes, nonce: bytes, ciphertext: bytes, aad: bytes,
+                mac_domain: bytes = MAC_DOMAIN) -> bytes:
     """HMAC-SHA256 over the MAC-covered fields, encrypt-then-MAC order."""
     covered = (
         nonce
@@ -74,11 +77,12 @@ def compute_tag(key: bytes, nonce: bytes, ciphertext: bytes, aad: bytes) -> byte
         + ciphertext
         + struct.pack("<Q", len(ciphertext))
     )
-    return _hmac.new(mac_key(key, nonce, aad), covered, hashlib.sha256).digest()
+    return _hmac.new(mac_key(key, nonce, aad, mac_domain), covered, hashlib.sha256).digest()
 
 
 def seal(key: bytes, plaintext: bytes, aad: bytes = b"",
-         nonce: bytes = None) -> Tuple[bytes, bytes, bytes]:
+         nonce: bytes = None, enc_domain: bytes = ENC_DOMAIN,
+         mac_domain: bytes = MAC_DOMAIN) -> Tuple[bytes, bytes, bytes]:
     """Return ``(nonce, ciphertext, tag)``."""
     if len(key) != KEY_BYTES:
         raise ValueError("payload key must be 32 bytes")
@@ -86,28 +90,35 @@ def seal(key: bytes, plaintext: bytes, aad: bytes = b"",
         nonce = os.urandom(NONCE_BYTES)
     if len(nonce) != NONCE_BYTES:
         raise ValueError("nonce must be 12 bytes")
-    ct = chacha20_xor(enc_key(key, nonce, aad), nonce, plaintext, counter=1)
-    return nonce, ct, compute_tag(key, nonce, ct, aad)
+    ct = chacha20_xor(enc_key(key, nonce, aad, enc_domain), nonce, plaintext, counter=1)
+    return nonce, ct, compute_tag(key, nonce, ct, aad, mac_domain)
 
 
 def open_(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes,
-          aad: bytes = b"") -> bytes:
+          aad: bytes = b"", enc_domain: bytes = ENC_DOMAIN,
+          mac_domain: bytes = MAC_DOMAIN) -> bytes:
     """Verify then decrypt.  Raises ``ValueError`` on any mismatch."""
-    expected = compute_tag(key, nonce, ciphertext, aad)
+    expected = compute_tag(key, nonce, ciphertext, aad, mac_domain)
     if not _hmac.compare_digest(expected, tag):
         raise ValueError("authentication tag mismatch")
-    return chacha20_xor(enc_key(key, nonce, aad), nonce, ciphertext, counter=1)
+    return chacha20_xor(enc_key(key, nonce, aad, enc_domain), nonce, ciphertext, counter=1)
 
 
-def sealed_blob(key: bytes, plaintext: bytes, aad: bytes = b"") -> bytes:
+def sealed_blob(key: bytes, plaintext: bytes, aad: bytes = b"",
+                enc_domain: bytes = ENC_DOMAIN,
+                mac_domain: bytes = MAC_DOMAIN) -> bytes:
     """Wire format: ``nonce || tag || ciphertext``."""
-    nonce, ct, tag = seal(key, plaintext, aad)
+    nonce, ct, tag = seal(key, plaintext, aad, enc_domain=enc_domain,
+                          mac_domain=mac_domain)
     return nonce + tag + ct
 
 
-def open_blob(key: bytes, blob: bytes, aad: bytes = b"") -> bytes:
+def open_blob(key: bytes, blob: bytes, aad: bytes = b"",
+              enc_domain: bytes = ENC_DOMAIN,
+              mac_domain: bytes = MAC_DOMAIN) -> bytes:
     if len(blob) < NONCE_BYTES + TAG_BYTES:
         raise ValueError("sealed blob too short")
     nonce = blob[:NONCE_BYTES]
     tag = blob[NONCE_BYTES : NONCE_BYTES + TAG_BYTES]
-    return open_(key, nonce, blob[NONCE_BYTES + TAG_BYTES :], tag, aad)
+    return open_(key, nonce, blob[NONCE_BYTES + TAG_BYTES :], tag, aad,
+                 enc_domain=enc_domain, mac_domain=mac_domain)

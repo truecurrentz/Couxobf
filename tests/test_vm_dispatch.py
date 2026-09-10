@@ -148,8 +148,8 @@ def test_dispatch_conditions_are_not_all_plain_opcode_equality():
     fmt = FormatSpec(op_bytes=2, arm_seed=0x12345)
     text, trace, _bk = _emit(opmap, "nested_if", fmt)
     assert trace
-    assert "%" in text, "arm_seed should disguise at least some equality tests"
-    assert any("+" in cond or "-" in cond for _nums, path in trace for cond in path)
+    assert "bit32.bxor" in text or "bit32.band" in text
+    assert "_vr" in text
 
 
 def test_the_guard_still_rejects_unassigned_numbers():

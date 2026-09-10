@@ -321,7 +321,7 @@ def test_wrong_aad_is_rejected():
     sealed = pool.seal()
     rt = ConstantPoolRuntime(default_names())
     src = rt.emit(sealed.key, sealed.nonce, sealed.tag, sealed.ciphertext,
-                  b"couxobf/constpool/v1\0stolen-build")
+                  b"stolen-build" + b"\x00" * 7)
     src += f"\nprint({rt.accessor}(1))\n"
     result = execute(TOOLCHAIN, src, "pool.luau", timeout=30)
     assert result.returncode != 0

@@ -22,7 +22,6 @@ from __future__ import annotations
 
 from typing import Dict
 
-from ..strings.bank import MASK_ADD, MASK_MOD, MASK_MUL
 from .constpool_runtime import byte_literal
 
 
@@ -94,9 +93,17 @@ class StringBankRuntime:
         ticket_mask &= 0xffffffff
         trip = (f"  if not {guard_check}() then error(\"invalid state\") end\n"
                 if guard_check else "")
-        deticket = (f"  ticket = bit32.bxor(ticket, {ticket_mask})\n"
+        ticket_expr = "bit32.bxor(%d, %d)" % (ticket_mask ^ 0x7F4A7C15, 0x7F4A7C15)
+        deticket = (f"  ticket = bit32.bxor(ticket, {ticket_expr})\n"
                     if ticket_mask else "")
         if self.emit_crypto:
+            if not crypto_src:
+                from .luau_crypto import crypto_runtime
+                crypto_src = crypto_runtime({"xor": n["c_xor"], "sha": n["c_sha"],
+                                             "mac": n["c_mac"], "open": n["c_open"],
+                                             "seal": n["c_seal"]},
+                                            enc_domain=getattr(sealed, "enc_domain", None),
+                                            mac_domain=getattr(sealed, "mac_domain", None))
             head = f"local {n['crypto']} = (function()\n{crypto_src}end)()\n"
         else:
             # The constant pool already declared it; a second copy would be a
@@ -110,14 +117,7 @@ class StringBankRuntime:
                 f"{trip}"
                 f"{deticket}"
                 f"  {n['load']}()\n"
-                f"  local cls = ticket % 3\n"
-                f"  if cls == 0 then\n"
-                f"    return {n['resolve']}(ticket)\n"
-                f"  elseif cls == 1 then\n"
-                f"    local indirect = ticket\n"
-                f"    return {n['resolve_alt']}(indirect)\n"
-                f"  end\n"
-                f"  return {n['resolve_alt2']}(ticket)\n"
+                f"  return {n['resolve']}(ticket)\n"
                 f"end\n"
             )
         else:
@@ -142,16 +142,7 @@ class StringBankRuntime:
                 f"  if {n['seen']}[ticket] then\n"
                 f"    return {n['cache']}[ticket]\n"
                 f"  end\n"
-                f"  local cls = ticket % 3\n"
-                f"  local v\n"
-                f"  if cls == 0 then\n"
-                f"    v = {n['resolve']}(ticket)\n"
-                f"  elseif cls == 1 then\n"
-                f"    local indirect = ticket\n"
-                f"    v = {n['resolve_alt']}(indirect)\n"
-                f"  else\n"
-                f"    v = {n['resolve_alt2']}(ticket)\n"
-                f"  end\n"
+                f"  local v = {n['resolve']}(ticket)\n"
                 f"  {n['cache']}[ticket] = v\n"
                 f"  {n['seen']}[ticket] = true\n"
                 f"{guard}"
@@ -221,11 +212,11 @@ local function {n['load']}()
   {n['index']} = ix
 end
 local function {n['unmask']}(s, seed)
-  local x = seed % {MASK_MOD}
+  local x = seed % 2147483648
   local t = table.create(#s)
   for i = 1, #s do
-    x = (x * {MASK_MUL} + {MASK_ADD}) % {MASK_MOD}
-    t[i] = string.char(bit32.bxor(string.byte(s, i), bit32.band(bit32.rshift(x, 16), 255)))
+    x = (x * {int(sealed.mask_mul)} + {int(sealed.mask_add)}) % 2147483648
+    t[i] = string.char(bit32.bxor(string.byte(s, i), bit32.band(bit32.rshift(x, {int(sealed.mask_shift)}), 255)))
   end
   return table.concat(t)
 end

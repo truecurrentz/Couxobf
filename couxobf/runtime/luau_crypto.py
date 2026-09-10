@@ -44,12 +44,13 @@ from typing import Dict
 
 from ..crypto.chacha20 import COLUMN_ROUNDS, DIAGONAL_ROUNDS
 from ..crypto.sha256 import H_INIT, K
+from ..crypto.protected import ENC_DOMAIN, MAC_DOMAIN
 
 # Sigma constants: little-endian 32-bit words of "expand 32-byte k".
 SIGMA = (1634760805, 857760878, 2036477234, 1797285236)
 
-ENC_DOMAIN = "couxobf-enc-v2\\000"  # matches crypto.protected.ENC_DOMAIN
-MAC_DOMAIN = "couxobf-mac-v2\\000"  # matches crypto.protected.MAC_DOMAIN
+def _byte_literal(data: bytes) -> str:
+    return '"' + ''.join('\\x%02x' % b for b in data) + '"'
 
 
 def _k_table() -> str:
@@ -59,7 +60,8 @@ def _k_table() -> str:
     return "\n".join(rows)
 
 
-def crypto_runtime(names: Dict[str, str]) -> str:
+def crypto_runtime(names: Dict[str, str], enc_domain: bytes = None,
+                   mac_domain: bytes = None) -> str:
     """Emit the crypto runtime.
 
     ``names`` maps logical roles to generated identifiers: ``xor`` (ChaCha20),
@@ -67,6 +69,8 @@ def crypto_runtime(names: Dict[str, str]) -> str:
     ``seal`` (encrypt + tag).
     """
     n = names
+    enc_dom = _byte_literal(enc_domain if enc_domain is not None else ENC_DOMAIN)
+    mac_dom = _byte_literal(mac_domain if mac_domain is not None else MAC_DOMAIN)
     return f"""local band, bor, bxor, bnot = bit32.band, bit32.bor, bit32.bxor, bit32.bnot
 local lshift, rshift = bit32.lshift, bit32.rshift
 local byte, char, rep, sub = string.byte, string.char, string.rep, string.sub
@@ -300,11 +304,11 @@ local function le64(n)
 end
 
 local function enc_key(keystr, noncestr, aad)
-  return {n["sha"]}("{ENC_DOMAIN}" .. keystr .. noncestr .. aad .. le64(#aad))
+  return {n["sha"]}({enc_dom} .. keystr .. noncestr .. aad .. le64(#aad))
 end
 
 local function mac_key(keystr, noncestr, aad)
-  return {n["sha"]}("{MAC_DOMAIN}" .. keystr .. noncestr .. aad .. le64(#aad))
+  return {n["sha"]}({mac_dom} .. keystr .. noncestr .. aad .. le64(#aad))
 end
 
 local function compute_tag(keystr, noncestr, ct, aad)

@@ -60,7 +60,6 @@ def test_protect_writes_a_file(tmp_path):
     assert code == EXIT_OK, err
     text = target.read_text()
     assert text.strip(), "output file is empty"
-    # "couxobf" does appear, as the MAC domain separator (couxobf-mac-v1).
     # That is required: a domain separator has to be fixed and distinct per
     # protocol, and it is inside an artifact that already contains the key.
     # What must not be there is explanatory prose for an analyst to read.

@@ -509,12 +509,16 @@ def _token(prefix: str, role: str, salt: int) -> str:
     ``_s0`` that made the guard easy to fingerprint across artifacts.
     """
     alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    x = (salt * 0x45D9F3B) ^ 0xA5A5A5A5
+    x = (salt ^ 0xA5A5A5A5) & 0xffffffff
     for ch in (prefix + role):
-        x = ((x ^ ord(ch)) * 1103515245 + 12345) & 0x7fffffff
+        x ^= (ord(ch) + 0x9E3779B9) & 0xffffffff
+        x = ((x << 13) | (x >> 19)) & 0xffffffff
+        x ^= (x >> 7)
     chars = []
     for _ in range(4):
-        x = (x * 1664525 + 1013904223) & 0xffffffff
+        x ^= (x << 11) & 0xffffffff
+        x ^= (x >> 17)
+        x ^= (x << 5) & 0xffffffff
         chars.append(alphabet[x % len(alphabet)])
     return "".join(chars)
 

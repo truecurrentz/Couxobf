@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 from typing import Dict, List, Tuple
 
+from ..constpool import mask_params
 from .luau_crypto import crypto_runtime
 
 
@@ -27,21 +28,19 @@ def byte_literal(data: bytes) -> str:
     """
     return '"' + "".join("\\x%02x" % b for b in data) + '"'
 
-_MASK_MUL = 1103515
-_MASK_ADD = 12345
-_MASK_MOD = 1 << 31
+MASK_MOD = 1 << 31
 
 
-def _mask(seed: int, length: int) -> bytes:
+def _mask(seed: int, length: int, mul: int, add: int, shift: int) -> bytes:
     out = bytearray()
-    x = seed % _MASK_MOD
+    x = seed % MASK_MOD
     for _ in range(length):
-        x = (x * _MASK_MUL + _MASK_ADD) % _MASK_MOD
-        out.append((x >> 16) & 0xFF)
+        x = (x * mul + add) % MASK_MOD
+        out.append((x >> shift) & 0xFF)
     return bytes(out)
 
 
-def _literal_parts(data: bytes) -> List[Tuple[int, bytes]]:
+def _literal_parts(data: bytes) -> List[Tuple[int, int, int, int, bytes]]:
     """Masked literal fragments for one runtime blob.
 
     The encrypted pool already protects the payload contents.  This layer keeps
@@ -51,25 +50,31 @@ def _literal_parts(data: bytes) -> List[Tuple[int, bytes]]:
     """
     if not data:
         return []
-    h = hashlib.sha256(b"couxobf-const-literal\0" + len(data).to_bytes(4, "big") + data).digest()
+    h = hashlib.sha256(len(data).to_bytes(4, "big") + data).digest()
     pos = 0
     idx = 0
-    parts: List[Tuple[int, bytes]] = []
+    parts: List[Tuple[int, int, int, int, bytes]] = []
     while pos < len(data):
         size = 3 + h[idx % len(h)] % 10
         size = min(size, len(data) - pos)
-        seed = int.from_bytes(hashlib.sha256(h + idx.to_bytes(2, "big")).digest()[:4], "big") & 0x7fffffff
+        row_hash = hashlib.sha256(h + idx.to_bytes(2, "big")).digest()
+        seed = int.from_bytes(row_hash[:4], "big") & 0x7fffffff
+        mul = (int.from_bytes(row_hash[4:7], "big") & 0x1fffff) | 1
+        if mul < 0x10000:
+            mul |= 0x10001
+        add = (int.from_bytes(row_hash[7:11], "big") & 0x7fffffff) | 1
+        shift = 8 + (row_hash[11] & 15)
         piece = data[pos:pos + size]
-        masked = bytes(b ^ m for b, m in zip(piece, _mask(seed, size)))
-        parts.append((seed, masked))
+        masked = bytes(b ^ m for b, m in zip(piece, _mask(seed, size, mul, add, shift)))
+        parts.append((seed, mul, add, shift, masked))
         pos += size
         idx += 1
     return parts
 
 
 def byte_expr(data: bytes, helper: str) -> str:
-    rows = ["{%d,%s}" % (seed, byte_literal(masked))
-            for seed, masked in _literal_parts(data)]
+    rows = ["{%d,%d,%d,%d,%s}" % (seed, mul, add, shift, byte_literal(masked))
+            for seed, mul, add, shift, masked in _literal_parts(data)]
     return "%s({%s})" % (helper, ",".join(rows))
 
 
@@ -92,22 +97,26 @@ class ConstantPoolRuntime:
     def emit(self, key: bytes, nonce: bytes, tag: bytes, ciphertext: bytes,
              aad: bytes, emit_crypto: bool = True,
              guard_check: str = "",
-             ticket_mask: int = 0) -> str:
+             ticket_mask: int = 0,
+             enc_domain: bytes = None,
+             mac_domain: bytes = None) -> str:
         n = self.n
         ticket_mask &= 0xffffffff
+        mask_mul, mask_add, mask_shift = mask_params(key + nonce + aad)
         trip = (f"  if not {guard_check}() then error(\"invalid state\") end\n"
                 if guard_check else "")
-        deticket = (f"  i = bit32.bxor(i, {ticket_mask})\n" if ticket_mask else "")
+        ticket_expr = "bit32.bxor(%d, %d)" % (ticket_mask ^ 0xA5C31D2F, 0xA5C31D2F)
+        deticket = (f"  i = bit32.bxor(i, {ticket_expr})\n" if ticket_mask else "")
         literal_helper = f"""local function {n['lit']}(parts)
   local out = table.create(#parts)
   for i = 1, #parts do
     local row = parts[i]
     local seed = row[1]
-    local s = row[2]
+    local s = row[5]
     local t = table.create(#s)
     for j = 1, #s do
-      seed = (seed * {_MASK_MUL} + {_MASK_ADD}) % {_MASK_MOD}
-      t[j] = string.char(bit32.bxor(string.byte(s, j), bit32.band(bit32.rshift(seed, 16), 255)))
+      seed = (seed * row[2] + row[3]) % 2147483648
+      t[j] = string.char(bit32.bxor(string.byte(s, j), bit32.band(bit32.rshift(seed, row[4]), 255)))
     end
     out[i] = table.concat(t)
   end
@@ -118,7 +127,8 @@ end
         # turns it into a value without needing a require.
         crypto = crypto_runtime(
             {"xor": n["c_xor"], "sha": n["c_sha"], "mac": n["c_mac"],
-             "open": n["c_open"], "seal": n["c_seal"]}
+             "open": n["c_open"], "seal": n["c_seal"]},
+            enc_domain=enc_domain, mac_domain=mac_domain,
         )
 
         if self.cache_policy == "none":
@@ -213,8 +223,8 @@ local function {n['dyn']}(s, seed)
   local x = seed % 2147483648
   local out = table.create(#s)
   for j = 1, #s do
-    x = (x * 1103515 + 12345) % 2147483648
-    out[j] = string.char(bit32.bxor(string.byte(s, j), bit32.band(bit32.rshift(x, 16), 255)))
+    x = (x * {mask_mul} + {mask_add}) % 2147483648
+    out[j] = string.char(bit32.bxor(string.byte(s, j), bit32.band(bit32.rshift(x, {mask_shift}), 255)))
   end
   return table.concat(out)
 end

@@ -920,11 +920,15 @@ def reconstruct_protected(module: IRModule,
         # before the pool is built, so folded constants are interned once
         # rather than once per site they were duplicated at
         _optimize.optimize_module(module)
+    crypto_enc_domain = rng.bytes(24)
+    crypto_mac_domain = rng.bytes(24)
     pool = ConstantPool(keys, rng, context,
                         cache_policy=cache_policy, cache_bound=cache_bound,
                         decoys=pool_decoys,
                         constant_level=constant_level,
-                        numeric_level=numeric_level)
+                        numeric_level=numeric_level,
+                        enc_domain=crypto_enc_domain,
+                        mac_domain=crypto_mac_domain)
 
     # Selected after optimization, so prototypes the optimizer shrank below the
     # size floor are not virtualized on the strength of code that no longer
@@ -1016,7 +1020,9 @@ def reconstruct_protected(module: IRModule,
         from .runtime.stringbank_runtime import default_names as bank_default_names
         bank = StringBank(keys, string_rng if string_rng is not None else rng,
                           context, page_size=string_page_size,
-                          randomized_ids=True)
+                          randomized_ids=True,
+                          enc_domain=crypto_enc_domain,
+                          mac_domain=crypto_mac_domain)
         # Its own prefix, drawn from the string stream: sharing the constant
         # pool's prefix would make the two runtimes recognisable as a pair.
         bank_names = bank_default_names(
@@ -1088,7 +1094,9 @@ def reconstruct_protected(module: IRModule,
             names["crypto"],
             crypto_runtime({"xor": names["c_xor"], "sha": names["c_sha"],
                             "mac": names["c_mac"], "open": names["c_open"],
-                            "seal": names["c_seal"]})))
+                            "seal": names["c_seal"]},
+                           enc_domain=crypto_enc_domain,
+                           mac_domain=crypto_mac_domain)))
 
     runtime_guard_check = guard.n("check") if guard.refuses else ""
 
@@ -1107,7 +1115,9 @@ def reconstruct_protected(module: IRModule,
                                 sealed.ciphertext, sealed.aad,
                                 emit_crypto=not crypto_src,
                                 guard_check=runtime_guard_check,
-                                ticket_mask=pool_ticket_mask)
+                                ticket_mask=pool_ticket_mask,
+                                enc_domain=sealed.enc_domain,
+                                mac_domain=sealed.mac_domain)
 
     bank_src = ""
     if need_bank:
@@ -1132,7 +1142,9 @@ def reconstruct_protected(module: IRModule,
             bank.seal(),
             crypto_runtime({"xor": bn["c_xor"], "sha": bn["c_sha"],
                             "mac": bn["c_mac"], "open": bn["c_open"],
-                            "seal": bn["c_seal"]}) if not crypto_src else "",
+                            "seal": bn["c_seal"]},
+                           enc_domain=crypto_enc_domain,
+                           mac_domain=crypto_mac_domain) if not crypto_src else "",
             guard_check=runtime_guard_check,
             ticket_mask=bank_ticket_mask)
 
