@@ -239,6 +239,9 @@ class FormatSpec:
     pad: int = 0
     #: Emit the wide operands before the register operands.
     wides_first: bool = False
+    #: Per-build seed for shuffling operand fields within each opcode.  Zero
+    #: keeps the legacy/wides-first split exactly.
+    field_order_seed: int = 0
     #: Additive masks, applied mod the field width.  #4.
     reg_mask: int = 0
     wide_mask: int = 0
@@ -294,6 +297,15 @@ class FormatSpec:
         wides: List[FieldKey] = [("w", name) for name in spec.wides]
         out = (wides + regs) if (self.wides_first or spec.wide_first) \
             else (regs + wides)
+        if self.field_order_seed and len(out) > 1:
+            def key_of(field: FieldKey) -> int:
+                h = self.field_order_seed ^ 0x9E3779B9
+                for ch in "%s:%s:%s" % (op, field[0], field[1]):
+                    h = ((h << 7) | (h >> 25)) & 0xffffffff
+                    h ^= ord(ch)
+                    h = (h * 0x45D9F3B) & 0xffffffff
+                return h
+            out = sorted(out, key=key_of)
         return tuple(out)
 
     @staticmethod
@@ -535,6 +547,7 @@ class FormatSpec:
             "reorder": self.reorder,
             "arm_seed": self.arm_seed,
             "op_pos_mult": self.op_pos_mult,
+            "field_order_seed": self.field_order_seed,
         }
 
 
@@ -762,6 +775,7 @@ def draw(rng: Optional[Rng], prefs: Optional[FormatPrefs] = None, *,
     wide_bytes = 3 if on(prefs.allow_wide_widen, 0.4) else 2
     pad = rng.randint(1, 2) if on(prefs.allow_pad, 0.5) else 0
     wides_first = on(prefs.allow_operand_swap, 0.6)
+    field_order_seed = rng.randint(1, 0x7fffffff) if prefs.allow_operand_swap else 0
     reg_mod = 1 << (8 * reg_bytes)
     wide_mod = 1 << (8 * wide_bytes)
     # A mask of 0 means "no mask", so masks are drawn from the non-zero range
@@ -838,6 +852,7 @@ def draw(rng: Optional[Rng], prefs: Optional[FormatPrefs] = None, *,
         wide_bytes=wide_bytes,
         pad=pad,
         wides_first=wides_first,
+        field_order_seed=field_order_seed,
         reg_mask=reg_mask,
         wide_mask=wide_mask,
         target_mode=mode,

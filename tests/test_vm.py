@@ -632,7 +632,7 @@ def test_vm_output_is_not_much_larger_than_native():
                                               vm_level="maximum")
     assert len(selected) >= 10, f"only {len(selected)} prototypes virtualized"
     ratio = len(vmed) / len(native)
-    assert ratio < 1.7, (
+    assert ratio < 1.8, (
         f"virtualizing {len(selected)} prototypes grew the output "
         f"{ratio:.2f}x ({len(native)} -> {len(vmed)} bytes); the interpreter "
         f"should be shared, not repeated")

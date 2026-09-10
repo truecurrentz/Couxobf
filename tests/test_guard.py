@@ -144,8 +144,9 @@ def test_level_one_observes_and_level_two_refuses_without_executor_mutation(leve
     assert guard.neutralises is False
     assert guard.refuses == (level >= 2)
     text = "\n".join(guardmod.guard_block(guard).splitlines())
-    assert "getrawmetatable" in text
-    assert "setreadonly" in text
+    assert "getrawmetatable" not in text
+    assert "setreadonly" not in text
+    assert "\\x67\\x65\\x74" in text
     if level == 1:
         assert guard.entry_lines() == []
     else:
@@ -175,9 +176,9 @@ def test_dump_guard_watches_luau_and_late_hook_surfaces():
     text = guardmod.guard_block(guardmod.make(2, 2))
     for literal in ("getconstants",):
         assert literal not in text
-    for literal in ("debug", "getinfo", "traceback", "__namecall",
-                    "hookfunction", "getgc", "saveinstance"):
-        assert literal in text
+    assert "debug" in text
+    for hidden in ("getinfo", "traceback", "__namecall", "hookfunction", "getgc", "saveinstance"):
+        assert hidden not in text
 
 
 def test_guard_role_names_do_not_expose_fixed_suffixes_when_prefixed():
@@ -254,24 +255,19 @@ def test_a_build_never_captures_a_name_it_writes():
         f"captured and written at chunk level: {sorted(captured & writes)}")
 
 
-def test_the_entry_check_rides_on_every_vm_entry():
-    """The per-call check is inside ``enter``, not floating at chunk level.
-
-    A check that runs once at load cannot see a runner that waits; a check on the
-    entry path can, and putting it before the frame is built is what makes a
-    refused call never touch the payload.
-    """
+def test_environment_guard_is_separate_from_vm_entry():
+    """Environment detection stays in its guard block, not the payload VM."""
     out = build(SOURCE, _cfg(2), name="guard.luau", verify=False)
     check = out.runtime_names["guard"]["locals"]["check"]
     enters = re.findall(r"local function \w+\(p,?\s*\w+,?\.\.\.\)(.{0,140})",
                         out.source, re.S)
     assert enters, "no VM entry points in a build that virtualized functions"
     for head in enters:
-        assert re.search(r"if not %s\(\)\s*then" % re.escape(check), head), head
+        assert not re.search(r"if not %s\(\)\s*then" % re.escape(check), head), head
 
 
-def test_pool_and_string_accessors_recheck_before_plaintext_materializes():
-    """Dumpers often wait until after load; accessors must close that window."""
+def test_pool_and_string_accessors_do_not_depend_on_environment_guard():
+    """Payload integrity remains separate from environment detection."""
     source = 'local function f() return "alpha" .. "beta" end\nprint(f())\n'
     out = build(source, _cfg(2, string_protection_level=2),
                 name="guard-strings.luau", verify=False)
@@ -279,14 +275,12 @@ def test_pool_and_string_accessors_recheck_before_plaintext_materializes():
     pool_get = out.runtime_names["pool"]["get"]
     pool_head = re.search(r"local function %s\(i\)(.{0,120})"
                           % re.escape(pool_get), out.source, re.S)
-    assert pool_head and re.search(r"if not %s\(\)\s*then"
-                                   % re.escape(check), pool_head.group(1))
+    assert pool_head and check not in pool_head.group(1)
     if "bank" in out.runtime_names:
         bank_get = out.runtime_names["bank"]["get"]
         bank_head = re.search(r"local function %s\(ticket\)(.{0,120})"
                               % re.escape(bank_get), out.source, re.S)
-        assert bank_head and re.search(r"if not %s\(\)\s*then"
-                                       % re.escape(check), bank_head.group(1))
+        assert bank_head and check not in bank_head.group(1)
 
 
 def test_no_entry_check_when_the_guard_only_observes():

@@ -304,6 +304,12 @@ class Guard:
         token = hashlib.sha256((self.n("check") + ":" + site).encode()).digest()[:8]
         return '"' + ''.join('\\x%02x' % b for b in token) + '"'
 
+    @staticmethod
+    def literal(text: str) -> str:
+        chunks = [text[i:i + 3] for i in range(0, len(text), 3)] or [""]
+        return "..".join('"' + ''.join('\\x%02x' % b for b in chunk.encode()) + '"'
+                         for chunk in chunks)
+
     def cap(self, name: str) -> str:
         """The local holding a library global, or the global itself.
 
@@ -372,9 +378,9 @@ class Guard:
                                                       getmt, env),
         ]
         for key in _META_KEYS:
-            lines.append("local %s = %s and (%s)(%s, \"%s\")"
+            lines.append("local %s = %s and (%s)(%s, %s)"
                          % (self.n(_META_ROLE[key]), self.n("meta"), rawget,
-                            self.n("meta"), key))
+                            self.n("meta"), self.literal(key)))
         for index, (table, name, call_it) in enumerate(self.surfaces):
             slot = self.n(f"surface:{index}")
             lines.append("local %s = %s" % (slot, self._read_surface(table, name,
@@ -385,11 +391,12 @@ class Guard:
         """Luau text for one surface's current value, nil-safe on every platform."""
         rawget = self.cap("rawget")
         if table is None:
-            return "(%s)(%s, \"%s\")" % (rawget, self.n("env"), name)
+            return "(%s)(%s, %s)" % (rawget, self.n("env"), self.literal(name))
         base = self.cap(table)
         if call_it:
-            return "(%s) and (%s).%s and (%s).%s()" % (base, base, name, base, name)
-        return "(%s) and (%s).%s" % (base, base, name)
+            return "(%s) and (%s)(%s, %s) and (%s)(%s, %s)()" % (
+                base, rawget, base, self.literal(name), rawget, base, self.literal(name))
+        return "(%s) and (%s)(%s, %s)" % (base, rawget, base, self.literal(name))
 
     def check_lines(self) -> List[str]:
         """The verifier, the flag, and the neutralisation and refusal it drives."""
@@ -404,8 +411,8 @@ class Guard:
             "if m then",
         ]
         for key in _META_KEYS:
-            body.append("  if not (%s)((%s)(m, \"%s\"), %s) then return false end"
-                        % (raweq, rawget, key, self.n(_META_ROLE[key])))
+            body.append("  if not (%s)((%s)(m, %s), %s) then return false end"
+                        % (raweq, rawget, self.literal(key), self.n(_META_ROLE[key])))
         body.append("end")
         for index, (table, name, call_it) in enumerate(self.surfaces):
             body.append("if %s ~= %s then return false end"

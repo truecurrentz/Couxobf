@@ -555,6 +555,58 @@ def _plain_cond(numbers: Tuple[int, ...]) -> str:
     return "(" + " or ".join("op == %d" % x for x in numbers) + ")"
 
 
+
+def _dispatch_key_seed(entries: Sequence[_Entry], fmt: FormatSpec) -> int:
+    return (dispatch_seed(entries) ^ getattr(fmt, "arm_seed", 0) ^ 0xA3C59AC3) & 0xffffffff
+
+
+def _dispatch_key_number(number: int, seed: int, fmt: FormatSpec) -> int:
+    mask = (1 << (8 * max(1, int(getattr(fmt, "op_bytes", 1))))) - 1
+    salt = ((seed ^ (seed >> 9) ^ (seed << 7)) & mask)
+    return ((number ^ salt) + ((seed >> 16) & mask)) & mask
+
+
+def _dispatch_key_expr(var: str, seed: int, fmt: FormatSpec) -> str:
+    mask = (1 << (8 * max(1, int(getattr(fmt, "op_bytes", 1))))) - 1
+    salt = ((seed ^ (seed >> 9) ^ (seed << 7)) & mask)
+    bias = (seed >> 16) & mask
+    return "bit32.band(bit32.bxor(%s, %d) + %d, %d)" % (var, salt, bias, mask)
+
+
+
+def _local_ident(seed: int, tag: int) -> str:
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    x = (seed ^ (tag * 0x9E3779B1) ^ 0xA5A5A5A5) & 0xffffffff
+    chars = ["_"]
+    for _ in range(7):
+        x ^= (x << 13) & 0xffffffff
+        x ^= x >> 17
+        x ^= (x << 5) & 0xffffffff
+        chars.append(alphabet[x % len(alphabet)])
+    return "".join(chars)
+
+
+def _emit_handler_bank(lines: List[str], entries: Sequence[_Entry],
+                       n: Dict[str, str], fam: Family, fmt: FormatSpec,
+                       trace: Optional[List[Tuple[Tuple[int, ...], Tuple[str, ...]]]] = None
+                       ) -> Tuple[str, str]:
+    seed = _dispatch_key_seed(entries, fmt)
+    table_name = _local_ident(seed, 1)
+    call_name = _local_ident(seed, 2)
+    lines.append(f"  local {table_name} = {{}}")
+    for idx, entry in enumerate(entries, 1):
+        func_name = _local_ident(seed, 16 + idx)
+        lines.append(f"  local function {func_name}()")
+        for body_line in entry.body(n, fam, fmt):
+            lines.append(f"    {body_line}")
+        lines.append("  end")
+        for number in entry.numbers:
+            lines.append(f"  {table_name}[{_dispatch_key_number(number, seed, fmt)}] = {func_name}")
+        if trace is not None:
+            trace.append((tuple(entry.numbers), (_plain_cond(tuple(entry.numbers)),)))
+    return table_name, call_name
+
+
 def _emit_chain(lines: List[str], indent: str, entries: Sequence[_Entry],
                 n: Dict[str, str], fam: Family, fmt: FormatSpec,
                 path: Tuple[str, ...] = (),
@@ -623,12 +675,17 @@ def _emit_dispatch(lines: List[str], entries: Sequence[_Entry],
                    n: Dict[str, str], fam: Family, dispatcher: str,
                    fmt: FormatSpec,
                    trace: Optional[List[Tuple[Tuple[int, ...],
-                                              Tuple[str, ...]]]] = None
+                                              Tuple[str, ...]]]] = None,
+                   table_name: str = "", call_name: str = ""
                    ) -> None:
-    if str(dispatcher).strip().lower() not in DISPATCHERS:
-        # Legacy names all resolve to the one production dispatcher.
-        dispatcher = "woven"
-    _emit_chain(lines, "    ", entries, n, fam, fmt, (), trace)
+    seed = _dispatch_key_seed(entries, fmt)
+    if not table_name:
+        table_name = _local_ident(seed, 1)
+    if not call_name:
+        call_name = _local_ident(seed, 2)
+    lines.append(f"    local {call_name} = {table_name}[{_dispatch_key_expr('op', seed, fmt)}]")
+    lines.append(f"    if {call_name} == nil then error({_vm_fail(fmt, 1)}) end")
+    lines.append(f"    {call_name}()")
 
 
 #: The interpreter's local that holds a prototype's control-flow edge table.
@@ -755,14 +812,11 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
     lines += [
         # The entry point comes out of the payload header, which is inside the
         # authenticated blob, rather than from the descriptor table beside it.
-        # The two used to agree by construction and nothing checked that they
-        # still agreed: editing the plaintext `entry` in the emitted source
-        # moved the program counter into the middle of the bytecode without
-        # touching the MAC. Measured on a one-prototype build, entry values
-        # 13/17/21 of 59 scanned ran to completion with exit code 0 and
-        # silently wrong output.
         f"  local pc = {entry_expr}",
-    ] + ["  " + decl for decl in fam.state] + [
+    ] + ["  " + decl for decl in fam.state]
+    entries = dispatch_entries(opmap, spec)
+    handler_table, handler_call = _emit_handler_bank(lines, entries, n, fam, spec, trace)
+    lines += [
         "  while true do",
         # The selector comes from the generated reader, not from a `byte(code, pc)`
         # written here: the stream carries the format's image of the number, so
@@ -776,8 +830,8 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         *["    " + line for line in loop_guard],
     ]
 
-    _emit_dispatch(lines, dispatch_entries(opmap, spec), n, fam, dispatcher,
-                   spec, trace)
+    _emit_dispatch(lines, entries, n, fam, dispatcher,
+                   spec, trace, handler_table, handler_call)
     lines += [
         "  end",
         "end",

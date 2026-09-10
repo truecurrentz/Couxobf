@@ -556,31 +556,49 @@ class Reconstructor:
                                   values=[_name(self._param_name(pid, i))]))
         pc = self._pc_name(pid)
         stmts.append(A.Local(names=[_local_name(pc)], values=[_num(proto.entry)]))
+        if len(proto.blocks) == 1:
+            stmts.extend(self._block_body(proto, proto.blocks[0], pc))
+            return stmts
 
-        # The native flattened driver no longer uses one canonical
-        # ``while true; if pc == block`` signature.  The state stays numeric and
-        # exact, but the loop is keyed by the liveness of the state and the block
-        # tests can carry a build-local additive bias.
+        # The native flattened driver varies per function: some blocks use an
+        # affine image of the state, some a shifted image, and single-block
+        # functions above bypass the driver entirely.  That keeps reconstructed
+        # native code from becoming one giant repeated state-machine signature.
         salt = 0
         mul = 1
         modulus = 65536
+        mode = 0
         if self.vm_layout_rng is not None:
             try:
                 salt = 17 + self.vm_layout_rng.randbelow(60000)
                 mul = 3 + 2 * self.vm_layout_rng.randbelow(20000)
+                mode = self.vm_layout_rng.randbelow(3)
             except AttributeError:
                 salt = 0
                 mul = 1
+                mode = 0
         arms: List[Tuple[A.Expr, A.Block]] = []
         for b in proto.blocks:
-            left: A.Expr = A.Bin(
-                op="%",
-                left=A.Bin(op="+",
-                           left=A.Bin(op="*", left=_name(pc), right=_num(mul)),
-                           right=_num(salt)),
-                right=_num(modulus),
-            )
-            right: A.Expr = _num(((b.id * mul) + salt) % modulus)
+            if mode == 1:
+                left = A.Bin(op="%", left=A.Bin(op="-", left=_name(pc), right=_num(salt)),
+                             right=_num(modulus))
+                right = _num((b.id - salt) % modulus)
+            elif mode == 2:
+                left = A.Bin(op="%",
+                             left=A.Bin(op="+",
+                                        left=A.Bin(op="*", left=A.Bin(op="+", left=_name(pc), right=_num(salt)), right=_num(mul)),
+                                        right=_num(salt % 251)),
+                             right=_num(modulus))
+                right = _num((((b.id + salt) * mul) + (salt % 251)) % modulus)
+            else:
+                left = A.Bin(
+                    op="%",
+                    left=A.Bin(op="+",
+                               left=A.Bin(op="*", left=_name(pc), right=_num(mul)),
+                               right=_num(salt)),
+                    right=_num(modulus),
+                )
+                right = _num(((b.id * mul) + salt) % modulus)
             cond = A.Bin(op="==", left=left, right=right)
             arms.append((cond, A.Block(body=self._block_body(proto, b, pc))))
         stmts.append(A.While(
@@ -1084,7 +1102,7 @@ def reconstruct_protected(module: IRModule,
         pooled = lambda value: "%s(%d)" % (names["get"], pool_ticket(pool.slot(value)))
         vm_src = _wiring.prelude_source(plan, rec.vm_encoded, pooled, pooled,
                                         edges_expr=pooled,
-                                        entry_guard=guard.entry_lines(),
+                                        entry_guard=(),
                                         opaque_predicates=bool(opaque_predicates))
 
     # A program with no constants at all needs no pool: emitting the runtime
@@ -1105,7 +1123,7 @@ def reconstruct_protected(module: IRModule,
                            enc_domain=crypto_enc_domain,
                            mac_domain=crypto_mac_domain)))
 
-    runtime_guard_check = guard.n("check") if guard.refuses else ""
+    runtime_guard_check = ""
 
     pool_src = ""
     if need_pool:
@@ -1225,16 +1243,11 @@ def reconstruct_protected(module: IRModule,
         deps["pool"].add("crypto")
     if "bank" in deps and "crypto" in deps:
         deps["bank"].add("crypto")
-    # When level-2 guard refusal is enabled, pool/string-bank accessors call the
-    # same checker as VM entries before materializing plaintext.  That makes the
-    # guard a real dependency, not merely a block that happened to be emitted
-    # earlier in today's layout.
-    if runtime_guard_check:
-        for guarded in ("pool", "bank"):
-            if guarded in deps and "guard" in deps:
-                deps[guarded].add("guard")
+    # Integrity/decryption paths are intentionally independent of environment
+    # detection.  The guard block can refuse on its own, but pool/string/VM code
+    # does not branch on executor-surface checks while materializing payload.
     if "vm" in deps:
-        for need in ("pool", "helpers", "guard"):
+        for need in ("pool", "helpers"):
             if need in deps:
                 deps["vm"].add(need)
     order: List[str] = []

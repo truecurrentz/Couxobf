@@ -107,6 +107,11 @@ class ConstantPoolRuntime:
             return byte_literal(hashlib.sha256(key + nonce + tag + site).digest()[:8])
         trip = (f"  if not {guard_check}() then error({fail(b'guard')}) end\n"
                 if guard_check else "")
+        meta_name = n.get("meta", n["key"] + "m")
+        meta_items = [("key", key), ("nonce", nonce), ("tag", tag), ("ct", ciphertext)]
+        meta_items.sort(key=lambda item: hashlib.sha256(tag + item[0].encode()).digest())
+        meta_index = {name: i + 1 for i, (name, _data) in enumerate(meta_items)}
+        meta_rows = ",".join(byte_expr(data, n["lit"]) for _name, data in meta_items)
         ticket_expr = 'string.unpack(">I4", %s, 1)' % byte_literal(ticket_mask.to_bytes(4, "big"))
         deticket = (f"  i = bit32.bxor(i, {ticket_expr})\n" if ticket_mask else "")
         literal_helper = f"""local function {n['lit']}(parts)
@@ -178,10 +183,7 @@ end
         head = f"local {n['crypto']} = (function()\n{crypto}end)()\n" \
             if emit_crypto else ""
 
-        return f"""{head}{literal_helper}local {n['key']} = {byte_expr(key, n['lit'])}
-local {n['nonce']} = {byte_expr(nonce, n['lit'])}
-local {n['tag']} = {byte_expr(tag, n['lit'])}
-local {n['ct']} = {byte_expr(ciphertext, n['lit'])}
+        return f"""{head}{literal_helper}local {meta_name} = {{{meta_rows}}}
 local {n['plain']} = nil
 local {n['off']} = nil
 local {n['loaded']} = false
@@ -190,7 +192,7 @@ local function {n['load']}()
     return
   end
   {n['loaded']} = true
-  local p = {n['crypto']}.{n['c_open']}({n['key']}, {n['nonce']}, {n['ct']}, {n['tag']}, {byte_expr(aad, n['lit'])})
+  local p = {n['crypto']}.{n['c_open']}({meta_name}[{meta_index['key']}], {meta_name}[{meta_index['nonce']}], {meta_name}[{meta_index['ct']}], {meta_name}[{meta_index['tag']}], {byte_expr(aad, n['lit'])})
   if p == nil then
     error({fail(b'open')})
   end
@@ -291,6 +293,7 @@ def default_names(prefix: str = "_kQ") -> Dict[str, str]:
         "nonce": prefix + "2",
         "tag": prefix + "3",
         "ct": prefix + "4",
+        "meta": prefix + "m",
         "plain": prefix + "5",
         "off": prefix + "6",
         "loaded": prefix + "7",
