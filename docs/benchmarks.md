@@ -95,6 +95,26 @@ iteration (~20 instructions per loop pass). Closing that needs structural
 change (e.g. register file as locals for small prototypes), which the roadmap
 lists as follow-up work rather than promising it here.
 
+## Sealed-blob spelling (dense vs hex)
+
+Sealed material (pool ciphertext, string pages, ticket metadata) can ship as
+base85 over a per-build alphabet (`blob_encoding = "dense"`, the default) or
+in the historical escaped form (`hex`). Measured at equal protection, seed
+42, hardened profile:
+
+| example     | dense    | hex      | saving |
+|-------------|----------|----------|--------|
+| hello.luau  | 19 627 B | 19 809 B | 0.9 %  |
+| inventory   | 54 874 B | 57 473 B | 4.5 %  |
+| maze        | 78 673 B | 81 711 B | 3.7 %  |
+
+The data literals themselves shrink by the expected ~3.2×, but sealed
+material is only ~10 % of a hardened artifact; the interpreter, crypto module
+and descriptor tables dominate. The honest takeaway: dense is a free win
+(load-time decode only) but it is not *the* size lever. The decoder preamble
+costs ~1 KB, so builds with < 512 bytes of sealed material keep hex and
+report `dense-skipped` in the build report.
+
 ## The guard's cost
 
 `env_guard`/`dump_guard` level 2 (`hardened` and `maximum`) re-checks the

@@ -21,7 +21,7 @@ seek reads plausible bytes from the wrong place instead of failing.
 from __future__ import annotations
 
 import hashlib
-from typing import Dict
+from typing import Any, Dict
 
 from .constpool_runtime import byte_literal, _xor_bytes
 
@@ -103,7 +103,7 @@ class StringBankRuntime:
         return self.n["get"]
 
     def emit(self, sealed, crypto_src: str = "", guard_check: str = "",
-             ticket_mask: int = 0) -> str:
+             ticket_mask: int = 0, dense: Any = None) -> str:
         n = self.n
         ticket_mask &= 0xffffffff
         def fail(site: bytes) -> str:
@@ -130,7 +130,9 @@ class StringBankRuntime:
         ]
         meta_items.sort(key=lambda item: hashlib.sha256(sealed.ticket_tag + item[0].encode()).digest())
         meta_index = {name: i + 1 for i, (name, _data) in enumerate(meta_items)}
-        meta_rows = ",".join(byte_literal(data) for _name, data in meta_items)
+        meta_rows = ",".join((dense.expr(data) if dense is not None
+                              else byte_literal(data))
+                             for _name, data in meta_items)
         if self.emit_crypto:
             if not crypto_src:
                 from .luau_crypto import crypto_runtime
@@ -185,7 +187,9 @@ class StringBankRuntime:
                 f"end\n"
             )
 
-        return f"""{head}local {n['blob']} = {byte_literal(sealed.blob)}
+        blob_expr = (dense.expr(sealed.blob) if dense is not None
+                     else byte_literal(sealed.blob))
+        return f"""{head}local {n['blob']} = {blob_expr}
 local {meta_name} = {{{meta_rows}}}
 local function {unwrap_name}(v, m)
   local h = {n['crypto']}.{n['c_sha']}(m)

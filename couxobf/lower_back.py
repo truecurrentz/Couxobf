@@ -902,6 +902,7 @@ def reconstruct_protected(module: IRModule,
                           env_guard: int = 0,
                           dump_guard: int = 0,
                           guard_policy: str = "fail",
+                          blob_encoding: str = "hex",
                           names_out: Optional[Dict[str, Any]] = None) -> str:
     """Lower an IR module to protected, self-contained Luau source.
 
@@ -1125,9 +1126,31 @@ def reconstruct_protected(module: IRModule,
 
     runtime_guard_check = ""
 
+    # Sealed up front so the dense-encoding decision can measure what it is
+    # deciding about: the decoder preamble costs a fixed ~1 KB of artifact,
+    # and base85 saves ~2.75 source chars per sealed byte against the
+    # printer's decimal escapes, so below the threshold hex is the smaller
+    # spelling and dense would be pure overhead.
+    sealed = pool.seal() if need_pool else None
+    bank_sealed = bank.seal() if need_bank else None
+    dense_codec = None
+    dense_skipped = ""
+    if blob_encoding == "dense" and (need_pool or need_bank):
+        blob_bytes = 0
+        if sealed is not None:
+            blob_bytes += len(sealed.ciphertext) + len(sealed.aad) + 64
+        if bank_sealed is not None:
+            blob_bytes += (len(bank_sealed.blob) + len(bank_sealed.ticket_ct)
+                           + 64)
+        if blob_bytes >= 512:
+            from .runtime.dense import DenseCodec
+            dp = fresh_prefix(rng, prefixes)
+            dense_codec = DenseCodec(rng, {"dec": dp + "D", "rev": dp + "R"})
+        else:
+            dense_skipped = "dense-skipped:%d" % blob_bytes
+
     pool_src = ""
     if need_pool:
-        sealed = pool.seal()
         if names_out is not None:
             # Read here rather than where the pool was built: constants are
             # interned while the bodies are lowered, and the decoys are planted as
@@ -1142,7 +1165,8 @@ def reconstruct_protected(module: IRModule,
                                 guard_check=runtime_guard_check,
                                 ticket_mask=pool_ticket_mask,
                                 enc_domain=sealed.enc_domain,
-                                mac_domain=sealed.mac_domain)
+                                mac_domain=sealed.mac_domain,
+                                dense=dense_codec)
 
     bank_src = ""
     if need_bank:
@@ -1164,16 +1188,26 @@ def reconstruct_protected(module: IRModule,
             bn, cache_policy=string_cache_policy,
             emit_crypto=not crypto_src)
         bank_src = bank_runtime.emit(
-            bank.seal(),
+            bank_sealed,
             crypto_runtime({"xor": bn["c_xor"], "sha": bn["c_sha"],
                             "mac": bn["c_mac"], "open": bn["c_open"],
                             "seal": bn["c_seal"]},
                            enc_domain=crypto_enc_domain,
                            mac_domain=crypto_mac_domain) if not crypto_src else "",
             guard_check=runtime_guard_check,
-            ticket_mask=bank_ticket_mask)
+            ticket_mask=bank_ticket_mask,
+            dense=dense_codec)
 
+    dense_src = dense_codec.source(rng) if dense_codec is not None else ""
+    if names_out is not None:
+        if dense_codec is not None:
+            names_out["blob_encoding"] = "dense:" + dense_codec.digest
+        elif dense_skipped:
+            names_out["blob_encoding"] = dense_skipped
+        else:
+            names_out["blob_encoding"] = "hex"
     crypto_block = _parser.parse(crypto_src, "<crypto>") if crypto_src else None
+    dense_block = _parser.parse(dense_src, "<dense>") if dense_src else None
     pool_block = _parser.parse(pool_src, "<constpool>") if pool_src else None
     bank_block = _parser.parse(bank_src, "<stringbank>") if bank_src else None
     # The helper functions have to be in scope too; a loop or a multi-value
@@ -1190,8 +1224,8 @@ def reconstruct_protected(module: IRModule,
     # a ParseError whose line number points into source nobody wrote.
     vm_block = _parser.parse(vm_src, "<vm>") if vm_src else None
 
-    blocks = [b for b in (crypto_block, pool_block, bank_block, helpers,
-                          vm_block) if b is not None]
+    blocks = [b for b in (crypto_block, dense_block, pool_block, bank_block,
+                          helpers, vm_block) if b is not None]
     captured: Dict[str, str] = {}
     if guard.active and blocks:
         # The capture set is decided *here*, once the emitted scaffolding exists:
@@ -1233,6 +1267,7 @@ def reconstruct_protected(module: IRModule,
     component_blocks: Dict[str, List[A.Stmt]] = {
         "guard": _guard_stmts(),
         "crypto": list(crypto_block.body) if crypto_block is not None else [],
+        "dense": list(dense_block.body) if dense_block is not None else [],
         "pool": list(pool_block.body) if pool_block is not None else [],
         "bank": list(bank_block.body) if bank_block is not None else [],
         "helpers": list(helpers.body),
@@ -1243,6 +1278,11 @@ def reconstruct_protected(module: IRModule,
         deps["pool"].add("crypto")
     if "bank" in deps and "crypto" in deps:
         deps["bank"].add("crypto")
+    # The dense decoder must exist before the runtimes whose literals call it.
+    if "dense" in deps:
+        for dependent in ("pool", "bank"):
+            if dependent in deps:
+                deps[dependent].add("dense")
     # Integrity/decryption paths are intentionally independent of environment
     # detection.  The guard block can refuse on its own, but pool/string/VM code
     # does not branch on executor-surface checks while materializing payload.

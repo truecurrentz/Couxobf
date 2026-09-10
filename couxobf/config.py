@@ -272,6 +272,18 @@ class Config:
     #: that legitimately has a hooked environment.
     guard_policy: str = "fail"
 
+    # ---- output encoding -------------------------------------------------
+    #: How sealed blobs (pool ciphertext, string-bank pages, ticket metadata)
+    #: are spelled in the artifact.  "dense" ships them as base85 over a
+    #: per-build alphabet (1.25 source chars per byte, decoded once at load);
+    #: "hex" keeps the historical escaped form (~4 chars per byte) for
+    #: debugging and as a stable baseline.  Same protection either way -- the
+    #: masking and authenticated encryption are untouched; only the spelling
+    #: of already-sealed bytes changes.  The decoder preamble costs a fixed
+    #: ~1 KB, so builds whose sealed material is below ~512 bytes keep hex
+    #: and say "dense-skipped" in the report.
+    blob_encoding: str = "dense"
+
     # ---- environment -----------------------------------------------------
     debug_build: bool = False
 
@@ -323,6 +335,8 @@ class Config:
         self.vm_variety = max(1, min(4, int(self.vm_variety)))
         if self.guard_policy not in ("fail", "ignore"):
             raise ValueError("guard_policy must be 'fail' or 'ignore'")
+        if self.blob_encoding not in ("dense", "hex"):
+            raise ValueError("blob_encoding must be 'dense' or 'hex'")
         if self.hash_comments not in ("auto", "strip", "strict"):
             raise ValueError("hash_comments must be auto, strip or strict")
         self.chunk_size = max(256, int(self.chunk_size))
@@ -469,6 +483,7 @@ class Config:
         "env_guard",
         "dump_guard",
         "guard_policy",
+        "blob_encoding",
         "hash_comments",
         "fingerprint",
         "minify",

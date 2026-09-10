@@ -430,6 +430,7 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         env_guard=int(config.env_guard),
         dump_guard=int(config.dump_guard),
         guard_policy=str(config.guard_policy),
+        blob_encoding=str(config.blob_encoding),
         names_out=runtime_names,
     )
 

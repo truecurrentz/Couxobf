@@ -333,7 +333,7 @@ P3 = polish. Each item names the axes above.
 | R1 | Restore multi-group VMs: `vm_variety` actually drives `make_plan`; report and docs reflect it | dead knob, dishonest `maximum` profile, single recognizable VM pattern | **P0** |
 | R2 | Real opaque predicates + opaque dispatch arms (build-keyed, never foldable, never dead) | `opaque_predicates` is a tautology today; docs admit the gap | **P1** |
 | R3 | Regression automation: reuse-audit thresholds as a test; seeded differential fuzz battery | "detect and prevent regressions automatically" | **P0/P1** |
-| R4 | Dense blob encoding: per-build 85-alphabet encoder for pool/bank/payload literals | `\xHH` = 4 chars/byte; hello.luau at 739×; size ceiling forces dropping real protection | **P1** |
+| R4 | Dense blob encoding: per-build 85-alphabet encoder for pool/bank/payload literals | `\xHH` = 4 chars/byte; hello.luau at 739×; size ceiling forces dropping real protection | **P1 — done** |
 | R5 | Closure-capable virtualization (upvalues via shared cell tables; varargs via frame field) | our biggest coverage gap vs Prometheus/Clyde | **P2** |
 | R6 | Per-group constant pools with group-format AAD binding | one recovered accessor currently yields all constants | **P2** |
 | R7 | Exact integer arithmetic number encoding (split/add/fold) behind `numeric_protection_level=2` | numbers currently only get float-safe disguises | **P2** |
@@ -343,7 +343,7 @@ P3 = polish. Each item names the axes above.
 | R11 | Dispatcher speed option: inlined-chain dispatch for small groups | 2 closure calls/instruction is slow | **P2 — done** |
 | R12 | Remove dead config surface; every remaining field either wired or gone (see G) | 15 pending fields erode trust in the report | **P1** |
 
-Status: R0, R1 and R11 are implemented and measured (see
+Status: R0, R1, R4 and R11 are implemented and measured (see
 `docs/benchmarks.md`); R3's fuzz battery is in
 (`tests/test_fuzz_differential.py`) with the reuse-audit thresholds still to
 become a test; everything else is as listed.
@@ -469,7 +469,7 @@ per-transformer pytest convention.
 *Cost.* Test time only. *Risk.* None.
 *Default.* n/a.
 
-### R4 — Dense blob encoding (P1)
+### R4 — Dense blob encoding (P1) — **implemented**
 
 *Problem.* Sealed blobs ship as `\xHH` escapes (4 source chars per byte).
 hello.luau grows 739×; the size ceiling makes the budget ladder drop real
@@ -482,23 +482,31 @@ fingerprintable, while an alphabet decoder is ~12 lines.
 *Design.* Per build, draw a permutation of an 85-char printable-safe alphabet
 (no quote/backslash/newline, ASCII to stay `\xHH`-free). Emit blobs as
 base85 over the alphabet (5 chars per 4 bytes: 1.25 chars/byte vs 4). The
-decoder table is emitted as one masked literal (reusing
-`constpool_runtime`'s fragment machinery) and assembled at runtime, so the
-alphabet itself never appears contiguously. Blobs covered: pool ciphertext,
-bank pages, VM payloads, edge tables.
+alphabet is emitted as escaped chunks whose locals are declared in a
+build-shuffled order and concatenated back in alphabet order, so the base
+never appears contiguously and the declaration order carries no information.
+Blobs covered: pool ciphertext, bank pages, VM payloads, edge tables -- all
+of them ride the pool/bank runtimes, so the single decoder preamble serves
+every blob.
 
-*Why better.* ~3.2× denser data → smaller artifacts → the budget ladder keeps
-the strong passes instead of trimming them; the alphabet is one more per-build
-axis (reuse-audit `shape`).
+*As built, and what the measurement corrected.* The data literals do shrink
+by the expected ~3.2×, but sealed material is only ~10 % of a hardened
+artifact -- the interpreter, the crypto module and the descriptor tables are
+the other 90 %. Measured end-to-end saving is therefore ~1–4.5 % of total
+size (hello 0.9 %, inventory 4.5 %, maze 3.7 % at equal protection), not the
+45 % this section once hoped for. The decoder preamble costs a fixed ~1 KB,
+so builds with < 512 bytes of sealed material keep hex and report
+"dense-skipped" -- the draw happens, the overhead does not. The size target
+the original estimate pointed at is really the *fixed* runtime costs, which
+is a different (larger) piece of work.
 
-*Cost.* Decode is one string-index pass per blob at load; load-time only,
-microseconds per KB. Build time +~10 %.
-*Compatibility.* None (pure data layer).
-*Test.* Round-trip unit tests per blob type at odd lengths (1..7 bytes);
-existing pool/bank/payload suites; size assertions (maze output shrinks ≥ 45 %
-at equal protection).
-*Default.* On; a `Config.blob_encoding = "dense" | "hex"` escape hatch keeps
-the historical form for debugging (and gives the audit a stable baseline).
+*Cost.* Decode is one indexing pass per blob at load; load-time only.
+*Compatibility.* None (pure data layer). *Tests.* `tests/test_dense.py`:
+round trips per group shape, alphabet hygiene, the emitted decoder executed
+under the pinned toolchain on odd lengths and 1 KB of random bytes, the
+skip-threshold behaviour, and dense-vs-hex differential on a real example.
+*Default.* On, with the threshold escape above; `Config.blob_encoding =
+"dense" | "hex"` is wired through the API option surface and the web form.
 
 ### R5 — Closure-capable virtualization (P2)
 

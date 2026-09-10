@@ -86,6 +86,10 @@ FIELD_RANGES: Dict[str, Tuple[float, float]] = {
 FIELD_CHOICES: Dict[str, Tuple[str, ...]] = {
     "guard_policy": GUARD_POLICIES,
     "hash_comments": COMMENT_MODES,
+    # Base85-over-per-build-alphabet vs the historical escaped spelling of
+    # sealed blobs.  Both carry the same protection; the UI offers the choice
+    # because a debugging session sometimes wants to read the bytes as shipped.
+    "blob_encoding": ("dense", "hex"),
     # Not the enum: DispatcherFamily carries ``table``, ``segmented`` and
     # ``indirect`` so a config file can express the intent, and the runtime
     # raises for them.  Offering a value that is refused at build time is the same

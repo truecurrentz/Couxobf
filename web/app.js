@@ -165,6 +165,12 @@ const SPEC = [
        "tooling uses), `strip` always, `strict` refuses the input. A # inside a " +
        "string or an operator like #t is never touched, and the stripped source is " +
        "re-parsed to prove nothing was cut through."],
+      ["blob_encoding", "Blob spelling", "select",
+       "How sealed blobs (pool ciphertext, string pages) are written. `dense` " +
+       "ships base85 over a per-build alphabet (~1.25 chars per byte, decoded " +
+       "once at load); `hex` keeps the escaped form (~4 chars per byte) for " +
+       "debugging. Same protection either way, and tiny builds keep `hex` " +
+       "automatically when the decoder would cost more than it saves."],
       ["max_output_growth", "Size budget", "float",
        "Above this ratio the pipeline gives up the most expensive optional passes " +
        "and rebuilds, then reports what it dropped. 0 disables the check. A maximum " +
@@ -841,6 +847,7 @@ const FALLBACK = {
   cache_policy: { kind: "enum", choices: ["none", "bounded", "full"], default: "none" },
   guard_policy: { kind: "choice", choices: ["fail", "ignore"], default: "fail" },
   hash_comments: { kind: "choice", choices: ["auto", "strip", "strict"], default: "auto" },
+  blob_encoding: { kind: "choice", choices: ["dense", "hex"], default: "dense" },
   instruction_formats: { kind: "int", min: 0, max: 2, default: 1 },
   opcode_aliases: { kind: "int", min: 0, max: 4, default: 1 },
   string_protection_level: { kind: "int", min: 0, max: 3, default: 2 },
