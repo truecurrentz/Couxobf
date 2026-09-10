@@ -237,6 +237,8 @@ local function {n['load']}()
       q += 4 + string.unpack(">I4", p, q)
     elseif t == 4 then
       q += 12
+    elseif t == 6 then
+      q += 8
     elseif t == 5 then
       local c = string.unpack(">I2", p, q)
       q += 2
@@ -275,6 +277,12 @@ local function {n['mat']}(i)
   elseif t == 4 then
     local seed = string.unpack(">I4", p, q + 1)
     return string.unpack(">d", {n['dyn']}(string.sub(p, q + 5, q + 12), seed), 1)
+  elseif t == 6 then
+    -- Exact-integer split: two 32-bit halves rebuilt by integer arithmetic.
+    -- Both terms are exact doubles by the encoder's eligibility rule, so the
+    -- sum is the original value bit-for-bit -- no rounding anywhere.
+    local hi, lo = string.unpack(">i4I4", p, q + 1)
+    return hi * 4294967296 + lo
   else
     local parts = {{}}
     local m = 0

@@ -204,13 +204,14 @@ class Config:
 
     # ---- data protection -------------------------------------------------
     string_protection_level: int = 2
-    #: How numbers are stored in the pool.  0 stores the double; 1 stores an
-    #: additively or multiplicatively disguised form; 2 also splits large
-    #: integers into two halves.  Every scheme is exact in Luau's float
-    #: semantics -- the point is that a decoder that only looks for
-    #: `string.unpack(">d")` sees nothing -- and NaN, signed zero and the
-    #: infinities stay on the exact path because no arithmetic encoding is safe
-    #: for them.
+    #: How numbers are stored in the pool.  0 stores the double; 1 masks the
+    #: double's bytes with a per-entry keystream; 2 also rebuilds exact
+    #: integers (abs(v) <= 2**53) from two 32-bit halves at runtime, so no
+    #: double bytes for them exist in the blob.  Every scheme is exact in
+    #: Luau's float semantics -- the point is that a decoder that only looks
+    #: for `string.unpack(">d")` sees nothing -- and NaN, signed zero and the
+    #: infinities stay on the masked-double path because no arithmetic
+    #: encoding is safe for them.
     numeric_protection_level: int = 1
     constant_protection_level: int = 1
     table_key_protection: bool = True

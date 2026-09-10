@@ -336,14 +336,14 @@ P3 = polish. Each item names the axes above.
 | R4 | Dense blob encoding: per-build 85-alphabet encoder for pool/bank/payload literals | `\xHH` = 4 chars/byte; hello.luau at 739×; size ceiling forces dropping real protection | **P1 — done** |
 | R5 | Closure-capable virtualization (upvalues via shared cell tables; varargs via frame field) | our biggest coverage gap vs Prometheus/Clyde | **P2** |
 | R6 | Per-group constant pools with group-format AAD binding | one recovered accessor currently yields all constants | **P2** |
-| R7 | Exact integer arithmetic number encoding (split/add/fold) behind `numeric_protection_level=2` | numbers currently only get float-safe disguises | **P2** |
+| R7 | Exact integer arithmetic number encoding (split/add/fold) behind `numeric_protection_level=2` | numbers currently only get float-safe disguises | **P2 — done** |
 | R8 | `--!couxobf:` directives (`no_virtualize`, `virtualize`) | per-function user control, Luaq parity | **P2** |
 | R9 | Index-to-number pass for provably-static table keys (opt-in) | structural transform at zero runtime cost | **P3** |
 | R10 | Inline-small-helpers AST pass (opt-in, node cap) | glue-code reduction, Luaq parity | **P3** |
 | R11 | Dispatcher speed option: inlined-chain dispatch for small groups | 2 closure calls/instruction is slow | **P2 — done** |
 | R12 | Remove dead config surface; every remaining field either wired or gone (see G) | 15 pending fields erode trust in the report | **P1 — done** |
 
-Status: R0, R1, R3, R4, R11 and R12 are implemented and measured (see
+Status: R0, R1, R3, R4, R7, R11 and R12 are implemented and measured (see
 `docs/benchmarks.md`), and R2's VM-side predicate tap is implemented (the
 native-side split arms remain deferred); the fuzz battery is in
 `tests/test_fuzz_differential.py`, and the reuse-audit's verdict is pinned
@@ -576,26 +576,34 @@ group (we already fragment metadata). Native code keeps one shared pool.
 existing seal/open suites per group.
 *Default.* On when `vm_variety > 1`.
 
-### R7 — Exact integer arithmetic encoding (P2)
+### R7 — Exact integer arithmetic encoding (P2) — **implemented**
 
-*Problem.* `numeric_protection_level=2` splits doubles today; integers can do
-better than storage-level disguise.
+*Problem.* `numeric_protection_level=2` masked double bytes today; integers
+can do better than storage-level disguise.
 
 *Reference.* LuaObfuscatorV2 numeric mutations; Prometheus
 NumbersToExpressions. Their versions rewrite AST expressions (visible,
 foldable); ours stays in the pool layer.
 
-*Design.* For integer-valued doubles with |v| < 2^52: store
-`(v - k1) xor k2` style exact decompositions (Luau bitwise ops are exact on
-32-bit; split wider values into two 32-bit halves), reassembled by the pool
-decoder. NaN/±0/inf/non-integers keep the exact `>d` path. Determinism and
-exactness are unit-proven before default-on.
+*As built.* A pool entry for an exact-integer double with `|v| <= 2**53`
+stores two 32-bit halves (`TAG_NUM_SPLIT`: signed hi, unsigned lo, 8 bytes
+— the same footprint as the double) and the runtime rebuilds the value as
+`hi * 2**32 + lo`. Every term is an exact double and the sum stays under
+2^54, so the reconstruction is bit-exact by construction; the eligibility
+rule (`_split_halves`) is what proves it, refusing non-integers, the
+infinities, NaN, `|v| > 2**53` and negative zero (arithmetic cannot carry
+the sign bit — `-0.0 + 0.0` is `+0.0`). Everything refused falls through
+to the masked-double path, so level 2 is strictly stronger than level 1,
+never weaker. A decoder that scans the blob for `string.unpack(">d")`
+finds no bytes for split constants at all.
 
-*Cost.* Decoder +2 integer ops per numeric constant, load-time only.
-*Compatibility.* None if exactness tests pass (the earlier rejection in
-checklist #27 was about *float* arithmetic encodings — this design avoids
-them).
-*Default.* On at level 2.
+*Cost.* One extra unpack, one multiply and one add per split constant,
+load-time only (the materializer path); zero runtime on cached policies.
+*Compatibility.* None — exactness is unit-proven across the edge values
+(2**53, 2**32 boundaries, negatives, ±0, NaN, 1e300) and by running a
+protected build that prints every split constant under the pinned
+toolchain (`tests/test_numeric_split.py`).
+*Default.* On at level 2 (the `maximum` profile sets it).
 
 ### R8 — Directives (P2)
 
