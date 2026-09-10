@@ -578,13 +578,19 @@ def _dispatch_key_seed(entries: Sequence[_Entry], fmt: FormatSpec) -> int:
 def _dispatch_key_number(number: int, seed: int, fmt: FormatSpec) -> int:
     mask = (1 << (8 * max(1, int(getattr(fmt, "op_bytes", 1))))) - 1
     salt = ((seed ^ (seed >> 9) ^ (seed << 7)) & mask)
-    return ((number ^ salt) + ((seed >> 16) & mask)) & mask
+    pt = fmt.key_tap_value() if getattr(fmt, "key_taps", ()) else 0
+    return ((number ^ salt ^ pt) + ((seed >> 16) & mask)) & mask
 
 
 def _dispatch_key_expr(var: str, seed: int, fmt: FormatSpec) -> str:
     mask = (1 << (8 * max(1, int(getattr(fmt, "op_bytes", 1))))) - 1
     salt = ((seed ^ (seed >> 9) ^ (seed << 7)) & mask)
     bias = (seed >> 16) & mask
+    if getattr(fmt, "key_taps", ()):
+        # The tapped shape folds the payload-read term in at runtime; see
+        # the chain ladder for why the text alone must not decode.
+        return ("bit32.band(bit32.bxor(bit32.bxor(%s, %d), _pt) + %d, %d)"
+                % (var, salt, bias, mask))
     return "bit32.band(bit32.bxor(%s, %d) + %d, %d)" % (var, salt, bias, mask)
 
 
@@ -725,13 +731,26 @@ def _emit_chain_ladder(lines: List[str], entries: Sequence[_Entry],
     """
     mask = (1 << (8 * max(1, fmt.op_bytes))) - 1
     salt = getattr(fmt, "dispatch_salt", 0) & mask
+    # R2's tap: when the format taps a header filler byte, the scramble
+    # gains a term the interpreter's text does not carry.  ``_pt`` is read
+    # from the payload once per call, so the ladder's constants are an image
+    # of the numbering under a salt the (encrypted) payload holds -- lifting
+    # the interpreter alone no longer decodes the arms.  ``bxor`` stays
+    # bijective in ``op`` either way, so an unassigned number still cannot
+    # collide with a real arm.
+    tapped = bool(getattr(fmt, "key_taps", ()))
+    pt = fmt.key_tap_value() if tapped else 0
     dk = _local_ident((getattr(fmt, "arm_seed", 0) ^ salt ^ 0xC417), 7)
-    lines.append("    local %s = bit32.band(bit32.bxor(op, %d), %d)"
-                 % (dk, salt, mask))
+    if tapped:
+        lines.append("    local %s = bit32.band(bit32.bxor(op, %d, _pt), %d)"
+                     % (dk, salt, mask))
+    else:
+        lines.append("    local %s = bit32.band(bit32.bxor(op, %d), %d)"
+                     % (dk, salt, mask))
     first = True
     for entry in entries:
         number = entry.numbers[0]
-        key = (number ^ salt) & mask
+        key = (number ^ salt ^ pt) & mask
         cond = "%s == %d" % (dk, key)
         lines.append("    %s %s then" % ("if" if first else "elseif", cond))
         first = False
@@ -905,6 +924,13 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         # authenticated blob, rather than from the descriptor table beside it.
         f"  local pc = {entry_expr}",
     ] + ["  " + decl for decl in fam.state]
+    tap_read = spec.key_tap_read(code)
+    if tap_read:
+        # The dispatch key's payload term, read once per call.  Placed with
+        # the frame locals rather than in the loop: it cannot change while
+        # the payload runs, and recomputing it per instruction would charge
+        # the hot path for a constant.
+        lines.append("  local _pt = %s" % tap_read)
     entries = dispatch_entries(opmap, spec)
     shape = getattr(spec, "dispatch_shape", "bank")
     if shape == "chain":
@@ -961,7 +987,7 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
 _CORE_TOKENS = (("pc", "pc"), ("R", "regs"), ("K", "consts"), ("E", "env"),
                 ("EG", "edges"), ("_ro", "ro"), ("_r8", "r8"),
                 ("_rr", "rr"), ("_rw", "rw"), ("_rk", "rk"),
-                ("_rp", "rp"), ("_rt", "rt"))
+                ("_rp", "rp"), ("_rt", "rt"), ("_pt", "pt"))
 
 
 def _le_read(read: str, at: int, width: int) -> str:

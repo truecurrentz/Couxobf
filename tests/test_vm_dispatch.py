@@ -23,8 +23,9 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from couxobf import rng as rngmod
+from couxobf.toolchain import find_toolchain
 from couxobf.vm import runtime
-from couxobf.vm.format import FUSION_RULES, FormatSpec
+from couxobf.vm.format import FUSION_RULES, FormatSpec, HeaderLayout
 from couxobf.vm.isa import OpcodeMap
 
 #: Interpreter locals, fixed here so a failure names the shape it came from.
@@ -53,6 +54,22 @@ FORMATS = (
     FormatSpec(inline_reads=True, arm_seed=19),
     FormatSpec(dispatch_shape="chain", dispatch_salt=0x55, arm_seed=5,
                inline_reads=True),
+    # R2's predicate tap: the dispatch key is folded with a header filler
+    # byte that every payload of the group carries, so the ladder's constants
+    # are an image of the numbering under a salt the payload holds.  Routing
+    # must stay exact with the extra term, for both dispatch shapes.
+    FormatSpec(dispatch_shape="chain", dispatch_salt=0x4B, arm_seed=9,
+               header=HeaderLayout(
+                   fields=(("nparams", 1), ("flags", 1), ("nregs", 2),
+                           ("nconsts", 2), ("entry", 2)),
+                   filler=((2, 0xA5),), entry_bias=0, legacy=False),
+               key_taps=(2,)),
+    FormatSpec(arm_seed=23,
+               header=HeaderLayout(
+                   fields=(("nparams", 1), ("flags", 1), ("nregs", 2),
+                           ("nconsts", 2), ("entry", 2)),
+                   filler=((1, 0x3C),), entry_bias=0, legacy=False),
+               key_taps=(1,)),
 )
 
 _CASES = [(seed, sparse, ratio, variant)
@@ -177,3 +194,123 @@ def test_the_guard_still_rejects_unassigned_numbers():
         assert not hits, (
             f"{dispatcher}: {len(hits)} unassigned numbers reach an arm, e.g. "
             f"{hits[:6]} -- the guard would run a handler instead of refusing")
+
+
+# ---------------------------------------------------------------------------
+# R2: the predicate tap -- dispatch keys folded with a payload header byte
+# ---------------------------------------------------------------------------
+
+def _tapped_chain():
+    return FormatSpec(dispatch_shape="chain", dispatch_salt=0x4B, arm_seed=9,
+                      header=HeaderLayout(
+                          fields=(("nparams", 1), ("flags", 1), ("nregs", 2),
+                                  ("nconsts", 2), ("entry", 2)),
+                          filler=((2, 0xA5),), entry_bias=0, legacy=False),
+                      key_taps=(2,))
+
+
+def test_the_tapped_ladder_reads_the_payload_and_rekeys_the_arms():
+    """The chain's scramble gains a term the interpreter text does not carry.
+
+    ``_pt`` is read once from the header filler, and every ladder constant is
+    the numbering folded with salt *and* the tap value -- so the constants in
+    the text must not equal the salt-only image, while still covering every
+    assigned number exactly once.
+    """
+    fmt = _tapped_chain()
+    opmap = _opmap(5, 1, 0.0)
+    text, trace, _bk = _emit(opmap, "woven", fmt)
+    assert re.search(r"local \w+ = _bd\(_kS, 3\)", text), (
+        "the tap read is missing or at the wrong offset")
+    m = re.search(r"local (\w+) = bit32\.band\(bit32\.bxor\(op, (\d+), (\w+)\), (\d+)\)",
+                  text)
+    assert m, "the scramble did not fold the payload term in"
+    assert m.group(2) == "75" and m.group(4) == "255"
+    pt_name = m.group(3)
+    assert pt_name != "op"
+    keys = [int(k) for k in re.findall(r"%s == (\d+)" % re.escape(m.group(1)),
+                                       text)]
+    salt, mask, pt = 0x4B, 255, fmt.key_tap_value()
+    assert pt == 0xA5
+    want = {(n ^ salt ^ pt) & mask for n in opmap.to_op}
+    assert set(keys) == want, "ladder constants are not the tapped image"
+    assert {(n ^ salt) & mask for n in opmap.to_op} != want, (
+        "the tap value collapsed to nothing")
+
+
+def test_the_tapped_bank_key_expression_folds_the_payload_term():
+    fmt = FormatSpec(arm_seed=23,
+                     header=HeaderLayout(
+                         fields=(("nparams", 1), ("flags", 1), ("nregs", 2),
+                                 ("nconsts", 2), ("entry", 2)),
+                         filler=((1, 0x3C),), entry_bias=0, legacy=False),
+                     key_taps=(1,))
+    opmap = _opmap(4, 1, 0.0)
+    text, _trace, _bk = _emit(opmap, "woven", fmt)
+    assert re.search(r"local \w+ = _bd\(_kS, 2\)", text), "no tap read"
+    assert re.search(r"bit32\.bxor\(bit32\.bxor\(op, \d+\), \w+\)", text), (
+        "the bank key did not fold the payload term in")
+
+
+@pytest.mark.skipif("not find_toolchain().can_execute")
+def test_a_tapped_build_executes_like_its_source():
+    """Force every drawn format to carry a tap, then run the artifact.
+
+    The tap changes the dispatch keying of whichever shape the group drew,
+    so executing the build is the check that the encoder, the ladder and the
+    bank all agree with the payload about what the header byte is.
+    """
+    import couxobf.vm.format as F
+    import couxobf.vm.wiring as W
+    from dataclasses import replace
+
+    src = ("local function acc(n)\n"
+           "  local t = 0\n"
+           "  for i = 1, n do\n"
+           "    if i % 3 == 0 then t = t + i * 2 else t = t + i end\n"
+           "  end\n"
+           "  return t\n"
+           "end\n"
+           "print(acc(60), acc(7))\n")
+
+    orig_draw = F.draw
+
+    def forced(rng, prefs=None, **kw):
+        spec = orig_draw(rng, prefs, **kw)
+        if spec.key_taps or spec.header.legacy:
+            return spec
+        _p, filler_at, _t = spec.header._map()
+        if not filler_at:
+            spec = replace(spec, header=replace(spec.header,
+                                                filler=((1, 0x5A),)))
+            _p, filler_at, _t = spec.header._map()
+        return replace(spec, key_taps=(sorted(filler_at)[0],))
+
+    from couxobf.config import Config
+    from couxobf.pipeline import build
+    from couxobf.toolchain import execute
+
+    F.draw = forced
+    W.draw = forced
+    try:
+        out = build(src, Config(reproducible_seed=29,
+                                min_virtualize_body_nodes=1,
+                                max_output_growth=0),
+                    name="tap.luau", verify=True)
+    finally:
+        F.draw = orig_draw
+        W.draw = orig_draw
+    assert out.stats.virtualized >= 1
+    tapped = [g for g in out.stats.vm_groups if (g.get("format") or {}).get("key_taps")]
+    assert tapped, "no drawn group carried a tap under the forced draw"
+    # The artifact's key math names the payload term, not just the salt.
+    # (Minified output drops spaces and ``bit32`` arrives as a captured,
+    # renamed local, so both are wildcards here.)
+    assert (re.search(r"\w+\.bxor\(op,\s*\d+,\s*\w+\)", out.source)
+            or re.search(r"\w+\.bxor\(\w+\.bxor\(op,\s*\d+\),\s*\w+\)",
+                         out.source)), "no tapped key expression in the artifact"
+    tc = find_toolchain()
+    want = execute(tc, src, "want.luau", timeout=30)
+    got = execute(tc, out.source, "got.luau", timeout=30)
+    assert got.returncode == 0, got.stderr[:300]
+    assert got.stdout == want.stdout, (got.stdout, want.stdout)

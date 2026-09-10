@@ -331,7 +331,7 @@ P3 = polish. Each item names the axes above.
 |---|---|---|---|
 | R0 | Green baseline everywhere: test corpus must not require an external Luau checkout; add repo-local conformance fixtures | failing/erroring tests hide regressions | **P0** |
 | R1 | Restore multi-group VMs: `vm_variety` actually drives `make_plan`; report and docs reflect it | dead knob, dishonest `maximum` profile, single recognizable VM pattern | **P0** |
-| R2 | Real opaque predicates + opaque dispatch arms (build-keyed, never foldable, never dead) | `opaque_predicates` is a tautology today; docs admit the gap | **P1** |
+| R2 | Real opaque predicates + opaque dispatch arms (build-keyed, never foldable, never dead) | `opaque_predicates` is a tautology today; docs admit the gap | **P1** (VM tap done; native split arms pending) |
 | R3 | Regression automation: reuse-audit thresholds as a test; seeded differential fuzz battery | "detect and prevent regressions automatically" | **P0/P1** |
 | R4 | Dense blob encoding: per-build 85-alphabet encoder for pool/bank/payload literals | `\xHH` = 4 chars/byte; hello.luau at 739×; size ceiling forces dropping real protection | **P1 — done** |
 | R5 | Closure-capable virtualization (upvalues via shared cell tables; varargs via frame field) | our biggest coverage gap vs Prometheus/Clyde | **P2** |
@@ -407,7 +407,7 @@ stop matching hardened; differential fixture suite at variety=2,3.
 *Default.* On at `maximum` (as the profile already promises); 1 at
 hardened/balanced/compact.
 
-### R2 — Real opaque predicates and opaque arms (P1)
+### R2 — Real opaque predicates and opaque arms (P1) — **VM side implemented**
 
 *Problem.* Today's `opaque_predicates` emits
 `if not ((op == op) and (pc >= 1) and (#code >= pc))` — a boundary check, not
@@ -420,31 +420,45 @@ data.
 in that form. The technique itself is standard; our version keys it to the
 AEAD material so it cannot be constant-folded from source alone.
 
-*Design.*
-- **VM side:** the dispatch key already mixes `op` with `pc`
-  (`_vr = bxor(op, band(pc, 65535))`). Extend the per-group format with a
-  drawn predicate tap: one or two payload bytes at build-known offsets feed
-  `band/bxor` terms into the arm condition. Because the terms come from
-  authenticated payload data, folding is impossible without decrypting the
-  pool — the analyst must run the pipeline we want them to run.
-- **Native side:** in the flattened state machine, draw *split arms*: two
-  `elseif` arms whose conditions are `state_enc == f(id)` and
-  `state_enc == g(id)` with exactly one satisfiable given the build's
-  modulus/affine choices; the unsatisfiable one holds a *copy* of a real
-  block's tail assignment sequence produced from the same IR (so even under
-  a bug it executes the same semantics). No dead branch ever exists — only a
-  branch the build can prove unreachable but a reader cannot.
+*As built (VM side).* The per-group format draws a **key tap**: a byte at a
+build-known offset in the payload header's filler region (a byte the encoder
+writes identically into every payload of the group). The dispatch key folds
+that byte in — `band(bxor(op, salt, _pt), mask)` for the chain,
+`band(bxor(bxor(op, salt), _pt) + bias, mask)` for the bank — where `_pt` is
+read from the payload once per call. Because the tap value lives inside the
+encrypted pool, the ladder/bank constants in the interpreter's text are an
+image of the numbering under a salt the text does not carry: lifting the
+interpreter alone no longer decodes the arms, and a matcher has to decrypt
+the payload to recover the table. `bxor` stays bijective in `op`, so an
+unassigned number still cannot collide with a real arm, and the tap costs one
+byte read per call rather than per instruction. Drawn per group (~1 in 10
+formats, whenever the header is a renumbered one), keyed into the reuse-audit
+`shape` and the structural fingerprint, so a recovered tapped table does not
+score as reuse of an untapped group.
 
-*Why better.* First genuine opaque predicates in the tool; keyed to sealed
+*Not yet built (native side).* In the flattened state machine, *split arms*:
+two `elseif` arms whose conditions are `state_enc == f(id)` and
+`state_enc == g(id)` with exactly one satisfiable given the build's
+modulus/affine choices; the unsatisfiable one holds a *copy* of a real block's
+tail assignment sequence produced from the same IR (so even under a bug it
+executes the same semantics). No dead branch ever exists — only a branch the
+build can prove unreachable but a reader cannot. Deferred because it needs the
+exactly-one-satisfiable invariant unit-tested over the affine forms before it
+is safe to turn on; the VM tap already delivers the load-bearing property.
+
+*Why better.* First genuine opaque predicate in the tool; keyed to sealed
 data instead of algebraic identities; structurally per-build.
 
-*Cost.* VM: ~1 extra `band` per dispatch (negligible). Native: ≤ 2× size on
-the drawn arms only (rate-limited by `control_flow_level`).
-*Compatibility.* None if the satisfiability invariant is unit-tested.
-*Test.* Unit: for N seeds, exactly one arm satisfiable per block (symbolic
-over the affine forms); differential corpus; analyzer assertion that the
-emitted condition is not a constant expression.
-*Default.* On when `opaque_predicates` (already defaults on).
+*Cost.* VM: one header byte read per call plus one extra `bxor` term in the
+key (negligible — measured within the per-iteration noise band). Native (when
+built): ≤ 2× size on the drawn arms only, rate-limited by `control_flow_level`.
+*Compatibility.* None — the tap is inside the authenticated blob, so a tamper
+of it is already a MAC failure.
+*Test.* `tests/test_vm_dispatch.py` pins the tapped ladder/bank: the scramble
+folds the payload term, the constants are the tapped image of the numbering
+and not the salt-only image, and a forced-tap build executes byte-identical to
+its source under the pinned toolchain.
+*Default.* On (drawn) for renumbered headers.
 
 ### R3 — Regression automation (P0/P1)
 
@@ -709,7 +723,7 @@ tags, uniform error messages, no-marker assertions (no `pc`, `R`, `K`,
 |---|---|---|
 | `pipeline.py` | stop pinning `vm_variety`; pass config value; report N groups honestly; docstring fixes | W1 (R1) |
 | `vm/wiring.py` | already group-capable; add per-group pool hooks (R6), dispatch-shape draw for R11 | W1/W3 |
-| `vm/runtime.py` | predicate taps in `_Entry.condition` (R2); inlined-chain emitter (R11) | W2/W3 |
+| `vm/runtime.py` | payload-header key taps folded into the ladder/bank dispatch key (R2 VM side, done); inlined-chain emitter (R11) | W2/W3 |
 | `lower_back.py` | split-arm emission in `_proto_body` (R2 native side); directive bindings threaded to classifier; per-group pool wiring | W2 |
 | `comments.py` | `--!couxobf:` directive extraction (R8) | W2 |
 | `classify.py` | honor directives; capability-set aware (R5) | W2/W3 |

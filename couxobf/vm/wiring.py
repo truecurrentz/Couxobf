@@ -204,7 +204,10 @@ def _fresh_names(rng: Rng, count: int, reserved: Iterable[str] = ()) -> List[str
 #: Per-build name roles the interpreter needs, in the order they are drawn.
 _ROLES = ("code", "exec", "enter", "call", "getfenv", "acc", "stack", "sp",
           "pc", "regs", "consts", "env", "edges",
-          "ro", "r8", "rr", "rw", "rk", "rp", "rt")
+          "ro", "r8", "rr", "rw", "rk", "rp", "rt",
+          # Appended last so the draws before it do not move: the dispatch
+          # key's payload-tap local, renamed like every other working name.
+          "pt")
 
 
 def make_plan(rng: Rng, protos: Iterable[int],

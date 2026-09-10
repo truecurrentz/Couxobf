@@ -301,6 +301,14 @@ class FormatSpec:
     #: it into straight arithmetic.  The readers stay generated and per-build
     #: either way -- this only moves where their text lives.
     inline_reads: bool = False
+    #: Header byte offsets (0-based) the dispatch key is folded with at
+    #: runtime -- R2's predicate tap.  The bytes sit at filler positions,
+    #: which the encoder writes identically into every payload of the group,
+    #: so the tap is one value per group, read once per call: the ladder's
+    #: constants become an image of the numbering under a salt the payload
+    #: holds, and an interpreter lifted on its own no longer decodes.  Empty
+    #: when the header drew no filler to tap.
+    key_taps: Tuple[int, ...] = ()
 
     # -- field geometry ---------------------------------------------------
     def fields(self, op: str) -> Tuple[FieldKey, ...]:
@@ -571,7 +579,32 @@ class FormatSpec:
             "field_order_seed": self.field_order_seed,
             "dispatch_shape": self.dispatch_shape,
             "inline_reads": self.inline_reads,
+            "key_taps": list(self.key_taps),
         }
+
+    def key_tap_value(self) -> int:
+        """The xor of the tapped filler bytes, known from the header alone.
+
+        This is what the build mixes into every dispatch key; the runtime
+        re-derives the same value from the payload itself, so the two can
+        only disagree by tamper -- which the pool's MAC already owns.
+        """
+        if not self.key_taps:
+            return 0
+        _positions, filler_at, _total = self.header._map()
+        out = 0
+        for off in self.key_taps:
+            out ^= filler_at[off]
+        return out
+
+    def key_tap_read(self, code_var: str) -> str:
+        """The Luau read for the tap value, or '' for an untapped format."""
+        if not self.key_taps:
+            return ""
+        reads = ["_bd(%s, %d)" % (code_var, off + 1) for off in self.key_taps]
+        if len(reads) == 1:
+            return reads[0]
+        return "bit32.bxor(%s)" % ", ".join(reads)
 
 
 # -- the reader half: Luau source for one build's field readers --------------
@@ -941,6 +974,29 @@ def draw(rng: Optional[Rng], prefs: Optional[FormatPrefs] = None, *,
         wanted = rng.randint(1 if prefs.variety >= 2 else 0, len(fusion_rules))
         if wanted:
             chosen = tuple(rng.sample(list(fusion_rules), wanted))
+    header = (random_header(rng) if on(prefs.allow_renumbered_header, 0.6)
+              else DEFAULT_HEADER)
+    # R2's predicate tap: mix one or more of the header's filler bytes into
+    # the dispatch key.  Filler values are written identically into every
+    # payload of the group, so the tap is one group-wide constant -- but one
+    # the interpreter's text does not contain: the ladder's keys become an
+    # image of the numbering under a salt that only the (encrypted) payload
+    # carries.  Drawn unconditionally so the stream does not branch on
+    # whether the header happened to grow filler.
+    _t_positions, filler_at, _t_total = header._map()
+    tap_wanted = rng.chance(0.5)
+    key_taps: Tuple[int, ...] = ()
+    if tap_wanted and not header.legacy:
+        # The legacy header is a fixed-width struct.pack layout with no room
+        # for a filler byte, so taps only ride renumbered headers.  When the
+        # header drew no filler of its own, the tap adds one: a byte that
+        # exists *for* the predicate, identical in every payload of the group.
+        if not filler_at:
+            pos = rng.randbelow(len(header.fields) + 1)
+            header = replace(header, filler=header.filler + ((pos, rng.byte()),))
+            _t_positions, filler_at, _t_total = header._map()
+        offsets = sorted(filler_at)
+        key_taps = (offsets[rng.randbelow(len(offsets))],)
     return FormatSpec(
         op_bytes=op_bytes,
         op_cipher=cipher,
@@ -958,8 +1014,8 @@ def draw(rng: Optional[Rng], prefs: Optional[FormatPrefs] = None, *,
         wide_mask=wide_mask,
         target_mode=mode,
         target_bias=bias,
-        header=(random_header(rng) if on(prefs.allow_renumbered_header, 0.6)
-                else DEFAULT_HEADER),
+        header=header,
+        key_taps=key_taps,
         fused=tuple(chosen),
         reorder=on(prefs.allow_instruction_reorder, 0.6),
         group=group,
