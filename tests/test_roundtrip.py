@@ -241,7 +241,14 @@ def _conformance_dir():
     skip cleanly when the checkout is absent.  ``tools/setup-luau.sh`` clones
     into ``$TMPDIR/luau-src-<tag>``, which is the usual place to find it; run
     that script (or set ``COUXOBF_LUAU_SRC``) to turn these on.
+
+    ``COUXOBF_NO_EXTERNAL_CORPUS=1`` hides it even when it is present, which
+    is how the suite proves the repo-local corpus is sufficient on its own
+    (R0) instead of discovering the opposite in a clean checkout.
     """
+    from tests.corpus import _external_disabled
+    if _external_disabled():
+        return None
     candidates = []
     env = os.environ.get("COUXOBF_LUAU_SRC")
     if env:

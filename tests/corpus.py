@@ -20,7 +20,23 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_CORPUS = sorted(glob.glob(os.path.join(HERE, "fixtures", "corpus", "*.luau")))
 
 
+def _external_disabled() -> bool:
+    """Whether the external checkout is deliberately hidden.
+
+    The suite has to pass in a checkout with no external state -- that was the
+    whole point of vendoring ``tests/fixtures/corpus``.  Setting
+    ``COUXOBF_NO_EXTERNAL_CORPUS=1`` simulates that checkout on a machine
+    which *does* have one, so the property is testable instead of assumed,
+    and a test that quietly depends on the upstream corpus fails here rather
+    than on a contributor's laptop.
+    """
+    flag = os.environ.get("COUXOBF_NO_EXTERNAL_CORPUS", "")
+    return flag.lower() in ("1", "true", "yes", "on")
+
+
 def _external_dir():
+    if _external_disabled():
+        return None
     env = os.environ.get("COUXOBF_LUAU_SRC")
     candidates = []
     if env:
