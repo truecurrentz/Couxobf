@@ -121,6 +121,13 @@ class VMPlan:
     #: ``enter`` an accessor list instead of ``false``; the eligibility and the
     #: native-home restriction are decided by the selector, not here.
     upvalues_ok: bool = False
+    #: R5's third increment: whether a prototype that *creates* closures may
+    #: ride the VM.  Mirrors :attr:`Config.vm_closures`.  Only children that
+    #: capture nothing qualify -- see
+    #: :func:`couxobf.vm.encode.can_virtualize` -- and a child always shares
+    #: its parent's group, because the interpreter that runs the parent is the
+    #: one that has to name the child's entry point.
+    closures_ok: bool = False
     #: Per-prototype dispatch decisions, for the report.
     decisions: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -259,7 +266,13 @@ _ROLES = ("code", "exec", "enter", "call", "getfenv", "acc", "stack", "sp",
           # over the native variables).  ``false`` when the prototype captures
           # nothing -- GETUPVAL/SETUPVAL never execute then, so it is never
           # indexed.
-          "uvs")
+          "uvs",
+          # R5's third increment: the table of per-prototype entry stubs.  One
+          # stub per prototype that captures nothing, built once at load, so a
+          # closure created inside a loop is the same function value every
+          # iteration -- which is what Luau's own compiler produces for a
+          # closure that captures nothing.
+          "stubs")
 
 
 def make_plan(rng: Rng, protos: Iterable[int],
@@ -282,7 +295,8 @@ def make_plan(rng: Rng, protos: Iterable[int],
               fragmented: bool = True,
               protos_by_id: Optional[Dict[int, Any]] = None,
               isa_subset: bool = False,
-              upvalues_ok: bool = False) -> VMPlan:
+              upvalues_ok: bool = False,
+              closures_ok: bool = False) -> VMPlan:
     """Build a :class:`VMPlan` from the build's ``vm`` randomness stream.
 
     ``rng`` should be the domain-separated stream for VM generation, not the
@@ -316,8 +330,19 @@ def make_plan(rng: Rng, protos: Iterable[int],
         # it away, and the draw count is part of the vm stream's fingerprint --
         # keeping it constant is what lets a new role (R5's ``uvs``) join the
         # roster without shifting every name drawn afterwards.
-        drawn = _fresh_names(rng, len(_ROLES), used=used)
-        names = dict(zip(_ROLES, drawn))
+        # ``stubs`` is the one role deliberately absent from this block.  It
+        # joined the roster in R5's third increment, and drawing it here would
+        # lengthen the block by one -- moving every format, opcode map and
+        # dispatch key the rest of the plan takes from this stream, so a build
+        # that gained a name would also quietly change its VMs.  It comes from
+        # a fork instead, which is how the rest of this project keeps one
+        # decision from moving another.
+        stream_roles = tuple(r for r in _ROLES if r != "stubs")
+        drawn = _fresh_names(rng, len(stream_roles), used=used)
+        names = dict(zip(stream_roles, drawn))
+        extra = _fresh_names(rng.fork("stubs"), 1, used=used)
+        names["stubs"] = extra[0]
+        used.add(extra[0])
     else:
         # A caller-supplied name set: the test harness pins these so a failure
         # names the function it came from.  They must reach the groups too -- a
@@ -332,6 +357,10 @@ def make_plan(rng: Rng, protos: Iterable[int],
     for role, helper in zip(("append", "iter", "iterpack", "itercheck"), shared):
         # shared with lower_back -- see the module docstring
         names.setdefault(role, helper)
+    # The descriptor table's name, so a CLOSURE arm can index it.  Taken from
+    # the four already drawn for the tables rather than drawn again: a new draw
+    # here would shift every role name in every build that followed.
+    names.setdefault("rows", tables[3])
 
     groups = _make_groups(rng, proto_ids, names, variety=variety, family=family,
                           dispatcher=dispatcher, families=families,
@@ -339,7 +368,8 @@ def make_plan(rng: Rng, protos: Iterable[int],
                           fusion=fusion, alias_ratio=alias_ratio,
                           alias_chance=alias_chance, prefs=fmt_prefs,
                           protos_by_id=protos_by_id, isa_subset=isa_subset,
-                          permute_blocks=permute_blocks, used=used)
+                          permute_blocks=permute_blocks, used=used,
+                          closures_ok=closures_ok)
     # A stable opcode numbering is a real option, not a placeholder: it makes
     # two builds of the same source comparable byte for byte apart from the
     # names, which is what you want when you are checking that a change did
@@ -360,7 +390,8 @@ def make_plan(rng: Rng, protos: Iterable[int],
                   groups=groups,
                   alias_chance=alias_chance,
                   fragmented=bool(fragmented),
-                  upvalues_ok=bool(upvalues_ok))
+                  upvalues_ok=bool(upvalues_ok),
+                  closures_ok=bool(closures_ok))
 
 
 def _make_groups(rng: Rng, proto_ids: List[int], names: Dict[str, str], *,
@@ -373,7 +404,8 @@ def _make_groups(rng: Rng, proto_ids: List[int], names: Dict[str, str], *,
                  protos_by_id: Optional[Dict[int, Any]] = None,
                  isa_subset: bool = False,
                  permute_blocks: bool = False,
-                 used: Optional[Set[str]] = None) -> List[VMGroup]:
+                 used: Optional[Set[str]] = None,
+                 closures_ok: bool = False) -> List[VMGroup]:
     """Partition the selection into VMs, one per group.
 
     ``used`` carries the names the plan has already drawn, so the per-group
@@ -389,11 +421,41 @@ def _make_groups(rng: Rng, proto_ids: List[int], names: Dict[str, str], *,
     """
     used = set(used or ()) | set(str(v) for v in names.values())
 
+    # R5's third increment: a prototype that creates closures runs its children
+    # too, and the interpreter that runs the parent is the one whose entry
+    # point the child's stub has to name -- so a child belongs to its parent's
+    # group.  Without this the parent's CLOSURE arm would need the *other*
+    # group's ``enter``, which is a cross-group reference the artifact would
+    # have to carry as a table.
+    follows: Dict[int, int] = {}
+    if closures_ok and protos_by_id:
+        chosen = set(proto_ids)
+        for pid in proto_ids:
+            proto = protos_by_id.get(pid)
+            if proto is None:
+                continue
+            for child in proto.children:
+                if child.proto_id in chosen:
+                    follows[child.proto_id] = pid
+    leader: Dict[int, int] = {}
+    for pid in proto_ids:
+        root, seen = pid, set()
+        while root in follows and root not in seen:
+            seen.add(root)
+            root = follows[root]
+        leader[pid] = root
+
     # ``variety`` is honored again: every group draws its own format, opcode
     # map, cipher and dispatch key, so a devirtualizer recovered from one
     # group does not read the others.  Capped at the population -- a group
     # with no prototype would still emit a whole interpreter for nothing.
-    count = max(1, min(int(variety), len(proto_ids) or 1))
+    # What counts as the population is the number of whole trees a build can
+    # move independently: with closures on, a subtree is not, so a request for
+    # three VMs against one closure tree is really a request for one.
+    roots = {leader[pid] for pid in proto_ids}
+    population = (len(roots) if (closures_ok and protos_by_id)
+                  else (len(proto_ids) or 1))
+    count = max(1, min(int(variety), population))
     family_pool = ["woven"]
     dispatcher_pool = ["woven"]
     if len(family_pool) < count:
@@ -412,8 +474,21 @@ def _make_groups(rng: Rng, proto_ids: List[int], names: Dict[str, str], *,
     # partition, computed once so the opcode subset and the plan cannot
     # disagree about which prototype runs where.
     members: List[List[int]] = [[] for _ in range(count)]
-    for i, pid in enumerate(proto_ids):
-        members[i % count].append(pid)
+    # One slot per tree, handed to whichever group is smallest at the time --
+    # largest tree first, ties by prototype id, so the result is a pure
+    # function of the selection.  Without closures every tree is one prototype
+    # and this is the round-robin it has always been.
+    size: Dict[int, int] = {}
+    for pid in proto_ids:
+        size[leader[pid]] = size.get(leader[pid], 0) + 1
+    slot: Dict[int, int] = {}
+    totals = [0] * count
+    for root in sorted(size, key=lambda r: (-size[r], r)):
+        idx = min(range(count), key=lambda i: (totals[i], i))
+        slot[root] = idx
+        totals[idx] += size[root]
+    for pid in proto_ids:
+        members[slot[leader[pid]]].append(pid)
 
     groups: List[VMGroup] = []
     for index in range(count):
@@ -437,7 +512,8 @@ def _make_groups(rng: Rng, proto_ids: List[int], names: Dict[str, str], *,
                     needed = None        # type: ignore[assignment]
                     break
                 got = encode.required_ops(proto, fmt,
-                                          permuted_blocks=permute_blocks)
+                                          permuted_blocks=permute_blocks,
+                                          children=bool(closures_ok))
                 if got is None:
                     needed = None        # type: ignore[assignment]
                     break
@@ -560,7 +636,8 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
                    edges_expr: Optional[Callable[..., str]] = None,
                    entry_guard: Sequence[str] = (),
                    fragmented: Optional[bool] = None,
-                   opaque_predicates: bool = True) -> str:
+                   opaque_predicates: bool = True,
+                   per_site: Optional[Set[int]] = None) -> str:
     """The interpreters plus the descriptor tables, as Luau source.
 
     One interpreter per VM group, then three tables keyed by prototype id: the
@@ -577,6 +654,13 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
     callbacks keeps this module independent of the constant pool, so the
     unprotected reconstruction path can pass literal emitters and the
     protected one can pass pool reads -- the same bytecode, protected or not.
+
+    ``per_site`` names the prototypes whose entry stub cannot be shared --
+    those that capture, because their stub closes over accessor closures built
+    at the closure site.  Every other prototype gets one stub in a table keyed
+    by its descriptor row, built once here; that is what makes
+    ``f == f`` hold across iterations of a loop that declares one, which is
+    what plain Luau does with a closure that captures nothing.
     """
     interpreter_parts: List[str] = []
     for group in plan.groups:
@@ -584,7 +668,8 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
                                                            group.family, group.dispatcher,
                                                            group.fmt,
                                                            entry_guard=entry_guard,
-                                                           opaque_predicates=opaque_predicates))
+                                                           opaque_predicates=opaque_predicates,
+                                                           row_mask=plan.row_mask))
     parts: List[str] = []
     payload_rows = []
     const_rows = []
@@ -612,6 +697,24 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
         # for free.
         return ""
 
+    # The entry stubs.  One per prototype that captures nothing, each closing
+    # over nothing but its own row and this group's ``enter`` -- which is why
+    # they can be built here, once, instead of at every closure site.  A
+    # prototype that captures is absent from this table on purpose: its stub
+    # has to close over the accessor closures the site builds, so it is
+    # emitted there.
+    stub_rows: List[str] = []
+    for group in plan.groups:
+        enter = group.names["enter"]
+        for pid in sorted(group.protos):
+            if pid in (per_site or ()) or pid not in encoded:
+                continue
+            stub_rows.append(
+                "  [%d] = function(...) return %s(%s[%d], %s(1), false, ...) end,"
+                % (plan.row_key(pid), enter, plan.rows_table,
+                   plan.row_key(pid), group.names["getfenv"]))
+
+
     def _finish(metadata: List[str]) -> str:
         if not interpreter_parts:
             combined = metadata
@@ -620,7 +723,27 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
             cut = seed % (len(interpreter_parts) + 1)
             combined = (interpreter_parts[:cut] + metadata +
                         interpreter_parts[cut:])
-        return "\n".join(combined) + "\n"
+        # Forward-declared, and assigned below: the descriptor tables are
+        # interleaved with the interpreters, so one of them may be emitted
+        # *after* an interpreter that reads it -- and a plain `local X = {...}`
+        # written later leaves every earlier `X` reading a nil global.  R5's
+        # third increment is what gives an interpreter a reason to read the
+        # rows table at all: its CLOSURE arm indexes it.
+        # ``stubs`` is declared for the same reason and assigned in the same
+        # place as the rows table: an interpreter's CLOSURE arm indexes it, and
+        # the interpreters are emitted first.
+        text = ("local %s\n" % plan.rows_table)
+        if stub_rows:
+            text += "local %s\n" % plan.names["stubs"]
+        text += "\n".join(combined) + "\n"
+        if stub_rows:
+            # The stubs go last, not with the rest of the metadata: each one
+            # closes over its group's ``enter``, which is a local the
+            # interpreter declares, so a stub table emitted before it would
+            # capture a nil global instead.
+            text += ("%s = {\n%s\n}\n"
+                     % (plan.names["stubs"], "\n".join(stub_rows)))
+        return text
 
     if fragmented is None:
         fragmented = plan.fragmented
@@ -640,7 +763,7 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
             joined.append("  [%d] = { code = function() return %s end, consts = function() return { %s } end,%s },"
                           % (plan.row_key(pid), code_expr(enc.code, pid),
                              consts, edges))
-        parts.append("local %s = {\n%s\n}"
+        parts.append("%s = {\n%s\n}"
                      % (plan.rows_table, "\n".join(joined)))
         return _finish(parts)
     parts.append("local %s = {\n%s\n}" % (plan.table, "\n".join(payload_rows)))
@@ -660,6 +783,6 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
         edges = ("%s[%d]" % (plan.edges_table, pid)) if edge_rows else "nil"
         joined.append("  [%d] = { code = %s[%d], consts = %s[%d], edges = %s },"
                       % (plan.row_key(pid), plan.table, pid, plan.consts_table, pid, edges))
-    parts.append("local %s = {\n%s\n}"
+    parts.append("%s = {\n%s\n}"
                  % (plan.rows_table, "\n".join(joined)))
     return _finish(parts)

@@ -144,7 +144,35 @@ a capture whose owning prototype is itself virtualized has its storage inside
 a frame no closure can see, so the selector unselects such a prototype (a
 fixpoint, since the ownership relation is circular). Today an owner can never
 actually be virtualized -- it creates a closure, which the encoder refuses --
-so the fixpoint is a guard for the day closure creation (R5c) joins the VM.
+so the fixpoint is a guard for the day closure creation joins the VM -- which
+it now partly has; see the next paragraph.
+
+### Nested closures that capture nothing (implemented, R5's third increment)
+
+With `vm_closures` (off by default, like `vm_upvalues`) a virtualized
+prototype may create closures of its own, provided the children it creates
+capture nothing. A child with no upvalues needs no state from the frame it was
+born in, so the interpreter can hand out its entry stub itself: `CLOSURE`
+stores `stubs[pid ^ row_mask]` in a register, and that stub is the same plain
+Luau function the native reconstruction would have emitted at the closure
+site. Two obligations come with it. The children have to come into the VM with
+their parent -- the interpreter has no function value for a child left native
+-- so a virtualized prototype takes its virtualizable subtree in with it,
+however small the children are, and a child that cannot be built in the VM at
+all unselects the parent, which unravels upwards to the root of the tree. And a child belongs to its parent's
+VM *group*, because the parent's CLOSURE arm names this interpreter's entry
+point; the artifact carries no table mapping prototypes to interpreters, and a
+closure tree is one indivisible unit when a build asks for more than one VM.
+
+**Cost added:** none measurable. Each stub is built once at load rather than
+once per closure creation, so the common case allocates *less* than before.
+
+**What it does not cover:** a child that captures. The variables it names
+would have to live in a VM frame, which is a table no Luau closure can see, so
+such a parent stays native with a reason in the report. That is the case real
+callbacks are made of, and it needs the cell model described under the
+limitations below -- which is why the flag is new machinery behind a default
+of off rather than a change to what every build does.
 
 **Cost added:** a capturing stub allocates two closures per upvalue per call
 and every `GETUPVAL`/`SETUPVAL` is two indirect calls. That is real, and it is
@@ -332,7 +360,8 @@ written through the closure -- the moment two closures share a captured local
 and one writes it, a copy is no longer a cell, which is why the copy is not
 extended to loop-body locals. Fixing this needs a real cell model (a fresh
 cell per iteration with every access, native and virtualized alike, routed
-through it) and is a prerequisite of R5c, not of any setting in this tool.
+through it) and is a prerequisite of the capturing half of R5's third
+increment, not of any setting in this tool.
 
 **`#` on a table with nil holes is reproduced in content, not in length.**
 When a multi-value result -- a call return, a vararg list (R5) -- is appended

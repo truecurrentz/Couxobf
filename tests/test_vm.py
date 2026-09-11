@@ -72,6 +72,11 @@ NAMES = {
     "vnp": "_kVn",
     # R5's second increment: frame key holding the upvalue accessor list
     "uvs": "_kUv",
+    # R5's third increment: the descriptor row table, and the table of
+    # per-prototype entry stubs a CLOSURE arm indexes to find the child it is
+    # handing out
+    "rows": "_kRw",
+    "stubs": "_kSb",
 }
 
 
@@ -274,9 +279,18 @@ def test_encoded_stream_walks_clean():
             # the ISA can carry -- including those two.  The walk only reads
             # bytes; the accessor closures exist at the stub, not in the
             # stream, so nothing here needs a runtime to run them.
-            if not encode.can_virtualize(proto, upvalues_ok=True)[0]:
+            # ``closures_ok`` on purpose, for the same reason as
+            # ``upvalues_ok``: CLOSURE has been encodable since R5's third
+            # increment, and the walk's job is to prove the encoder and
+            # ``operand_size`` agree for every opcode the ISA can carry.  A
+            # prototype that creates closures is only *selected* in a build
+            # that asked for them, which is a different question -- the bytes
+            # are the same either way.
+            if not encode.can_virtualize(proto, upvalues_ok=True,
+                                         closures_ok=True)[0]:
                 continue
-            enc = encode.encode_proto(proto, opmap, upvalues_ok=True)
+            enc = encode.encode_proto(proto, opmap, upvalues_ok=True,
+                                      closures_ok=True)
             pc, code = enc.lua_entry - 1, enc.code
             while pc < len(code):
                 name = opmap.to_op[code[pc]]
@@ -994,6 +1008,7 @@ def test_required_ops_over_approximates_rather_than_guesses():
     from couxobf.vm.format import FusionRule
 
     src = "local function f(a) return a + 1 end\nprint(f(2))\n"
+    mangled_src = src
     module = ir.Lowerer().lower(parser.parse(src, "over.luau"))
     proto = next(q for q in _all_protos(module) if q.proto_id == 1)
     plain = encode.required_ops(proto)
@@ -1005,13 +1020,32 @@ def test_required_ops_over_approximates_rather_than_guesses():
     assert {"LOADK", "ADD"} <= both
     # A prototype whose instructions cannot all be named gets no answer at all,
     # which the caller reads as "do not narrow" -- the fail-safe direction, since
-    # the alternative is a group with a handler missing.
-    m2 = ir.Lowerer().lower(parser.parse(
-        "local function g(...)<NEWLINE>  local n = select(2, ...)\n  return n\nend\n"
-        "print(g(1, 2))\n".replace("<NEWLINE>", " "), "var.luau"))
-    unknown = [q for q in _all_protos(m2)
+    # the alternative is a group with a handler missing.  Every IR opcode now
+    # has a VM entry (CLOSURE got one in R5's third increment), so the branch is
+    # reached through the other thing it exists for: an instruction whose
+    # operand count disagrees with the opcode it claims to be.
+    broken = ir.Lowerer().lower(parser.parse(mangled_src, "arity.luau"))
+    victim = next(q for q in _all_protos(broken) if q.proto_id == 1)
+    victim.blocks[0].instrs[0].args = victim.blocks[0].instrs[0].args[:1]
+    unknown = [q for q in _all_protos(broken)
                if encode.required_ops(q) is None]
     assert unknown, "expected a prototype required_ops cannot answer for"
+    # And the closure subtree is folded in only when the caller asks: a
+    # prototype that creates closures needs its children's opcodes in the same
+    # group, which is what ``children`` is for.
+    tree = ir.Lowerer().lower(parser.parse(
+        "local function outer(n)\n"
+        "  local function child(x)\n"
+        "    return x * 2\n"
+        "  end\n"
+        "  return child(n) + 1\n"
+        "end\n"
+        "print(outer(3))\n", "tree.luau"))
+    outer = next(q for q in _all_protos(tree) if q.proto_id == 1)
+    # MUL is the child's alone -- the parent adds and calls, so seeing it in
+    # the parent's answer is the subtree having been folded in.
+    assert ir.OP.MUL not in encode.required_ops(outer, children=False)
+    assert ir.OP.MUL in encode.required_ops(outer, children=True)
 
 
 def test_permuted_arms_test_the_same_numbers_in_a_different_order():
@@ -1221,8 +1255,13 @@ def test_plan_names_are_unique_across_every_draw():
         plan = wiring.make_plan(rng, [0, 1, 2], variety=2)
         drawn = [plan.table, plan.consts_table, plan.edges_table,
                  plan.rows_table]
+        # ``rows`` is excluded because it is not a drawn name: it is the row
+        # table's own identifier, listed in ``plan.names`` so the interpreter's
+        # CLOSURE arm can index it.  Counting it would report a collision
+        # between a table and itself.
         drawn += [value for key, value in plan.names.items()
-                  if key not in ("append", "iter", "iterpack", "itercheck")]
+                  if key not in ("append", "iter", "iterpack", "itercheck",
+                                 "rows")]
         for group in plan.groups:
             drawn += [group.names["exec"], group.names["enter"]]
         dupes = sorted({name for name in drawn if drawn.count(name) > 1})

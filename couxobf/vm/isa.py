@@ -144,6 +144,13 @@ FORMATS: Dict[str, OperandSpec] = {
     OP.FORINPREP:    OperandSpec(regs=(0,), wides=("target", "resolved")),
     OP.FORIN:        OperandSpec(regs=(0,), wides=("target", "nvars")),
     OP.ITERPREP:     OperandSpec(regs=(0,), wides=("packed",)),
+    # CLOSURE d, proto: the child prototype's id rides a wide slot like a jump
+    # target -- it is an immediate, not a register.  The interpreter turns it
+    # into a row key and builds the child's entry stub; see runtime._body.
+    # The distinction that matters is the one ``can_virtualize`` draws: a child
+    # that *captures* cannot be built this way at all, because the closure
+    # would have to close over a register that lives in the parent's frame.
+    OP.CLOSURE:      OperandSpec(regs=(0,), wides=("proto",)),
 }
 
 #: Wide fields that carry a *register index* rather than an immediate.
@@ -170,7 +177,11 @@ SUPPORTED = frozenset(FORMATS)
 #: accessor closures over the native storage, which is what GETUPVAL and
 #: SETUPVAL call -- see runtime.py.)
 UNSUPPORTED_REASON = {
-    OP.CLOSURE: "creates a closure; its upvalues would have to point into VM state",
+    # Reached only when the prototype is refused for another reason -- since
+    # R5's third increment CLOSURE is in ``FORMATS``, and the refusal for a
+    # child that captures is ``can_virtualize``'s own message.
+    OP.CLOSURE: ("creates a closure; a capturing one would have to point into "
+                 "VM state"),
     OP.NOP: "removed by the optimizer before encoding",
     OP.LABEL: "resolved away during lowering",
 }

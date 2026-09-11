@@ -22,9 +22,10 @@ written here; where a capability turned out not to exist, the row says so and
 | 🔶 | Partially implemented — the gap is stated |
 | ⬜ | Not implemented |
 
-**Tally: 45 done · 20 partial · 15 not built.** Of the 45 done, 26 are ✅ and
-19 are ⭐ (implemented and improved beyond the point as written). All 80 points
-are scored exactly once. The round that produced the two new VM options moved four
+**Tally: 45 done · 23 partial · 11 not built · 1 deliberately not emitted
+(#60).** Of the 45 done, 26 are ✅ and 19 are ⭐ (implemented and improved
+beyond the point as written). All 80 points are scored exactly once; the tally
+is recomputed from the table itself rather than carried forward. The round that produced the two new VM options moved four
 rows: #71 from ✅ to ⭐ (the handler count is now derived from the code rather than
 only randomized), #68 from ⬜ to ⭐ (there is an extractor whose findings become
 tests), and #65 and #66 from ⬜ to 🔶 (a real cross-build measurement exists; a
@@ -48,7 +49,7 @@ is unbreakable.
 
 | # | Technique | Status | Evidence |
 | --- | --- | --- | --- |
-| 1 | Virtualize only selected high-value functions | ⭐ | Five levels (`none`/`light`/`medium`/`heavy`/`maximum`) with size floors, plus per-function refusals for upvalues, closures, the main chunk and varargs. `max_vm_functions` caps the total — measured on `inventory.luau`: uncapped 3/7, capped at 1 → 1/7, capped at 0 → 0/7. Improved beyond the point: selection is not merely "high-value functions", it is a per-function decision with a size floor and an explicit refusal reason recorded in the report. |
+| 1 | Virtualize only selected high-value functions | ⭐ | Five levels (`none`/`light`/`medium`/`heavy`/`maximum`) with size floors, plus per-function refusals for upvalues, capturing closures, the main chunk and varargs -- **and, since R5's third increment, no refusal at all for a function whose nested closures capture nothing**: `vm_closures` lets the interpreter hand out a child's entry stub, so a helper, a comparator or a pure nested function no longer drags its parent out of the VM (the child comes into the VM with its parent -- the whole subtree, however small -- and shares its parent's group). `max_vm_functions` caps the total — measured on `inventory.luau`: uncapped 3/7, capped at 1 → 1/7, capped at 0 → 0/7. Improved beyond the point: selection is not merely "high-value functions", it is a per-function decision with a size floor and an explicit refusal reason recorded in the report. |
 | 22 | Never recursively virtualize generated VM code | ✅ | The interpreter is emitted as plain Luau source; the main chunk is never virtualized, so generated code cannot re-enter the lowering path. |
 | 80 | Hybrid native/virtual execution | ⬜ | A function is either wholly native or wholly in the VM. The `mixed_execution` knob that claimed otherwise was removed in R12. |
 | 77 | Randomize whether an operation is native, VM, or hybrid | ⬜ | No per-operation boundary exists to randomize. |
@@ -103,7 +104,7 @@ is unbreakable.
 | 69 | Continuously change the generated format | ⭐ | **Improved this build.** The pool and bank prefixes were the constants `_kQ` and `_kS`, identical in every build ever produced — `_kQ` alone appears 115 times in a typical output. Each build now draws its own: 12 builds produced 24 prefixes, all distinct, none stable. |
 | 25 | Avoid repeated decoder boilerplate | ✅ | Measured on a maximum build: 30 long string literals, 30 distinct, 0 repeated. |
 | 23 | Randomize helper placement | 🔶 | **Names and blocks yes, one contiguous preamble no.** The six bit/table helpers used to be `_kpack`/`_kunpk`/`_kiter`/`_kiterpack`/`_kitercheck`/`_kapp` in every build; each build now draws its own names, and the runtime is no longer a single preamble — measured in a maximum build of `maze.luau`, the guard locals land at lines 9-12, the bit-op destructure at 39 and the pool blobs at 239+. What the point still asks for and does not get: the six helpers are one statement, and which of the four runtime blocks goes where is fixed by the emitter, not drawn. |
-| 24 | Different helper implementations for equivalent operations | ⬜ | One implementation each. |
+| 24 | Different helper implementations for equivalent operations | 🔶 | **The constant pool's decoder is no longer one implementation (R13).** Each region draws a shape on three axes -- whether entry offsets are built eagerly at load or scanned forward on demand and memoised, whether the ticket mask is folded in as one literal, as two XORs of two literals, or as one XOR of their sum, and whether a type byte dispatches through an if-chain or a table of per-type readers -- so twelve structurally different decoders open the same pool, two of which drop the mask literal entirely. Measured: all twelve verified against one sealed pool in Luau, reading slots forwards and backwards; the spread across shapes is under 1 KB on `maze.luau`, inside the noise of the drawn identifier lengths. What is still one implementation: the string bank's reader, the crypto module, and each handler body. |
 | 40 | Avoid a recognizable VM → decrypt → execute sequence | ⬜ | The prelude order is fixed: crypto runtime, constant pool, helpers, body. |
 
 ## 5. Control flow
@@ -212,13 +213,14 @@ What each build can currently change, against the eleven axes requested.
 | Instruction fusion | ✅ — `FUSABLE` pairs the numbering can fit become one arm (`2 fused`, `5 fused` in the report) (#6) |
 | Constant representation | 🔶 — pool layout keyed, decoys planted, plaintext materialized per read; per-chunk keys unbuilt, and R12 removed the chunking knobs that claimed them (#14, #41) |
 | Control-flow representation | ✅ — block permutation, within-block reorder, and jump targets in `abs`/`biased`/`rel`/`edges` form (#7, #18, #33) |
-| Helper implementation | ⬜ — one implementation per operation; placement is spread by emitter structure, not by choice (#23, #24) |
+| Helper implementation | 🔶 — the constant pool's decoder is drawn per region on three axes (how an entry offset is found, how a ticket is folded back into a slot, how a type byte dispatches), so twelve structurally different decoders open the same pool (R13); the crypto module, the string bank's reader and each handler body are still one implementation each, and placement is spread by emitter structure rather than by choice (#23, #24) |
 | VM / native boundary | ⬜ — a function is wholly native or wholly virtual; the inert `mixed_execution` knob was removed in R12 (#80) |
 
-**8 of 11 axes are genuinely per-build.** That is the honest state of the
-"polymorphic hybrid VM": what a build varies is the *shape* it decodes with,
-and it varies it per group rather than once per build. The three it does not
-are helper implementations, chunked constant representation, and a
+**8 of 11 axes are genuinely per-build and a ninth is partly.** That is the
+honest state of the "polymorphic hybrid VM": what a build varies is the *shape*
+it decodes with, and it varies it per group rather than once per build. Helper
+implementation now varies for one helper — the pool decoder — and not for the
+rest. The two it does not vary at all are chunked constant representation and a
 per-operation native/virtual boundary.
 
 ---

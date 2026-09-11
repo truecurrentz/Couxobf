@@ -98,10 +98,16 @@ def test_repo_corpus_covers_every_vm_opcode():
         except Exception:
             continue
         for proto in _all_protos(module):
-            ok, _reason = encode.can_virtualize(proto, upvalues_ok=True)
+            # ``closures_ok`` too: CLOSURE has been encodable since R5's third
+            # increment, and this walk's job is to cover every opcode the ISA
+            # can carry.  Whether a build *selects* a prototype that creates
+            # closures is the flag's business, not the encoder's.
+            ok, _reason = encode.can_virtualize(proto, upvalues_ok=True,
+                                                closures_ok=True)
             if not ok:
                 continue
-            enc = encode.encode_proto(proto, opmap, upvalues_ok=True)
+            enc = encode.encode_proto(proto, opmap, upvalues_ok=True,
+                                      closures_ok=True)
             pc, code = enc.lua_entry - 1, enc.code
             while pc < len(code):
                 name = opmap.to_op[code[pc]]

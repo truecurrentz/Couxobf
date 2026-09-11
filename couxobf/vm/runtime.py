@@ -66,6 +66,9 @@ REG_VARS: Dict[str, Tuple[str, ...]] = {
     OP.FORPREP: ("base",), OP.FORLOOP: ("base",),
     OP.FORINPREP: ("base",), OP.FORIN: ("base",),
     OP.ITERPREP: ("base",),
+    # R5's third increment: the register the new closure lands in, and the
+    # child prototype's id as a wide immediate.
+    OP.CLOSURE: ("a",),
 }
 
 #: Instructions whose handler always transfers control, so the pc it leaves
@@ -89,6 +92,7 @@ WIDE_VARS: Dict[str, Dict[str, str]] = {
     OP.RETURNMULTI: {"pack": "t"},
     OP.SETLISTMULTI: {"pack": "pk"},
     OP.EXPAND: {"pack": "t"},
+    OP.CLOSURE: {"proto": "pid"},
 }
 
 _ARITH = {OP.ADD: "+", OP.SUB: "-", OP.MUL: "*", OP.DIV: "/", OP.IDIV: "//",
@@ -205,7 +209,7 @@ def _target_jump(fmt: FormatSpec, travel: int = 0) -> str:
 
 
 def _body(op: str, fam: Family, n: Dict[str, str], fmt: FormatSpec,
-          travel: int = 0, variant: int = 0) -> List[str]:
+          travel: int = 0, variant: int = 0, row_mask: int = 0) -> List[str]:
     """What one opcode *does*, given its operands in locals.
 
     Every branch here reads only names -- never offsets -- because the layout is
@@ -244,6 +248,23 @@ def _body(op: str, fam: Family, n: Dict[str, str], fmt: FormatSpec,
         return ["R[o][K[k + 1]] = R[v]"]
     if op == OP.NEWTABLE:
         return fam.store("R[a]", "{}")
+    if op == OP.CLOSURE:
+        # R5's third increment: hand out the child's entry stub, which the
+        # prelude built once per prototype and keyed by descriptor row.  It is
+        # a lookup rather than a closure being built here, for two reasons:
+        # the stub has to be the same function value every time -- Luau's own
+        # compiler hoists a closure that captures nothing, so `f == f` holds
+        # across iterations of a loop that declares one -- and a child that
+        # captured anything was never eligible, so there are no accessors to
+        # build.
+        #
+        # The key is the prototype id masked with the plan's own mask, the one
+        # the descriptor table is keyed by; the mask travels as a literal
+        # rather than as a table, so the artifact carries no map from
+        # prototype to interpreter.
+        stubs = n.get("stubs") or "stubs"
+        return fam.store("R[a]", "%s[bit32.bxor(pid, %d)]"
+                         % (stubs, int(row_mask) & 0xffffffff))
     if op in _ARITH:
         sym = _ARITH[op]
         if variant % 3 == 1:
@@ -430,7 +451,7 @@ def _fix_bias(op: str, fmt: FormatSpec, view: OperandView) -> List[str]:
 
 def _handler(op: str, n: Dict[str, str], fam: Optional[Family] = None,
              fmt: Optional[FormatSpec] = None, view: Optional[OperandView] = None,
-             variant: int = 0
+             variant: int = 0, row_mask: int = 0
              ) -> List[str]:
     """The Luau body of one opcode handler.
 
@@ -459,7 +480,8 @@ def _handler(op: str, n: Dict[str, str], fam: Optional[Family] = None,
         # dispatcher cannot inherit a stale pc.
         out.append("pc = pc + %d" % advance)
         travel = 0
-    return out + _fix_bias(op, spec, v) + _body(op, fam, n, spec, travel, variant)
+    return out + _fix_bias(op, spec, v) + _body(op, fam, n, spec, travel,
+                                                variant, row_mask)
 
 
 def _fused_handler(rule: FusionRule, n: Dict[str, str], fam: Family,
@@ -510,15 +532,20 @@ class _Entry:
     normalizer can collapse immediately.
     """
 
-    __slots__ = ("op", "numbers", "pair", "variant")
+    #: ``row_mask`` is how a CLOSURE arm finds the child's descriptor row: the
+    #: prototype id in the instruction, masked with the plan's own mask.  It is
+    #: a build constant rather than a table, so the artifact carries no map
+    #: from prototype to interpreter.
+    __slots__ = ("op", "numbers", "pair", "variant", "row_mask")
 
     def __init__(self, op: str, numbers: Tuple[int, ...],
                  pair: Optional[FusionRule] = None,
-                 variant: int = 0) -> None:
+                 variant: int = 0, row_mask: int = 0) -> None:
         self.op = op
         self.numbers = numbers
         self.pair = pair
         self.variant = variant
+        self.row_mask = int(row_mask) & 0xffffffff
 
     @property
     def key(self) -> int:
@@ -556,7 +583,8 @@ class _Entry:
     def body(self, n: Dict[str, str], fam: Family, fmt: FormatSpec) -> List[str]:
         if self.pair is not None:
             return _fused_handler(self.pair, n, fam, fmt)
-        return _handler(self.op, n, fam, fmt, variant=self.variant)
+        return _handler(self.op, n, fam, fmt, variant=self.variant,
+                        row_mask=self.row_mask)
 
 def _arm_key(entry: "_Entry", seed: int) -> int:
     """A permutation of the arms, mixed enough to be one.
@@ -575,8 +603,8 @@ def _arm_key(entry: "_Entry", seed: int) -> int:
     h ^= h >> 13
     return h
 
-def dispatch_entries(opmap: OpcodeMap, fmt: Optional[FormatSpec] = None
-                     ) -> List[_Entry]:
+def dispatch_entries(opmap: OpcodeMap, fmt: Optional[FormatSpec] = None,
+                     row_mask: int = 0) -> List[_Entry]:
     """Every arm this build's dispatcher needs, in dispatch order.
 
     Ordered by opcode number, so the chain is a function of the map and nothing
@@ -586,7 +614,8 @@ def dispatch_entries(opmap: OpcodeMap, fmt: Optional[FormatSpec] = None
     entries: List[_Entry] = []
     for op in sorted(opmap.to_byte, key=lambda o: opmap.to_byte[o]):
         for variant, number in enumerate(opmap.numbers(op)):
-            entries.append(_Entry(op, (number,), variant=variant))
+            entries.append(_Entry(op, (number,), variant=variant,
+                                  row_mask=row_mask))
     for number, pair in sorted((opmap.fused or {}).items()):
         entries.append(_Entry(FUSED_PREFIX + "%s,%s" % pair, (number,),
                               pair=FusionRule(pair[0], pair[1])))
@@ -862,7 +891,8 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
                        trace: Optional[List[Tuple[Tuple[int, ...],
                                                   Tuple[str, ...]]]] = None,
                        entry_guard: Sequence[str] = (),
-                       opaque_predicates: bool = True
+                       opaque_predicates: bool = True,
+                       row_mask: int = 0
                        ) -> str:
     """The interpreter, with this build's opcode numbers *and layout* inlined.
 
@@ -947,6 +977,13 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         # E arrives as an argument.  Resolving it here instead would give this
         # function's environment, not the virtualised function's, and a
         # setfenv'd build would silently read and write the real globals.
+        # Forward-declared, not merely declared later: ``exec``'s body holds
+        # every handler, and R5's third increment gives one of them -- CLOSURE
+        # -- reason to call ``enter``.  A local declared *after* ``exec`` would
+        # read as a global there, which in Luau is nil, so the closure would be
+        # created and then fail on the first call.  Declaring the name first
+        # and assigning it afterwards makes it an upvalue of every arm.
+        f"local {n['enter']}",
         f"local function {n['exec']}(p, R, E, _ec)",
         f"  local {n['code']} = _ec or p.code",
         f"  if type({n['code']}) == \"function\" then {n['code']} = {n['code']}() end",
@@ -974,7 +1011,7 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         # the payload runs, and recomputing it per instruction would charge
         # the hot path for a constant.
         lines.append("  local _pt = %s" % tap_read)
-    entries = dispatch_entries(opmap, spec)
+    entries = dispatch_entries(opmap, spec, row_mask=row_mask)
     shape = getattr(spec, "dispatch_shape", "bank")
     if shape == "chain":
         # No bank: the arms' bodies go into the ladder below, so nothing here
@@ -1005,7 +1042,7 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
     lines += [
         "  end",
         "end",
-        f"local function {n['enter']}(p, E, _uv, ...)",
+        f"{n['enter']} = function(p, E, _uv, ...)",
         # The environment guard rides the dispatch loop (see ``loop_guard``),
         # masked like any other opaque check, rather than sitting at the head
         # of this function: an entry point that opens with the check is a

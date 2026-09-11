@@ -17,6 +17,7 @@ They are not; see ``docs/SECURITY.md``.
 """
 
 import glob
+import itertools
 import math
 import os
 import struct
@@ -239,11 +240,19 @@ def test_reproducible_for_a_fixed_seed():
 # the Luau decoder
 
 
-def _luau_checks(names, sealed, values):
-    """Build a script that reads every slot and prints whether it is correct."""
-    rt = ConstantPoolRuntime(names, cache_policy="full")
-    src = rt.emit(sealed.key, sealed.nonce, sealed.tag, sealed.ciphertext, sealed.aad)
-    lines = [f"local v{i} = {rt.accessor}({i})" for i in range(1, len(values) + 1)]
+def _luau_checks(names, sealed, values, shape=None, order=None):
+    """Build a script that reads every slot and prints whether it is correct.
+
+    ``order`` reads the slots back in an order other than 1..N, which is what
+    catches an index that only works when it is walked from the start.
+    """
+    rt = ConstantPoolRuntime(names, cache_policy="full", shape=shape)
+    src = rt.emit(sealed.key, sealed.nonce, sealed.tag, sealed.ciphertext, sealed.aad,
+                  shape=shape)
+    slots = list(range(1, len(values) + 1))
+    if order == "reverse":
+        slots = list(reversed(slots))
+    lines = [f"local v{i} = {rt.accessor}({i})" for i in slots]
     for i, v in enumerate(values, start=1):
         if isinstance(v, float) and math.isnan(v):
             lines.append(f'print({i}, v{i} ~= v{i})')
@@ -278,6 +287,62 @@ def test_luau_decoder_matches_python(policy):
     assert len(lines) == len(TRICKY)
     bad = [l for l in lines if not l.rstrip().endswith("true")]
     assert not bad, f"policy={policy}: {bad}"
+
+
+@pytest.mark.parametrize("order", ["forward", "reverse"])
+def test_every_drawn_decoder_shape_decodes_the_same_pool(order):
+    """The decoder's shape is drawn per region, so every combination has to work.
+
+    Three axes: whether the entry offsets are built all at load time or scanned
+    forward on demand, how the ticket mask is folded back into a slot number,
+    and whether a type byte reaches its materializer through an if-chain or a
+    table.  All twelve decode the same pool -- they exist so two regions of one
+    artifact are not the same runtime with the names changed.
+
+    Reading the slots backwards is the case the incremental scan has to get
+    right: it can only walk forward, so a slot already passed has to have been
+    remembered.
+    """
+    if not TOOLCHAIN.can_execute:
+        pytest.skip("luau runtime not available")
+    pool = make_pool()
+    for v in TRICKY:
+        pool.slot(v)
+    sealed = pool.seal()
+    combos = [
+        dict(zip(ConstantPoolRuntime.SHAPES, pick))
+        for pick in itertools.product(*ConstantPoolRuntime.SHAPES.values())
+    ]
+    assert len(combos) == 12, combos
+    for shape in combos:
+        src = _luau_checks(default_names(), sealed, TRICKY, shape=shape,
+                           order=order)
+        result = execute(TOOLCHAIN, src, "pool.luau", timeout=30)
+        assert result.returncode == 0, "%s: %s" % (shape, result.stderr[:400])
+        lines = [l for l in result.stdout.strip().split("\n") if l.strip()]
+        assert len(lines) == len(TRICKY), (shape, len(lines))
+        bad = [l for l in lines if not l.rstrip().endswith("true")]
+        assert not bad, f"shape={shape} order={order}: {bad}"
+
+
+def test_the_shape_draw_really_varies():
+    """A shape that never moves is a fixed signature with extra steps.
+
+    One build draws one shape per region; across builds every axis has to
+    appear.
+    """
+    seen = {key: set() for key in ConstantPoolRuntime.SHAPES}
+    for seed in range(24):
+        result = build("local a = 1\nprint(a)\n",
+                       Config(reproducible_seed=seed), name="s.luau",
+                       verify=False)
+        for region in result.runtime_names.get("pool_regions") or ():
+            drawn = dict(zip(sorted(ConstantPoolRuntime.SHAPES),
+                             region["shape"].split("/")))
+            for key, value in drawn.items():
+                seen[key].add(value)
+    for key, allowed in ConstantPoolRuntime.SHAPES.items():
+        assert seen[key] == set(allowed), (key, sorted(seen[key]))
 
 
 def test_runtime_literals_are_masked_fragments_not_whole_blobs():

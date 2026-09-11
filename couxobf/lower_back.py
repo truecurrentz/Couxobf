@@ -415,6 +415,54 @@ class Reconstructor:
             params.append(A.Param(name=None))
         return A.Func(params=params, body=A.Block(body=self._proto_body(proto)))
 
+    def _vm_encode(self, proto: FuncIR) -> bool:
+        """Encode ``proto`` for the VM.  True when its bytecode now exists.
+
+        Split out of :meth:`_vm_closure` because R5's third increment needs the
+        encoding without the stub: a virtualized prototype's children are never
+        visited by the native reconstruction -- the parent's body is encoded,
+        not printed -- so nothing else would ever produce their bytecode, and
+        the interpreter would build an entry stub for a row that is not there.
+
+        Children first, then the parent: if a child cannot be encoded, the
+        parent falls back to native and no rows have been written for a tree
+        that will not run in the VM.
+        """
+        from .vm import encode as _encode
+
+        if proto.proto_id in self.vm_encoded:
+            return True
+        # The plan, not a default: which group owns this prototype decides the
+        # opcode map, the instruction format *and* the interpreter that will run
+        # it.  Asking those three questions separately is how a build ends up
+        # executing bytes encoded for a different machine -- and eligibility has
+        # to be judged against the format in play, because a wide operand that
+        # fits a three-byte field does not fit a two-byte one.
+        fmt = self.vm.fmt_for(proto.proto_id)
+        ok, _reason = _encode.can_virtualize(
+            proto, fmt, upvalues_ok=self.vm.upvalues_ok,
+            closures_ok=self.vm.closures_ok)
+        if not ok:
+            return False
+        if proto.children and self.vm.closures_ok:
+            for child in proto.children:
+                # A child left native cannot be built by a CLOSURE arm -- the
+                # interpreter has no function value to hand out -- so the whole
+                # subtree stays native instead of half of it.
+                if not self.vm.selects(child) or not self._vm_encode(child):
+                    return False
+        order = None
+        if self.vm.permute_blocks and self.vm.layout_rng is not None:
+            from .vm import layout as _layout
+            order = _layout.permuted_order(proto, self.vm.layout_rng)
+        self.vm_encoded[proto.proto_id] = _encode.encode_proto(
+            proto, self.vm.opmap_for(proto.proto_id), order=order, fmt=fmt,
+            rng=self.vm_layout_rng,
+            alias_chance=self.vm.alias_chance,
+            upvalues_ok=self.vm.upvalues_ok,
+            closures_ok=self.vm.closures_ok)
+        return True
+
     def _vm_closure(self, proto: FuncIR) -> Optional[A.Func]:
         """Encode ``proto`` and return the Luau closure that runs it.
 
@@ -424,29 +472,8 @@ class Reconstructor:
         was made; this second check is cheap insurance against the plan and the
         encoder disagreeing.
         """
-        from .vm import encode as _encode
-
-        # The plan, not a default: which group owns this prototype decides the
-        # opcode map, the instruction format *and* the interpreter that will run
-        # it.  Asking those three questions separately is how a build ends up
-        # executing bytes encoded for a different machine -- and eligibility has
-        # to be judged against the format in play, because a wide operand that
-        # fits a three-byte field does not fit a two-byte one.
-        group = self.vm.group_for(proto.proto_id)
-        fmt = self.vm.fmt_for(proto.proto_id)
-        ok, _reason = _encode.can_virtualize(
-            proto, fmt, upvalues_ok=self.vm.upvalues_ok)
-        if not ok:
+        if not self._vm_encode(proto):
             return None
-        order = None
-        if self.vm.permute_blocks and self.vm.layout_rng is not None:
-            from .vm import layout as _layout
-            order = _layout.permuted_order(proto, self.vm.layout_rng)
-        self.vm_encoded[proto.proto_id] = _encode.encode_proto(
-            proto, self.vm.opmap_for(proto.proto_id), order=order, fmt=fmt,
-            rng=self.vm_layout_rng,
-            alias_chance=self.vm.alias_chance,
-            upvalues_ok=self.vm.upvalues_ok)
         # A vararg parameter list, not the prototype's declared parameters:
         # the descriptor carries the real count and the interpreter distributes
         # the arguments itself.  From the caller's side this is an ordinary
@@ -458,6 +485,16 @@ class Reconstructor:
         # virtualised function would be ignored.  `_gf` is an upvalue rather
         # than a global lookup, because a swapped environment does not contain
         # getfenv either.
+        #
+        # A prototype that captures nothing does not need any of that: its stub
+        # was built once in the prelude and this site only names it.  Sharing
+        # it is not an optimisation -- Luau's own compiler hoists a closure
+        # that captures nothing, so a function declared inside a loop is one
+        # value across every iteration, and a stub rebuilt per execution would
+        # answer `f == f` differently from the unprotected program.
+        if not proto.upvalues:
+            return A.Index(obj=A.Name(name=self.vm.names["stubs"]),
+                           key=_num(self.vm.row_key(proto.proto_id)))
         # `enter_for` is this prototype's *group's* entry point, and the row it
         # is handed comes out of the assembled descriptor table.  Naming the
         # interpreter in the closure rather than storing "which VM" in the
@@ -1195,6 +1232,7 @@ def reconstruct_protected(module: IRModule,
                           alias_ratio: float = 0.0,
                           alias_chance: float = 0.0,
                           vm_upvalues: bool = False,
+                          vm_closures: bool = False,
                           env_guard: int = 0,
                           dump_guard: int = 0,
                           guard_policy: str = "fail",
@@ -1294,8 +1332,12 @@ def reconstruct_protected(module: IRModule,
                                  # "which opcodes does this function need" is a
                                  # question about its instructions, not about any
                                  # of the names the config has.
+                                 # Grouping a closure with its parent (and the
+                                 # per-group opcode subset folding in children)
+                                 # both need the IR objects, not just the ids.
                                  protos_by_id=({q.proto_id: q for q in module.protos}
-                                                if isa_subset else None),
+                                                if (isa_subset or vm_closures)
+                                                else None),
                                  isa_subset=bool(isa_subset),
                                  # R5's second increment: whether upvalue-capturing
                                  # prototypes may ride the VM.  The eligibility and
@@ -1303,6 +1345,10 @@ def reconstruct_protected(module: IRModule,
                                  # by the selector; this only tells the stub whether
                                  # to hand ``enter`` an accessor list.
                                  upvalues_ok=bool(vm_upvalues),
+                                 # R5's third increment: whether a prototype
+                                 # that creates closures may ride the VM, and
+                                 # whether its children have to come with it.
+                                 closures_ok=bool(vm_closures),
                                  # wiring indexes this positionally as
                                  # (append, iter, iterpack, itercheck); passing
                                  # the dict would hand it the role *keys*.
@@ -1390,9 +1436,15 @@ def reconstruct_protected(module: IRModule,
                 else 0x5A17C0DE) & 0xffffffff
         if mask == 0:
             mask = 0x5A17C0DE
+        # The decoder's shape is drawn too, so two regions are not the same
+        # runtime with the names changed.
+        shape = {}
+        for key, allowed in ConstantPoolRuntime.SHAPES.items():
+            shape[key] = allowed[prng.randbelow(len(allowed))]
         regions.append({
             "label": label,
             "pool": region_pool,
+            "shape": shape,
             # Its own prefix and its own ticket mask: two regions sharing
             # either would be recognisable as one runtime twice.
             # The native region keeps the names the build already drew for
@@ -1507,10 +1559,16 @@ def reconstruct_protected(module: IRModule,
             return "%s(%d)" % (region["names"]["get"],
                                region["ticket"](region["pool"].slot(value)))
 
+        # Prototypes whose stub has to be built where the closure is created
+        # rather than once in the prelude: the ones that capture, whose
+        # accessors close over the enclosing scope's own storage.
+        per_site = {pid for pid in rec.vm_encoded
+                    if rec.by_id[pid].upvalues} if plan.upvalues_ok else set()
         vm_src = _wiring.prelude_source(plan, rec.vm_encoded, pooled, pooled,
                                         edges_expr=pooled,
                                         entry_guard=guard.entry_lines(),
-                                        opaque_predicates=bool(opaque_predicates))
+                                        opaque_predicates=bool(opaque_predicates),
+                                        per_site=per_site)
 
     # A region with no constants in it needs no runtime: emitting one would
     # just be a decoder that never runs.  A build that virtualized nothing has
@@ -1578,7 +1636,9 @@ def reconstruct_protected(module: IRModule,
                 {"label": r["label"], "entries": len(r["pool"]),
                  "protos": len(r["protos"]),
                  "aad": r["sealed"].aad.hex(),
-                 "get": r["names"]["get"]} for r in live]
+                 "get": r["names"]["get"],
+                 "shape": "/".join(r["shape"][k] for k in sorted(r["shape"]))}
+                for r in live]
             # "The pool" is now several.  Callers that look for one -- a
             # validator finding the meta table, a test editing the blob --
             # get the region that actually carries this program's constants,
@@ -1610,7 +1670,8 @@ def reconstruct_protected(module: IRModule,
                 enc_domain=sealed.enc_domain,
                 mac_domain=sealed.mac_domain,
                 dense=dense_codec,
-                cipher=cipher_spec, shape_rng=shape_rng))
+                cipher=cipher_spec, shape_rng=shape_rng,
+                shape=region["shape"]))
 
     bank_src = ""
     if need_bank:

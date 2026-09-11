@@ -389,7 +389,8 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         module, config, domains.get("vm"),
         directives=directives)
     selected = _select_for_vm(module, classification,
-                              upvalues_ok=bool(config.vm_upvalues))
+                              upvalues_ok=bool(config.vm_upvalues),
+                              closures_ok=bool(config.vm_closures))
 
     # -- back end ---------------------------------------------------------
     runtime_names: Dict[str, Any] = {}
@@ -418,6 +419,7 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
         control_flow_level=int(config.control_flow_level),
         isa_subset=bool(config.vm_isa_subset),
         vm_upvalues=bool(config.vm_upvalues),
+        vm_closures=bool(config.vm_closures),
         layout_rng=domains.get("cfg"),
         dispatcher_family=DispatcherFamily.MIXED,
         opcode_randomization=config.opcode_randomization,
@@ -458,7 +460,8 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
 
     stats = _collect_stats(module, classification, out, source_size,
                            index_stats, selected=selected,
-                           upvalues_ok=bool(config.vm_upvalues))
+                           upvalues_ok=bool(config.vm_upvalues),
+                           closures_ok=bool(config.vm_closures))
     stats.guard = dict(runtime_names.get("guard") or {})
     stats.fingerprint = str(runtime_names.get("fingerprint") or "")
     stats.fingerprint_requested = bool(runtime_names.get("fingerprint_requested"))
@@ -537,7 +540,8 @@ def _upvalue_home_map(module) -> Dict[int, Tuple[int, ...]]:
             for p in module.walk() if p.upvalues}
 
 
-def _select_for_vm(module, classification, upvalues_ok: bool = False) -> Set[int]:
+def _select_for_vm(module, classification, upvalues_ok: bool = False,
+                   closures_ok: bool = False) -> Set[int]:
     """Prototypes the classifier picked that the encoder can actually take.
 
     The classifier does not know the VM's constraints -- nested closures are
@@ -555,6 +559,24 @@ def _select_for_vm(module, classification, upvalues_ok: bool = False) -> Set[int
     removal runs to a fixpoint.  Intersecting here means the reported count is
     the count that will really be virtualized, not the count the classifier
     wished for.
+
+    ``closures_ok`` is R5's third increment and closes the tree the other way.
+    A virtualized parent hands its children to the interpreter, which can only
+    build an entry stub for a child that is *in* the VM -- so a selected
+    prototype takes its whole virtualizable subtree in with it.  A nested helper
+    is usually far below the classifier's size floor on its own, and refusing
+    its parent instead would have made the flag close to useless: the patterns
+    worth protecting (a comparator, a callback, a helper next to the loop that
+    calls it) are exactly the ones whose children are small.  What cannot be
+    pulled in is a child that captures a variable a virtualized ancestor owns,
+    because that variable lives in a frame no closure can see; such a child
+    unselects its parent, and its parent's parent, to the root of the tree.
+
+    Deciding that needs no fixpoint, because everything a prototype's decision
+    depends on -- whether its parent is in, whether an upvalue of its own is
+    homed in the VM -- is a fact about its *ancestors*.  So the pass runs
+    parents first: encodability of the whole subtree is computed bottom-up,
+    then the set is decided top-down, once.
     """
     from .vm import encode as _encode
 
@@ -562,7 +584,8 @@ def _select_for_vm(module, classification, upvalues_ok: bool = False) -> Set[int
     for proto in module.walk():
         if classification.level(proto.proto_id) <= 0:
             continue
-        ok, _reason = _encode.can_virtualize(proto, upvalues_ok=upvalues_ok)
+        ok, _reason = _encode.can_virtualize(proto, upvalues_ok=upvalues_ok,
+                                             closures_ok=closures_ok)
         if ok:
             chosen.add(proto.proto_id)
     if upvalues_ok and chosen:
@@ -574,12 +597,53 @@ def _select_for_vm(module, classification, upvalues_ok: bool = False) -> Set[int
                 if any(h in chosen for h in homes.get(pid, ())):
                     chosen.discard(pid)
                     changed = True
+    if closures_ok and chosen:
+        homes = (_upvalue_home_map(module) if upvalues_ok else {})
+        parents = {c.proto_id: p.proto_id
+                   for p in module.walk() for c in p.children}
+        # Depth-first, so a prototype is always visited before its children
+        # and after its parent -- the order both passes below need.
+        order: List[Any] = []
+        stack = [module.main]
+        while stack:
+            proto = stack.pop()
+            order.append(proto)
+            stack.extend(reversed(proto.children))
+        # Bottom-up: can this prototype and everything under it run in the VM?
+        # Refusing the parent instead of pulling the child in is what the first
+        # version of this did, and it meant the flag could only ever pay for
+        # itself on functions whose helpers were large -- a comparator, a
+        # callback or a helper beside the loop that calls it is the small case.
+        whole_tree: Dict[int, bool] = {}
+        for proto in reversed(order):
+            whole_tree[proto.proto_id] = (
+                _encode.can_virtualize(proto, upvalues_ok=upvalues_ok,
+                                       closures_ok=closures_ok)[0]
+                and all(whole_tree[c.proto_id] for c in proto.children))
+        # Top-down: a prototype is in if the classifier put it there, or if its
+        # parent is in and it can be built there.  A child refused above has
+        # already marked its whole chain unencodable, so a tree is all or
+        # nothing without a second pass to enforce it.
+        roots = set(chosen)
+        keep: Set[int] = set()
+        for proto in order:
+            pid = proto.proto_id
+            parent = parents.get(pid)
+            if pid not in roots and (parent is None or parent not in keep):
+                continue
+            if not whole_tree[pid]:
+                continue
+            if any(h in keep for h in homes.get(pid, ())):
+                continue
+            keep.add(pid)
+        chosen = keep
     return chosen
 
 
 def _collect_stats(module, classification, out: str, source_size: int,
                    index_stats=None, selected: Optional[Set[int]] = None,
-                   upvalues_ok: bool = False) -> BuildStats:
+                   upvalues_ok: bool = False,
+                   closures_ok: bool = False) -> BuildStats:
     from .vm import encode as _encode
 
     # ``source_size`` is the caller's, because the honest denominator for the
@@ -598,7 +662,8 @@ def _collect_stats(module, classification, out: str, source_size: int,
     # independently is how the report drifts from what the build actually did.
     if selected is None:
         selected = _select_for_vm(module, classification,
-                                  upvalues_ok=upvalues_ok)
+                                  upvalues_ok=upvalues_ok,
+                                  closures_ok=closures_ok)
     reasons: Dict[str, int] = {}
     for proto in module.walk():
         stats.prototypes += 1
@@ -606,15 +671,34 @@ def _collect_stats(module, classification, out: str, source_size: int,
         if pid in selected:
             stats.virtualized += 1
             continue
-        ok, reason = _encode.can_virtualize(proto, upvalues_ok=upvalues_ok)
+        ok, reason = _encode.can_virtualize(proto, upvalues_ok=upvalues_ok,
+                                            closures_ok=closures_ok)
         if not ok:
             key = reason or "not encodable"
         elif classification.level(pid) > 0:
             # Encodable and wanted by the classifier, yet not in the final
-            # selection: that only happens to upvalue-capturing prototypes
-            # whose home ended up virtualized, removed by the fixpoint.
-            key = ("an upvalue's home lives inside the VM, where no closure "
-                   "can reach it")
+            # selection: either an upvalue-capturing prototype whose home
+            # ended up virtualized, or one whose nested closures did not all
+            # make it -- both removed by the fixpoint.  Which one is worth
+            # saying, because the fix is different: stop capturing across the
+            # boundary, or re-check why the child was refused.
+            if not closures_ok or not proto.children:
+                key = ("an upvalue's home lives inside the VM, where no "
+                       "closure can reach it")
+            else:
+                # The child's own reason, not a count: the tree is all or
+                # nothing, so the root's answer is the leaf's answer, and
+                # "one of them captures" is actionable where "one of them
+                # stayed native" is not.
+                missing = [c for c in proto.children
+                           if c.proto_id not in selected]
+                why = _encode.can_virtualize(missing[0],
+                                             upvalues_ok=upvalues_ok,
+                                             closures_ok=closures_ok)[1] \
+                    or "cannot run in the VM"
+                key = ("creates closures, and %d of them %s -- the whole "
+                       "tree has to run in the VM or none of it can"
+                       % (len(missing), why))
         else:
             key = reasons_by_proto.get(pid) or "not selected"
         reasons[key] = reasons.get(key, 0) + 1
@@ -741,16 +825,21 @@ def cost_report(result: BuildResult) -> str:
     else:
         lines.append("pool decoys           : none.  Every entry in the pool is referenced.")
     if s.pool_regions:
-        labels = ", ".join(r["label"] for r in s.pool_regions)
+        labels = ", ".join("%s (%s)" % (r["label"], r.get("shape", ""))
+                           for r in s.pool_regions)
         counts = [str(r["entries"]) for r in s.pool_regions]
         sizes = counts[0] if len(counts) == 1 else (
             ", ".join(counts[:-1]) + " and " + counts[-1])
-        body = ("%d sealed regions: %s (%s constants).  One per VM group plus "
-                "the native one, each authenticated against the format that "
-                "reads it -- so recovering an accessor yields that region's "
-                "constants, and a blob moved between regions fails the tag "
-                "rather than decrypting."
-                % (len(s.pool_regions), labels, sizes))
+        body = ("%d sealed region%s: %s, holding %s constants between them.  "
+                "One per VM group plus the native one, each authenticated "
+                "against the format that reads it -- so recovering an accessor "
+                "yields that region's constants, and a blob moved between "
+                "regions fails the tag rather than decrypting.  The decoder "
+                "behind each one is drawn per region too: how it finds an "
+                "entry, how it folds a ticket back into a slot, and whether "
+                "it dispatches a type byte through an if-chain or a table."
+                % (len(s.pool_regions), "" if len(s.pool_regions) == 1 else "s",
+                   labels, sizes))
         wrapped = textwrap.wrap(body, width=54) or [""]
         lines.append("constant pools        : %s" % wrapped[0])
         for line in wrapped[1:]:
