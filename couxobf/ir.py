@@ -263,6 +263,13 @@ class FuncIR:
     closure_count: int = 0
     loop_count: int = 0
     branch_count: int = 0
+    #: registers that hold a *cell* rather than a value: a one-field table,
+    #: allocated fresh every time the declaration runs, whose field is the
+    #: variable.  A local declared inside a loop body and captured by a
+    #: closure is one register standing in for one variable per iteration,
+    #: and a cell is what gives each iteration its own -- including to a
+    #: closure that *writes* it, which a snapshot cannot serve.
+    cells: Set[int] = field(default_factory=set)
     #: registers holding a value that is fresh on each loop iteration: the
     #: loop variable itself, and any local declared inside a loop body that
     #: nothing ever assigns again.  A closure capturing one of these must see
@@ -339,6 +346,32 @@ class _Local:
     name: str
 
 
+def _produces_in_place(expr: Any) -> bool:
+    """Whether lowering ``expr`` writes its value straight into the register it
+    was handed, in a way no later pass can move.  A call's base is also its
+    callee slot, and a vararg's its first result, so neither can be retargeted
+    after the fact; every other expression produces through a ``MOV``."""
+    return isinstance(expr, (A.Call, A.Vararg)) or _is_multiret(expr)
+
+
+def _unmovable_write(ins: "Instr") -> Optional[Tuple[int, int]]:
+    """The (base, count) run of registers ``ins`` writes, if the run cannot be
+    redirected elsewhere.  ``None`` for everything else, including every
+    single-register definition."""
+    if ins.op == OP.EXPAND and isinstance(ins.args[0], Reg):
+        return (ins.args[0].index, max(1, int(ins.args[2])))
+    if ins.op == OP.CALL and isinstance(ins.args[0], Reg):
+        # The base holds the callee and the result, and the arguments are
+        # counted out from it, so no other register can stand in for it.
+        return (ins.args[0].index, max(1, int(ins.args[2])))
+    if ins.op == OP.VARARG and isinstance(ins.args[0], Reg):
+        count = int(ins.args[1])
+        return (ins.args[0].index, count) if count != 1 else None
+    if ins.op == OP.SELF and isinstance(ins.args[0], Reg):
+        return (ins.args[0].index, 2)
+    return None
+
+
 class _FuncBuilder:
     def __init__(self, lowerer: "Lowerer", proto: FuncIR,
                  parent: Optional["_FuncBuilder"] = None) -> None:
@@ -355,6 +388,24 @@ class _FuncBuilder:
         #: reachable through the closure after its block closes, so its
         #: register must never be handed out again.
         self.captured: Set[int] = set()
+        #: locals declared inside a loop body, and the ones that must never
+        #: become cells because the loop's own instructions read and write
+        #: them -- a numeric `for` writes its control variable directly.
+        #:
+        #: ``decl_at`` records where each of those was declared, as a position
+        #: in ``code``.  A register is scratch before that point and the
+        #: variable after it: a numeric `for` spends its preheader calling the
+        #: coercion helper with a scratch register that the body's first local
+        #: is later handed, and without the position a cell would be allocated
+        #: in the preheader -- once per loop, which is the one thing it must
+        #: not be.  ``scope_end`` bounds it from the other side: a register is
+        #: scratch again once the block that declared it closes, and a call
+        #: may then use it as an argument slot, which no rewrite can follow
+        #: because the slot is a number and not an operand.
+        self.loop_body_locals: Set[int] = set()
+        self.decl_at: Dict[int, int] = {}
+        self.scope_end: Dict[int, int] = {}
+        self.not_a_cell: Set[int] = set()
         self.loop_stack: List[Tuple[Label, Label]] = []  # (continue, break)
         self.next_label = 0
         self.reg_names: Dict[int, str] = {}
@@ -363,6 +414,20 @@ class _FuncBuilder:
     def emit(self, op: str, *args: Any, line: int = 0, origin: Any = None) -> Instr:
         ins = Instr(op, tuple(args), line, origin)
         self.code.append(ins)
+        # A cell has to be *stored into*, and a call, a multi-value vararg and
+        # SELF all write their destination in place: the register is the
+        # callee slot and the origin the arguments are counted from, or the
+        # head of a run.  Nothing can stand in for it later, so a local that
+        # lands in one keeps the representation it had.  Noted here rather
+        # than discovered at the end because the register may be scratch today
+        # and a loop body's local tomorrow -- the order is what decides, and
+        # this is the only place that sees it.
+        span = _unmovable_write(ins)
+        if span is not None:
+            for r in range(span[0], span[0] + span[1]):
+                self.loop_body_locals.discard(r)
+                self.decl_at.pop(r, None)
+                self.scope_end.pop(r, None)
         return ins
 
     def label(self) -> Label:
@@ -402,6 +467,18 @@ class _FuncBuilder:
         # after the closure exists is one variable, not one per iteration.
         if self.loop_depth:
             self.proto.per_iteration.add(idx)
+            self.loop_body_locals.add(idx)
+            self.decl_at[idx] = len(self.code)
+        else:
+            # The register may have held a loop body's local before -- one
+            # that was never captured, so nothing pinned it, and whose block
+            # has closed.  Its variable is gone and this is a new one that is
+            # not per-iteration, so the candidacy goes with it: the register
+            # has two variables' worth of code in it, and only the ranges
+            # above keep the two apart.
+            self.loop_body_locals.discard(idx)
+            self.decl_at.pop(idx, None)
+            self.scope_end.pop(idx, None)
         self.base = self.proto.num_regs
         self.max_regs = max(self.max_regs, self.proto.num_regs)
         self.reg_names[idx] = name
@@ -411,6 +488,9 @@ class _FuncBuilder:
         self.scopes.append({})
 
     def pop_scope(self) -> None:
+        for loc in self.scopes[-1].values():
+            if loc.reg in self.decl_at:
+                self.scope_end[loc.reg] = len(self.code)
         self.scopes.pop()
         self.base = self._min_base()
 
@@ -529,6 +609,11 @@ class Lowerer:
         fb.base = 0
         self._block(fb, root)
         fb.emit(OP.RETURN0, line=0)
+        # The main chunk lowers through this path rather than through
+        # ``_function``, so it needs the same finish: a local it declares
+        # inside a loop body is no less per-iteration than one a function
+        # declares.
+        self._lower_cells_if_any(fb)
         main.num_regs = fb.max_regs
         main.blocks = self._build_cfg(fb)
         main.node_count = self._count(root)
@@ -773,13 +858,42 @@ class Lowerer:
                     fb.emit(OP.MOV, r, tmps[i], line=s.line, origin=s)
             extra = len(locs) - len(tmps)
             if extra > 0:
-                fb.emit(OP.EXPAND, locs[len(tmps)], pack.index, extra,
-                        line=s.line, origin=s)
+                if fb.loop_depth:
+                    # `local n = f()` -- a local declared in a loop body may
+                    # turn out to be captured, and a captured one becomes a
+                    # cell, which is *stored into*.  EXPAND writes a run of
+                    # registers in place and cannot be redirected later, so
+                    # expand into scratch and move: an extra instruction per
+                    # declaration, and only where one may be needed.
+                    first = fb.new_reg()
+                    for _ in range(extra - 1):
+                        fb.new_reg()
+                    fb.emit(OP.EXPAND, first, pack.index, extra,
+                            line=s.line, origin=s)
+                    for j in range(extra):
+                        fb.emit(OP.MOV, Reg(locs[len(tmps)].index + j),
+                                Reg(first.index + j), line=s.line, origin=s)
+                else:
+                    fb.emit(OP.EXPAND, locs[len(tmps)], pack.index, extra,
+                            line=s.line, origin=s)
             return
         for i, name in enumerate(names):
             r = fb.alloc_local(name)
             if i < len(exprs):
-                self._expr(fb, exprs[i], r)
+                if fb.loop_depth and _produces_in_place(exprs[i]):
+                    # A local declared in a loop body may turn out to be
+                    # captured, and a captured one becomes a cell -- which
+                    # means the declaration has to be a store *into* the cell
+                    # rather than a value produced straight into the register.
+                    # A call or a vararg writes its own base, and that base is
+                    # also where its arguments are counted from, so it cannot
+                    # be redirected to the cell later: put the value in a
+                    # scratch register and move it, which can be.
+                    t = fb.new_reg()
+                    self._expr(fb, exprs[i], t)
+                    fb.emit(OP.MOV, r, t, line=s.line, origin=exprs[i])
+                else:
+                    self._expr(fb, exprs[i], r)
             else:
                 fb.emit(OP.LOADK, r, fb.proto.add_const(None), line=s.line)
 
@@ -858,6 +972,117 @@ class Lowerer:
             desc = proto.upvalues[index]
             if desc.from_local:
                 fb.proto.per_iteration.discard(desc.index)
+
+    def _lower_cells_if_any(self, fb: "_FuncBuilder") -> None:
+        """Turn the loop-body locals a closure captured into cells.
+
+        Called once the body is finished, which is the earliest point at which
+        *which* locals a closure captured is known -- a closure declared
+        later in the body can still capture one declared earlier.
+        """
+        fb.proto.cells = ((fb.loop_body_locals - fb.not_a_cell)
+                          & fb.captured)
+        if fb.proto.cells:
+            self._lower_cells(fb)
+
+    def _lower_cells(self, fb: "_FuncBuilder") -> None:
+        """Turn a captured loop-body local's register into a cell.
+
+        Runs when the whole body has been lowered, because which locals a
+        closure captured is only known then.  The register stops holding the
+        value and starts holding a one-field table; every read of the local
+        becomes ``GETTABLE`` and every write ``SETTABLE``, so the value lives
+        in exactly one place that every closure of this iteration shares --
+        which is what neither a snapshot nor a plain register can be.
+
+        The cell is allocated at the first write, and the first write is the
+        declaration.  That is the only site that runs once per iteration, and
+        once per iteration is the whole point.
+
+        Reads and writes of a local both go through a ``MOV``, so in practice
+        the pass rewrites ``MOV``s; the rest of the cases are the ones where
+        a value is produced straight into the local's register.
+        """
+        cells = set(fb.proto.cells)
+        if not cells:
+            return
+        # Which registers those are was decided as the instructions were
+        # emitted: one a call, a multi-value vararg or SELF writes into place
+        # was never left in the set, because nothing can redirect it later.
+        key = fb.proto.add_const(1)
+        narr = fb.proto.add_const(0)
+        nhash = fb.proto.add_const(1)
+        out: List[Any] = []
+        allocated: Set[int] = set()
+        # Scratch for the rewrite, and shared: a value read out of a cell is
+        # consumed by the very next instruction, so one register per operand
+        # of the widest instruction serves the whole body.  A register per
+        # access would grow the frame with the program, and a prototype that
+        # outgrows what the encoder can name stops being virtualizable at all.
+        reads: List[Reg] = []
+        write: Optional[Reg] = None
+        decl_at = fb.decl_at
+        scope_end = fb.scope_end
+        # Only between the declaration and the end of the block that made it
+        # is the register the variable: before, it is scratch the loop's
+        # preheader may still be using, and after, scratch again -- handed out
+        # as a call's argument slot, which is a number in the operand list
+        # rather than an operand, and so is not a place this pass can follow.
+        def live(reg: int, pos: int) -> bool:
+            return (decl_at.get(reg, 0) <= pos
+                    and pos < scope_end.get(reg, len(fb.code)))
+
+        for pos, item in enumerate(fb.code):
+            if isinstance(item, tuple):
+                out.append(item)
+                continue
+            ins = item
+            dst = ins.dest()
+            args = list(ins.args)
+            value: Any = None
+            used = 0
+            for i, a in enumerate(args):
+                if not isinstance(a, Reg) or a.index not in cells:
+                    continue
+                if i == 0 and dst is not None:
+                    continue  # the destination, rewritten below
+                if not live(a.index, pos):
+                    continue  # scratch life, outside the variable's own
+                if used == len(reads):
+                    reads.append(fb.new_reg())
+                tmp = reads[used]
+                used += 1
+                out.append(Instr(OP.GETTABLE, (tmp, a, key), ins.line,
+                                 ins.origin))
+                args[i] = tmp
+                value = tmp
+            if (dst is not None and isinstance(dst, Reg)
+                    and dst.index in cells and live(dst.index, pos)):
+                cell = Reg(dst.index)
+                if dst.index not in allocated:
+                    allocated.add(dst.index)
+                    out.append(Instr(OP.NEWTABLE, (cell, narr, nhash),
+                                     ins.line, ins.origin))
+                if ins.op == OP.MOV:
+                    out.append(Instr(OP.SETTABLE,
+                                     (cell, key, value if value is not None
+                                      else args[1]),
+                                     ins.line, ins.origin))
+                    continue
+                # Produced straight into the local's register: give the
+                # producing instruction somewhere else to put it, then move
+                # it into the cell.
+                if write is None:
+                    write = fb.new_reg()
+                tmp = write
+                args[0] = tmp
+                out.append(Instr(ins.op, tuple(args), ins.line, ins.origin))
+                out.append(Instr(OP.SETTABLE, (cell, key, tmp), ins.line,
+                                 ins.origin))
+                continue
+            out.append(Instr(ins.op, tuple(args), ins.line, ins.origin)
+                       if value is not None else ins)
+        fb.code = out
 
     def _write_name_preserving(self, fb: _FuncBuilder, name: str, src: Reg,
                                line: int) -> None:
@@ -975,6 +1200,7 @@ class Lowerer:
         sub.base = proto.num_regs
         self._block(sub, fn.body)
         sub.emit(OP.RETURN0, line=0)
+        self._lower_cells_if_any(sub)
         # A closure that *writes* the variable it captured makes that variable
         # shared, which is the opposite of per-iteration: two closures built
         # in one iteration have to agree on what they see, and a snapshot each
@@ -1102,7 +1328,16 @@ class Lowerer:
         fb.loop_depth += 1
         var = fb.alloc_local(s.var.name)
         fb.proto.per_iteration.add(base.index + 3)
+        fb.not_a_cell.add(base.index + 3)
         if var.index != base.index + 3:  # pragma: no cover - safety net
+            # The register ``alloc_local`` handed out is scratch again, and
+            # another local may be given it later -- one that is *not* in a
+            # loop body, and that must not inherit either mark.
+            fb.proto.per_iteration.discard(var.index)
+            fb.loop_body_locals.discard(var.index)
+            fb.decl_at.pop(var.index, None)
+            fb.scope_end.pop(var.index, None)
+            fb.not_a_cell.discard(var.index)
             fb.proto.num_regs = base.index + 4
             fb.scopes[-1][s.var.name] = _Local(base.index + 3, s.var.name)
             fb.base = base.index + 4
@@ -1161,6 +1396,7 @@ class Lowerer:
         for i, v in enumerate(s.vars):
             fb.scopes[-1][v.name] = _Local(base.index + 3 + i, v.name)
             fb.proto.per_iteration.add(base.index + 3 + i)
+            fb.not_a_cell.add(base.index + 3 + i)
         fb.base = need
         loop = fb.label()
         end = fb.label()

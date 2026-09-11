@@ -275,12 +275,16 @@ _ROLES = ("code", "exec", "enter", "call", "getfenv", "acc", "stack", "sp",
           "stubs",
           # R5's fourth increment: how a capturing child reaches what it
           # captures.  ``caps`` is one entry per upvalue (a parent register to
-          # watch, or an accessor of the parent's to relay); ``snaps`` names
-          # the ones that need a cell holding a snapshot instead, because the
-          # variable is a loop variable and Luau gives each iteration its own.
-          # A child with no entry in ``caps`` has nothing to capture and takes
-          # its stub from the table above.
-          "caps", "snaps", "setfenv")
+          # watch, or an accessor of the parent's to relay); ``kinds`` is one
+          # entry per upvalue of the same child: 0 to watch it live, 1 to
+          # snapshot it into a cell because the variable is a loop variable
+          # and Luau gives each iteration its own, 2 to read the register as
+          # a cell table the parent already made -- a snapshot would hand a
+          # closure that writes the variable a copy of its own, and every
+          # closure of one iteration has to share.  A child with no entry in
+          # ``caps`` has nothing to capture and takes its stub from the table
+          # above.
+          "caps", "kinds", "setfenv")
 
 #: Roles whose names come from their own fork of the vm stream rather than from
 #: the shared block.  A role drawn from the block lengthens it by one, and
@@ -288,7 +292,7 @@ _ROLES = ("code", "exec", "enter", "call", "getfenv", "acc", "stack", "sp",
 #: dispatch key -- moves with it, so a build that gained a name would also
 #: quietly change its VMs.  Forking keeps one decision from moving another; the
 #: block's length is the part that has to stay put.
-_FORKED = ("stubs", "caps", "snaps", "setfenv")
+_FORKED = ("stubs", "caps", "kinds", "setfenv")
 
 
 def make_plan(rng: Rng, protos: Iterable[int],
@@ -684,9 +688,10 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
     child of a *virtualized* parent captures from that parent's frame, so its
     accessors can only be built by the interpreter that owns the frame.  One
     entry per upvalue -- the parent's register to watch, or the parent's own
-    accessor to relay -- plus, in a second table, the ones that need a cell
-    holding a snapshot because the variable is a loop variable and Luau gives
-    each iteration its own.  A child with no entry here captures nothing and
+    accessor to relay -- plus, in a second table keyed the same way, how that
+    entry is to be read: watched live, snapshotted because the variable is a
+    loop variable and Luau gives each iteration its own, or read as a cell the
+    parent already made.  A child with no entry here captures nothing and
     takes its stub from the table above.
     """
     interpreter_parts: List[str] = []
@@ -746,14 +751,14 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
     # stubs, and read by the same CLOSURE arm that reads them -- one lookup
     # tells the interpreter whether the child it is creating captures at all.
     cap_rows: List[str] = []
-    snap_rows: List[str] = []
+    kind_rows: List[str] = []
     for pid in sorted(caps or ()):
         if pid not in encoded:
             continue
         items: List[str] = []
-        snaps: List[str] = []
+        kinds: List[str] = []
         for i, desc in enumerate(caps[pid]):
-            from_local, index, snapshot = desc
+            from_local, index, kind = desc
             # Positive: a register of the parent's, watched live, carried as
             # the frame slot it lives in -- and the frame is one-based, the
             # entry point laying parameters down at R[1..n], so register k is
@@ -761,12 +766,15 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
             # biased the same way so that upvalue 0 is representable in a
             # table that has no zero key.
             items.append(str(index + 1) if from_local else str(-(index + 1)))
-            if snapshot:
-                snaps.append(str(i))
+            # One entry per upvalue, dense and positional, so the interpreter
+            # reads it with a counted loop rather than walking holes; 0 means
+            # "watch it live", which is what the ``caps`` entry already says
+            # how to do.
+            kinds.append(str(int(kind)))
         cap_rows.append("  [%d] = { %s }," % (plan.row_key(pid), ", ".join(items)))
-        if snaps:
-            snap_rows.append("  [%d] = { %s },"
-                             % (plan.row_key(pid), ", ".join(snaps)))
+        if any(k != "0" for k in kinds):
+            kind_rows.append("  [%d] = { %s },"
+                             % (plan.row_key(pid), ", ".join(kinds)))
 
     def _finish(metadata: List[str]) -> str:
         if not interpreter_parts:
@@ -787,12 +795,12 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
         # the interpreters are emitted first.
         text = ("local %s\n" % plan.rows_table)
         for rows, role in ((stub_rows, "stubs"), (cap_rows, "caps"),
-                           (snap_rows, "snaps")):
+                           (kind_rows, "kinds")):
             if rows:
                 text += "local %s\n" % plan.names[role]
         text += "\n".join(combined) + "\n"
         for rows, role in ((stub_rows, "stubs"), (cap_rows, "caps"),
-                           (snap_rows, "snaps")):
+                           (kind_rows, "kinds")):
             if rows:
                 # The stubs go last, not with the rest of the metadata: each
                 # one closes over its group's ``enter``, which is a local the

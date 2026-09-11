@@ -675,16 +675,27 @@ runs, where the non-capturing case hands out one shared stub: Luau gives a
 capturing closure a new identity per evaluation and hoists a non-capturing
 one, so the two paths have to differ or `f == f` starts lying.
 
-One shape the snapshot does *not* reach: a closure that *writes* the
-loop-body local it captured. Reading and writing pull in opposite directions
-here -- a per-iteration copy is right for a reader and wrong for two closures
-sharing a counter within one iteration -- so the IR only marks a local
-per-iteration when nothing assigns to it again, directly or through a
-closure. Reads are exact; a mutating closure still sees one variable shared
-across iterations, which is written up under the limitations in
-`SECURITY.md`. Serving both needs the cell model in full: a cell allocated at
-the declaration, fresh per iteration, with the parent's own reads and writes
-going through it rather than through the register.
+One shape the snapshot does *not* reach, and the reason the cell exists: a
+closure that *writes* the loop-body local it captured. Reading and writing
+pull in opposite directions here -- a per-iteration copy is right for a
+reader, and wrong for two closures sharing a counter within one iteration --
+so a captured loop-body local is not represented by its register at all. It
+becomes a cell: one table allocated at the declaration, which is the one place
+that runs exactly once per iteration, whose single field is the variable, and
+through which every access goes, the loop body's own included. A reader gets
+the iteration's value because the table is the iteration's; a writer shares it
+with every other closure of that iteration because they all captured the same
+table. Both halves of the rule the old sketch had to choose between, from one
+representation.
+
+The rewrite is a pass over the finished body, because which locals a closure
+captured is only known once it is finished, and it is confined to the range
+where the register *is* the variable: a register is scratch before the
+declaration -- a numeric `for` spends its preheader calling the coercion
+helper with the register its body's first local is about to be handed -- and
+scratch again after the block closes, when a call may use it as an argument
+slot, which no rewrite can follow because the slot is a number in the operand
+list rather than an operand.
 
 `can_virtualize` grew two capability flags (`upvalues_ok`, `closures_ok`)
 instead of a blanket refusal; the classifier still keeps its size floor for a

@@ -322,12 +322,15 @@ runs the same language the guard is written in. The artifact's own report states
 what the guard captured and whether it tripped, because a build should not claim
 more than it did.
 
-**A closure that *mutates* a local declared in a loop body shares one copy of
-it across iterations.** Luau gives every iteration its own copy of a local
-declared in the loop body. A closure that only *reads* such a local now gets
-the iteration it was built in -- three closures built in three iterations see
-three different values, at every profile, native or virtualized. A closure
-that *writes* it does not:
+**A closure that captures a local declared in a loop body costs one table per
+iteration.** Luau gives every iteration its own copy of such a local, and a
+closure built in the body captures that iteration's. Reading and writing pull
+in opposite directions -- a per-iteration copy is right for a reader, and
+wrong for two closures of one iteration sharing a counter -- so the
+representation is a cell: one table allocated at the declaration, whose single
+field is the variable, and through which every access goes, the loop body's
+own included. Both directions then agree, at every profile, native or
+virtualized:
 
 ```lua
 local makers = {}
@@ -339,18 +342,14 @@ for i = 1, 3 do
     end
 end
 print(makers[1](), makers[1](), makers[2](), makers[3]())
--- 3 4 5 7 unprotected; 7 8 9 10 protected
+-- 3 4 5 7, protected and not
 ```
 
-The reason is that reading and writing pull in opposite directions. A
-per-iteration copy is right for a closure that reads, and wrong for two
-closures built in the same iteration that share a counter -- which is what a
-write means. Serving both is one mechanism, the cell model: a cell allocated
-at the declaration, fresh per iteration, with every access -- the parent's
-own included -- routed through it. Until that exists, the read-only case is
-correct and the mutating case is not, and the difference is confined to
-programs that mutate a loop-body local from inside a closure. It predates R5
-and reproduced at `compact`, which virtualizes nothing.
+What that leaves is cost and recognisability rather than behaviour: a captured
+loop-body local becomes a `GETTABLE`/`SETTABLE` pair per access and a
+`NEWTABLE` per iteration, and the field is a constant. A local no closure
+captures is untouched, so the shape appears only where a program already
+captures one.
 
 **One pool and one bank per artifact.** Constant data lives in exactly two places
 -- the sealed pool and the string bank -- each authenticated as a whole. So the

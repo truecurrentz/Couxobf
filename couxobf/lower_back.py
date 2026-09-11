@@ -312,6 +312,22 @@ def _const_expr(value: Any) -> A.Expr:
     raise ReconstructionError(f"cannot emit constant {value!r}")
 
 
+def _capture_kind(parent: Any, uv: Any) -> int:
+    """How a virtualized child reaches this upvalue of its parent's.
+
+    ``0`` watches the register live.  ``1`` snapshots it into a cell, because
+    the register belongs to a loop iteration that will move on.  ``2`` reads
+    the register as a cell table, the parent having turned that local into one
+    -- a snapshot would give a closure that *writes* the variable a copy all
+    of its own, and every closure of the same iteration has to share.
+    """
+    if not uv.from_local:
+        return 0
+    if uv.index in parent.cells:
+        return 2
+    return 1 if uv.index in parent.per_iteration else 0
+
+
 class Reconstructor:
     def __init__(self, pool: Any = None, accessor: Optional[str] = None,
                  vm: Any = None, bank: Any = None,
@@ -593,13 +609,27 @@ class Reconstructor:
         local copy would silently break ``SETUPVAL``.
         """
         snap = self.snapshots.get((proto.proto_id, i))
-        if snap is not None:
-            return _name(snap)
         desc = proto.upvalues[i]
         par = self.parents.get(proto.proto_id)
         if par is None:
             raise ReconstructionError(
                 f"upvalue {i} of {proto.name} has no enclosing prototype")
+        home_pid, home_reg = self._upvalue_home(proto, i)
+        if home_reg in self.by_id[home_pid].cells:
+            # A cell: the table is the variable, and the variable is its
+            # field.  Dereferencing is what makes a write through the closure
+            # land in the cell every closure of this iteration shares, rather
+            # than in a copy of it, and what makes a read see the current
+            # value instead of the one the register held when the closure was
+            # built.  The chain is walked to the owning prototype because that
+            # is whose register the field belongs to, whatever depth the
+            # capture started at -- and a snapshot local, where there is one,
+            # is already the iteration's own table.
+            held = (_name(snap) if snap is not None
+                    else self._reg(self.by_id[home_pid], home_reg))
+            return A.Index(obj=held, key=_num(1))
+        if snap is not None:
+            return _name(snap)
         if desc.from_local:
             return self._reg(par, desc.index)
         return self._upvalue_expr(par, desc.index)
@@ -1027,15 +1057,29 @@ class Reconstructor:
             snaps: List[Tuple[str, A.Expr]] = []
             for i in range(len(child.upvalues)):
                 home_pid, home_reg = self._upvalue_home(child, i)
-                if home_reg in self.by_id[home_pid].per_iteration:
+                home_proto = self.by_id[home_pid]
+                if (home_reg in home_proto.per_iteration
+                        or home_reg in home_proto.cells):
                     # Luau gives every loop iteration its own variable, so a
                     # closure built inside the body captures that iteration's
-                    # value.  Reading the shared register later would report
-                    # the final one instead, so capture through a local that is
+                    # one.  Reading the shared register later would report the
+                    # final one instead, so capture through a local that is
                     # fresh each time this block runs.
+                    #
+                    # What the local holds is the difference between the two
+                    # cases, and it is the register's own shape that decides:
+                    # a per-iteration value is copied into a private cell,
+                    # while a cell *is* the iteration's variable, so the local
+                    # takes the table itself and every closure of the
+                    # iteration ends up sharing it.
                     nm = f"{PREFIX}U{child.proto_id}_{i}"
                     self.snapshots[(child.proto_id, i)] = nm
-                    snaps.append((nm, self._reg(self.by_id[home_pid], home_reg)))
+                    # A cell is caught *as itself*: the table is the
+                    # iteration's variable, so a closure of this iteration
+                    # shares it with every other one.  Anything else is a
+                    # copy, because a value type in a Luau local already is
+                    # one and the register will move on.
+                    snaps.append((nm, self._reg(home_proto, home_reg)))
             fn = self.function_expr(child)
             self.snapshots = saved
             assign = self._assign(proto, a[0], fn)
@@ -1580,7 +1624,7 @@ def reconstruct_protected(module: IRModule,
                         continue
                     capture_desc[child.proto_id] = [
                         (uv.from_local, uv.index,
-                         bool(uv.from_local) and uv.index in parent.per_iteration)
+                         _capture_kind(parent, uv))
                         for uv in child.upvalues]
         vm_src = _wiring.prelude_source(plan, rec.vm_encoded, pooled, pooled,
                                         edges_expr=pooled,

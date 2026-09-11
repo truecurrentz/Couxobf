@@ -78,13 +78,13 @@ NAMES = {
     "rows": "_kRw",
     "stubs": "_kSb",
     # R5's fourth increment: the capture descriptors a CLOSURE arm reads to
-    # find out whether the child it is creating captures at all, the
-    # per-iteration snapshot list beside them, and the local alias for
+    # find out whether the child it is creating captures at all, the per-entry
+    # reading of them -- live, snapshot, or cell -- and the local alias for
     # setfenv -- held in a local for the same reason getfenv is, plus one of
     # its own: the stub a capturing child gets is born inside the interpreter,
     # so its inherited environment is the interpreter's and not the parent's.
     "caps": "_kCp",
-    "snaps": "_kSn",
+    "kinds": "_kKd",
     "setfenv": "_kSe",
 }
 

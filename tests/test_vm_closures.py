@@ -874,3 +874,130 @@ def test_a_loop_body_capture_inside_a_virtualized_parent():
            "print(outer(1))\n")
     # 3 + 6 + 9 == 18, and 3 alone for n = 1 -- not 9 + 9 + 9.
     _equivalent(src, seed=7, expect_virtualized=2)
+
+
+def test_a_closure_that_writes_the_loop_body_local_shares_it():
+    """The case a snapshot cannot serve.  Each iteration has its own counter,
+    and both calls on the first one move *that* counter: 3 4, then the second
+    iteration's 5, then the third's 7.  A snapshot would give every call its
+    own copy and answer 3 3 3 3, and one shared register would answer
+    7 8 9 10."""
+    src = ("local makers = {}\n"
+           "for i = 1, 3 do\n"
+           "  local n = i * 2\n"
+           "  makers[i] = function() n += 1 return n end\n"
+           "end\n"
+           "print(makers[1](), makers[1](), makers[2](), makers[3]())\n")
+    assert _both_profiles(src) == "3\t4\t5\t7\n"
+
+
+def test_a_write_after_the_closure_is_built_reaches_it():
+    """Still one variable per iteration, but a shared one inside it -- so the
+    body's own write has to land where the closure will look.  A snapshot
+    taken when the closure is built would answer 0 0 0, and one register
+    shared by every iteration would answer 3 3 3."""
+    src = ("local fns = {}\n"
+           "for i = 1, 3 do\n"
+           "  local c = 0\n"
+           "  fns[i] = function() return c end\n"
+           "  c = i\n"
+           "end\n"
+           "print(fns[1](), fns[2](), fns[3]())\n")
+    assert _both_profiles(src) == "1\t2\t3\n"
+
+
+def test_a_local_the_body_initialises_from_a_call_is_a_cell_too():
+    """`local n = f()` is the same variable as any other.  It is also the
+    shape a cell is hardest to give: a call writes its own base, and that base
+    is where its arguments are counted from, so the store has to be a separate
+    instruction rather than the call's destination."""
+    src = ("local function mk(v) return v * 2 end\n"
+           "local makers = {}\n"
+           "for i = 1, 3 do\n"
+           "  local n = mk(i)\n"
+           "  makers[i] = function() n += 1 return n end\n"
+           "end\n"
+           "print(makers[1](), makers[1](), makers[2](), makers[3]())\n")
+    assert _both_profiles(src) == "3\t4\t5\t7\n"
+
+
+def test_the_parents_own_writes_go_through_the_same_cell():
+    """The loop body writes the variable after the closure is built, and the
+    closure is the one that has to see it -- so the write cannot go to the
+    register the closure is not reading."""
+    src = ("local fns = {}\n"
+           "for i = 1, 3 do\n"
+           "  local n = i\n"
+           "  fns[i] = function() return n end\n"
+           "  n = n * 10\n"
+           "  fns[i] = function() return n end\n"
+           "end\n"
+           "print(fns[1](), fns[2](), fns[3]())\n")
+    assert _both_profiles(src) == "10\t20\t30\n"
+
+
+def test_the_parent_reads_what_a_closure_wrote():
+    """The other direction: the body calls a closure that increments, then
+    reads the variable itself.  Both have to be looking at the same place."""
+    src = ("local out = {}\n"
+           "for i = 1, 3 do\n"
+           "  local n = i\n"
+           "  local bump = function() n += 5 end\n"
+           "  bump()\n"
+           "  out[i] = n\n"
+           "end\n"
+           "print(out[1], out[2], out[3])\n")
+    assert _both_profiles(src) == "6\t7\t8\n"
+
+
+def test_two_closures_of_one_iteration_share_that_iterations_cell():
+    """A reader and a writer built in the same iteration, driven after the
+    loop has finished: each pair moves its own counter and no other."""
+    src = ("local incs, gets = {}, {}\n"
+           "for i = 1, 3 do\n"
+           "  local n = i * 10\n"
+           "  incs[i] = function() n += 1 end\n"
+           "  gets[i] = function() return n end\n"
+           "end\n"
+           "for i = 1, 3 do\n"
+           "  incs[i]()\n"
+           "  incs[i]()\n"
+           "end\n"
+           "print(gets[1](), gets[2](), gets[3]())\n")
+    assert _both_profiles(src) == "12\t22\t32\n"
+
+
+def test_a_three_deep_capture_writes_the_outer_iterations_cell():
+    """The write happens two closures down, through a relay.  The cell
+    belongs to the iteration that declared it, not to whichever one the
+    register happens to hold when the innermost closure runs."""
+    src = ("local out = {}\n"
+           "for i = 1, 3 do\n"
+           "  local n = i\n"
+           "  out[i] = (function() return function() n += 1 return n end end)()\n"
+           "end\n"
+           "print(out[1](), out[1](), out[2](), out[3]())\n")
+    assert _both_profiles(src) == "2\t3\t3\t4\n"
+
+
+def test_a_mutating_capture_inside_a_virtualized_parent():
+    """The same property on the VM path, where the accessor is built by the
+    interpreter over the parent's frame: the cell it hands the child is that
+    iteration's table, so two closures of one iteration agree and two
+    iterations do not."""
+    src = (DIRECT +
+           "local function outer(n)\n"
+           "  local fns = {}\n"
+           "  for i = 1, n do\n"
+           "    local x = i * 3\n"
+           "    fns[i] = function() x += 1 return x end\n"
+           "  end\n"
+           "  local s = 0\n"
+           "  for j = 1, n do s = s + fns[j]() end\n"
+           "  return s\n"
+           "end\n"
+           "print(outer(3))\n"
+           "print(outer(1))\n")
+    # 4 + 7 + 10 == 21 for three iterations, and 4 alone for one -- not
+    # 10 + 10 + 10, which is what one shared counter would give.
+    _equivalent(src, seed=7, expect_virtualized=2)

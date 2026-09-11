@@ -271,7 +271,7 @@ def _body(op: str, fam: Family, n: Dict[str, str], fmt: FormatSpec,
         # harmless at all.
         stubs = n.get("stubs") or "stubs"
         caps = n.get("caps") or "caps"
-        snaps = n.get("snaps") or "snaps"
+        kinds = n.get("kinds") or "kinds"
         rows = n.get("rows") or "rows"
         uvs = n.get("uvs") or "uvs"
         getter = n.get("getfenv") or "getfenv"
@@ -321,16 +321,25 @@ def _body(op: str, fam: Family, n: Dict[str, str], fmt: FormatSpec,
             "    end",
             "  end",
             # A loop variable is fresh per iteration in Luau, so a closure
-            # declared in the body captures *that* iteration's value.  The
-            # frame slot keeps moving, so the accessor closes over a cell
-            # holding a snapshot taken now instead.
-            "  local _zn = %s and %s[%s]" % (snaps, snaps, key),
+            # declared in the body captures *that* iteration's value.  Two
+            # ways of getting one, and the difference is whether the closure
+            # writes it: a snapshot in a private cell is right for a reader,
+            # and wrong for two closures of one iteration that share a
+            # counter -- those need the parent's own cell, which the parent
+            # made at the declaration and which is what kind 2 names.
+            "  local _zn = %s and %s[%s]" % (kinds, kinds, key),
             "  if _zn then",
             "    for _zj = 1, #_zn do",
             "      local _zk = _zn[_zj]",
-            "      local _zcell = { R[_zc[_zk + 1]] }",
-            "      _zu[_zk * 2 + 1] = function() return _zcell[1] end",
-            "      _zu[_zk * 2 + 2] = function(_zv) _zcell[1] = _zv end",
+            "      if _zk == 1 then",
+            "        local _zcell = { R[_zc[_zj]] }",
+            "        _zu[_zj * 2 - 1] = function() return _zcell[1] end",
+            "        _zu[_zj * 2] = function(_zv) _zcell[1] = _zv end",
+            "      elseif _zk == 2 then",
+            "        local _zt = R[_zc[_zj]]",
+            "        _zu[_zj * 2 - 1] = function() return _zt[1] end",
+            "        _zu[_zj * 2] = function(_zv) _zt[1] = _zv end",
+            "      end",
             "    end",
             "  end",
             # setfenv, not getfenv: this closure is born inside the
