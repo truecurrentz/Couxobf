@@ -322,31 +322,35 @@ runs the same language the guard is written in. The artifact's own report states
 what the guard captured and whether it tripped, because a build should not claim
 more than it did.
 
-**A local declared inside a loop body does not get a per-iteration identity.**
-Luau gives every iteration its own copy of a local declared in the loop body,
-so three closures built in three iterations capture three different variables.
-The reconstruction allocates one register per declaration and, for a native
-body, one local per register -- so a program that captures such a local sees
-the last iteration's value in all three closures:
+**A closure that *mutates* a local declared in a loop body shares one copy of
+it across iterations.** Luau gives every iteration its own copy of a local
+declared in the loop body. A closure that only *reads* such a local now gets
+the iteration it was built in -- three closures built in three iterations see
+three different values, at every profile, native or virtualized. A closure
+that *writes* it does not:
 
 ```lua
-local fns = {}
+local makers = {}
 for i = 1, 3 do
-    local x = i
-    fns[i] = function() return x end
+    local n = i * 2
+    makers[i] = function()
+        n += 1
+        return n
+    end
 end
-print(fns[1](), fns[2](), fns[3]())   -- 1 2 3 unprotected; 3 3 3 protected
+print(makers[1](), makers[1](), makers[2](), makers[3]())
+-- 3 4 5 7 unprotected; 7 8 9 10 protected
 ```
 
-This predates R5 and is not a VM limitation: it reproduces at the `compact`
-profile, which virtualizes nothing. Loop *control* variables are handled
-correctly (they are marked per-iteration in the IR and captured through a
-snapshot), and so are the closures a virtualized parent builds, because the
-interpreter takes that snapshot itself. What is missing is the general case: a
-cell allocated at the variable's declaration and torn down per iteration, with
-the parent's own reads and writes routed through it. Until then it is a
-correctness difference on programs that capture loop-body locals, and it is
-the one place where the output does not do what the source does.
+The reason is that reading and writing pull in opposite directions. A
+per-iteration copy is right for a closure that reads, and wrong for two
+closures built in the same iteration that share a counter -- which is what a
+write means. Serving both is one mechanism, the cell model: a cell allocated
+at the declaration, fresh per iteration, with every access -- the parent's
+own included -- routed through it. Until that exists, the read-only case is
+correct and the mutating case is not, and the difference is confined to
+programs that mutate a loop-body local from inside a closure. It predates R5
+and reproduced at `compact`, which virtualizes nothing.
 
 **One pool and one bank per artifact.** Constant data lives in exactly two places
 -- the sealed pool and the string bank -- each authenticated as a whole. So the

@@ -675,15 +675,16 @@ runs, where the non-capturing case hands out one shared stub: Luau gives a
 capturing closure a new identity per evaluation and hoists a non-capturing
 one, so the two paths have to differ or `f == f` starts lying.
 
-The one shape the snapshot does *not* reach is a local declared inside a loop
-body and captured there. The IR marks a loop's control variables per-iteration
-and nothing else, so `local x = i` in a loop body is one register for all
-three iterations and the closures share it. That is not a VM limitation -- it
-reproduces at `compact`, which virtualizes nothing -- and it is written up
-under the limitations in `SECURITY.md`. Closing it needs the cell model in
-full: a cell allocated at the declaration, fresh per iteration, with the
-parent's own reads and writes going through it rather than through the
-register.
+One shape the snapshot does *not* reach: a closure that *writes* the
+loop-body local it captured. Reading and writing pull in opposite directions
+here -- a per-iteration copy is right for a reader and wrong for two closures
+sharing a counter within one iteration -- so the IR only marks a local
+per-iteration when nothing assigns to it again, directly or through a
+closure. Reads are exact; a mutating closure still sees one variable shared
+across iterations, which is written up under the limitations in
+`SECURITY.md`. Serving both needs the cell model in full: a cell allocated at
+the declaration, fresh per iteration, with the parent's own reads and writes
+going through it rather than through the register.
 
 `can_virtualize` grew two capability flags (`upvalues_ok`, `closures_ok`)
 instead of a blanket refusal; the classifier still keeps its size floor for a

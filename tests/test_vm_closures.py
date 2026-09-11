@@ -726,3 +726,151 @@ def test_the_capturing_half_under_the_maximum_profile():
         assert got.returncode == 0, got.stderr[:300]
         assert got.stdout == want.stdout, (seed, want.stdout[:200],
                                            got.stdout[:200])
+
+
+# ---------------------------------------------------------------------------
+# per-iteration identity
+# ---------------------------------------------------------------------------
+#
+# Luau gives every iteration its own copy of a local declared inside a loop
+# body, while the obfuscator gives that local one register for the whole
+# loop.  These tests are the two halves of that gap: the cases where a
+# closure must see the iteration it was built in, and the cases where it must
+# see the *variable*, writes and all, because the two are not the same rule.
+#
+# They run at two profiles on purpose.  The bug this section was written for
+# reproduced at `compact`, which virtualizes nothing, so a test that only
+# built at `maximum` would have passed against the broken code.
+
+_PER_ITERATION_PROFILES = ("compact", "maximum")
+
+
+def _both_profiles(src, seed=7):
+    """Build at a native profile and at the maximum one, and require both."""
+    if not TOOLCHAIN.can_execute:
+        pytest.skip("luau runtime not available")
+    want = execute(TOOLCHAIN, src, "want.luau", timeout=30)
+    for profile in _PER_ITERATION_PROFILES:
+        config = Config.from_profile(profile)
+        config.reproducible_seed = seed
+        config.vm_upvalues = True
+        config.vm_closures = True
+        out = build(src, config, name="pi.luau", verify=True)
+        got = execute(TOOLCHAIN, out.source, "got.luau", timeout=120)
+        assert got.returncode == 0, (profile, got.stderr[:300])
+        assert got.stdout == want.stdout, (
+            "%s printed something else\n  want %r\n  got  %r"
+            % (profile, want.stdout[:200], got.stdout[:200]))
+    return want.stdout
+
+
+def test_a_loop_body_local_is_fresh_in_every_iteration():
+    """The classic closure-in-a-loop shape: three iterations, three
+    variables.  One shared register answers 3 3 3."""
+    src = ("local fns = {}\n"
+           "for i = 1, 3 do\n"
+           "  local x = i\n"
+           "  fns[i] = function() return x end\n"
+           "end\n"
+           "print(fns[1](), fns[2](), fns[3]())\n")
+    assert _both_profiles(src) == "1\t2\t3\n"
+
+
+def test_the_same_in_a_while_loop():
+    """Not a property of `for`: any loop body re-entered per iteration."""
+    src = ("local fns = {}\n"
+           "local i = 1\n"
+           "while i <= 3 do\n"
+           "  local x = i * 10\n"
+           "  fns[i] = function() return x end\n"
+           "  i += 1\n"
+           "end\n"
+           "print(fns[1](), fns[2](), fns[3]())\n")
+    assert _both_profiles(src) == "10\t20\t30\n"
+
+
+def test_the_same_in_a_generic_for():
+    """Both loop variables of a generic `for`, plus a local beside them."""
+    src = ("local fns = {}\n"
+           "for k, v in ipairs({5, 6, 7}) do\n"
+           "  local both = k * 100 + v\n"
+           "  fns[k] = function() return both end\n"
+           "end\n"
+           "print(fns[1](), fns[2](), fns[3]())\n")
+    assert _both_profiles(src) == "105\t206\t307\n"
+
+
+def test_a_loop_control_variable_is_fresh_per_iteration():
+    """The control variable itself, which Luau also makes per-iteration."""
+    src = ("local g = {}\n"
+           "for i = 1, 3 do g[i] = function() return i end end\n"
+           "print(g[1](), g[2](), g[3]())\n")
+    assert _both_profiles(src) == "1\t2\t3\n"
+
+
+def test_nested_loops_capture_both_levels():
+    """The inner body's local is per inner iteration, and the outer one it
+    was built from is per outer iteration."""
+    src = ("local fns = {}\n"
+           "for i = 1, 2 do\n"
+           "  for j = 1, 2 do\n"
+           "    local pair = i * 10 + j\n"
+           "    fns[i * 2 + j] = function() return pair end\n"
+           "  end\n"
+           "end\n"
+           "print(fns[3](), fns[4](), fns[5](), fns[6]())\n")
+    assert _both_profiles(src) == "11\t12\t21\t22\n"
+
+
+def test_a_variable_written_after_the_closure_is_built_is_shared():
+    """The other half of the rule: a local the loop body assigns again is one
+    variable, not one per iteration, so the write has to reach the closure.
+    A snapshot taken at closure creation would answer 0 0 0."""
+    src = ("local t = {}\n"
+           "for i = 1, 3 do\n"
+           "  local c = 0\n"
+           "  local f = function() return c end\n"
+           "  c = i\n"
+           "  t[i] = f()\n"
+           "end\n"
+           "print(t[1], t[2], t[3])\n")
+    assert _both_profiles(src) == "1\t2\t3\n"
+
+
+def test_two_closures_built_in_one_iteration_share_the_variable():
+    """Both closures belong to the same iteration, so a write through one is
+    visible through the other.  Snapshotting each closure separately gives
+    them two private copies and answers 0 0 0."""
+    src = ("local fns = {}\n"
+           "local out = {}\n"
+           "for i = 1, 3 do\n"
+           "  local acc = 0\n"
+           "  local function add(v) acc += v end\n"
+           "  fns[i] = function() return acc end\n"
+           "  add(i)\n"
+           "  add(i * 2)\n"
+           "  out[i] = fns[i]()\n"
+           "end\n"
+           "print(out[1], out[2], out[3])\n")
+    assert _both_profiles(src) == "3\t6\t9\n"
+
+
+def test_a_loop_body_capture_inside_a_virtualized_parent():
+    """The same property on the VM path, where the accessor is built by the
+    interpreter over the parent's frame: the cell has to be the iteration's,
+    not the last one's."""
+    src = (DIRECT +
+           "local function outer(n)\n"
+           "  local fns = {}\n"
+           "  for i = 1, n do\n"
+           "    local x = i * 3\n"
+           "    fns[i] = function() return x end\n"
+           "  end\n"
+           "  local s = 0\n"
+           "  for j = 1, n do s = s + fns[j]() end\n"
+           "  return s\n"
+           "end\n"
+           "print(outer(3))\n"
+           "print(outer(1))\n")
+    # 3 + 6 + 9 == 18, and 3 alone for n = 1 -- not 9 + 9 + 9.
+    _equivalent(src, seed=7, expect_virtualized=2)

@@ -264,9 +264,17 @@ class FuncIR:
     loop_count: int = 0
     branch_count: int = 0
     #: registers holding a value that is fresh on each loop iteration: the
-    #: loop variable itself, and any local declared inside a loop body.  A
-    #: closure capturing one of these must see the value from the iteration it
-    #: was created in, not whatever the register holds later.
+    #: loop variable itself, and any local declared inside a loop body that
+    #: nothing ever assigns again.  A closure capturing one of these must see
+    #: the value from the iteration it was created in, not whatever the
+    #: register holds later.
+    #:
+    #: The "nothing ever assigns again" half is what decides between two
+    #: different languages.  A local declared in a loop body and never
+    #: reassigned is a *new variable per iteration* in Luau, so a snapshot
+    #: taken when the closure is built is exactly right.  A local that is
+    #: assigned again is one variable shared with its closures -- writing
+    #: through it has to stay visible -- and a snapshot would freeze it.
     per_iteration: Set[int] = field(default_factory=set)
     #: filled in by the classifier / lowering
     virtualization: int = 0
@@ -385,6 +393,15 @@ class _FuncBuilder:
         idx = self.proto.num_regs
         self.proto.num_regs += 1
         self.scopes[-1][name] = _Local(idx, name)
+        # Luau gives every iteration its own copy of a local declared inside a
+        # loop body, and one register holds all of them.  Marking it here is
+        # what lets a closure capture the iteration's value: the snapshot is
+        # taken when the closure is built, inside the loop.  An assignment to
+        # the same local takes the mark away again -- see
+        # ``_write_name_preserving`` -- because a variable that is written
+        # after the closure exists is one variable, not one per iteration.
+        if self.loop_depth:
+            self.proto.per_iteration.add(idx)
         self.base = self.proto.num_regs
         self.max_regs = max(self.max_regs, self.proto.num_regs)
         self.reg_names[idx] = name
@@ -826,11 +843,31 @@ class Lowerer:
             return store
         raise LoweringError(f"cannot assign to {type(t).__name__}")
 
+    def _drop_per_iteration_on_upvalue_writes(self, fb: _FuncBuilder,
+                                              sub: "_FuncBuilder",
+                                              proto: FuncIR) -> None:
+        """Unmark any parent register this closure writes through."""
+        for item in sub.code:
+            ins = item[1] if isinstance(item, tuple) else item
+            if ins.op != OP.SETUPVAL:
+                continue
+            up = ins.args[0]
+            index = up.index if isinstance(up, Up) else up
+            if not isinstance(index, int) or index >= len(proto.upvalues):
+                continue  # pragma: no cover - malformed upvalue reference
+            desc = proto.upvalues[index]
+            if desc.from_local:
+                fb.proto.per_iteration.discard(desc.index)
+
     def _write_name_preserving(self, fb: _FuncBuilder, name: str, src: Reg,
                                line: int) -> None:
         loc = fb.lookup(name)
         if loc is not None:
             fb.emit(OP.MOV, Reg(loc.reg), src, line=line)
+            # Written after its declaration, so it is one variable for the
+            # whole loop and not one per iteration: a closure holding it has
+            # to see this write, and a snapshot would hide it.
+            fb.proto.per_iteration.discard(loc.reg)
             return
         if fb.parent is not None:
             up = fb.upvalue_for(name)
@@ -938,6 +975,13 @@ class Lowerer:
         sub.base = proto.num_regs
         self._block(sub, fn.body)
         sub.emit(OP.RETURN0, line=0)
+        # A closure that *writes* the variable it captured makes that variable
+        # shared, which is the opposite of per-iteration: two closures built
+        # in one iteration have to agree on what they see, and a snapshot each
+        # would give them two private copies.  The write is visible in the
+        # child before the parent's CLOSURE is emitted, so the mark comes off
+        # in time for the reconstruction to see it.
+        self._drop_per_iteration_on_upvalue_writes(fb, sub, proto)
         proto.num_regs = sub.max_regs
         proto.blocks = self._build_cfg(sub)
         proto.node_count = self._count(fn.body)
