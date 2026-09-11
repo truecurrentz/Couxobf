@@ -319,7 +319,8 @@ class Reconstructor:
                  helpers: Optional[Dict[str, str]] = None,
                  native_prefix: str = PREFIX,
                  pool_ticket: Optional[Any] = None,
-                 bank_ticket: Optional[Any] = None) -> None:
+                 bank_ticket: Optional[Any] = None,
+                 pool_resolver: Optional[Any] = None) -> None:
         """``pool`` is a :class:`~couxobf.constpool.ConstantPool`.
 
         When one is supplied, no literal reaches the output: every constant is
@@ -330,6 +331,12 @@ class Reconstructor:
         ``vm`` is an optional :class:`~couxobf.vm.wiring.VMPlan`.  Prototypes it
         selects are encoded to bytecode and replaced by a closure that enters
         the interpreter; everything else is reconstructed natively as usual.
+
+        ``pool_resolver`` splits the pool by prototype (R6): given a prototype
+        id it returns ``(pool, accessor_name, ticket_function)``, so each VM
+        group's constants are interned into that group's own sealed region
+        instead of one shared blob.  Without one, every constant goes to
+        ``pool``.
         """
         self.parents: Dict[int, Optional[FuncIR]] = {}
         self.by_id: Dict[int, FuncIR] = {}
@@ -338,6 +345,11 @@ class Reconstructor:
         self.snapshots: Dict[Tuple[int, int], str] = {}
         self.pool = pool
         self.accessor = accessor
+        #: Optional ``proto_id -> (pool, accessor, ticket)``.  A build with one
+        #: pool leaves it None and every read goes through ``self.pool``; a
+        #: build with per-group regions uses it to keep one group's constants
+        #: out of another group's blob.
+        self.pool_resolver = pool_resolver
         #: Slot numbers are not passed to the runtime directly.  The pool
         #: accessor receives a per-build ticket and decodes it locally, so a dump
         #: of call-site constants is not an index over the decrypted table.
@@ -563,12 +575,20 @@ class Reconstructor:
             return (par.proto_id, desc.index)
         return self._upvalue_home(par, desc.index)
 
+    def _pool_trio(self, proto_id: int):
+        """The (pool, accessor, ticket) a prototype's constants belong to."""
+        if self.pool_resolver is not None:
+            trio = self.pool_resolver(proto_id)
+            if trio is not None:
+                return trio
+        return (self.pool, self.accessor, self.pool_ticket)
+
     def _operand(self, proto: FuncIR, op: Any) -> A.Expr:
         if isinstance(op, Reg):
             return self._reg(proto, op.index)
         if isinstance(op, Kon):
             if self.pool is not None:
-                return self._pool_ref(proto.consts[op.index])
+                return self._pool_ref(proto, proto.consts[op.index])
             return _const_expr(proto.consts[op.index])
         if isinstance(op, Up):
             return self._upvalue_expr(proto, op.index)
@@ -586,12 +606,18 @@ class Reconstructor:
             ticket = self.bank.ticket(value)
             return A.Call(fn=_name(self.bank_accessor),
                           args=[_num(self.bank_ticket(ticket))])
-        return self._pool_ref(value)
+        return self._pool_ref(proto, value)
 
-    def _pool_ref(self, value: Any) -> A.Expr:
-        """A runtime read of one pooled constant."""
-        slot = self.pool.slot(value)
-        return A.Call(fn=_name(self.accessor), args=[_num(self.pool_ticket(slot))])
+    def _pool_ref(self, proto: FuncIR, value: Any) -> A.Expr:
+        """A runtime read of one pooled constant.
+
+        Which pool it is interned into depends on the prototype: with R6's
+        per-group regions, a group's constants live in that group's blob and
+        are read back through that group's accessor.
+        """
+        pool, accessor, ticket = self._pool_trio(proto.proto_id)
+        slot = pool.slot(value)
+        return A.Call(fn=_name(accessor), args=[_num(ticket(slot))])
 
     def _global_expr(self, proto: FuncIR, k: Kon) -> A.Expr:
         """The expression naming a global.
@@ -1193,7 +1219,8 @@ def reconstruct_protected(module: IRModule,
     from . import parser as _parser
     from .constpool import ConstantPool
     from .emit import printer as _printer
-    from .runtime.constpool_runtime import ConstantPoolRuntime, default_names
+    from .runtime.constpool_runtime import (ConstantPoolRuntime, default_names,
+                                            default_names as _pool_default_names)
 
     prefixes: Set[str] = set()
     # Its own prefix again: the guard's locals are the one part of the artifact
@@ -1227,14 +1254,9 @@ def reconstruct_protected(module: IRModule,
     cipher_spec = _cipher_mod.draw(cipher_rng)
     if names_out is not None:
         names_out["cipher"] = cipher_spec.summary()
-    pool = ConstantPool(keys, rng, context,
-                        cache_policy=cache_policy, cache_bound=cache_bound,
-                        decoys=pool_decoys,
-                        constant_level=constant_level,
-                        numeric_level=numeric_level,
-                        enc_domain=crypto_enc_domain,
-                        mac_domain=crypto_mac_domain,
-                        cipher=cipher_spec)
+    # The pools are built below, once the plan (and therefore the grouping) is
+    # known: R6 gives each VM group its own sealed region, so the pool that
+    # holds a constant depends on which group the prototype belongs to.
 
     # Selected after optimization, so prototypes the optimizer shrank below the
     # size floor are not virtualized on the strength of code that no longer
@@ -1294,6 +1316,10 @@ def reconstruct_protected(module: IRModule,
         # plan, so nothing gets digested, and the report must not read that as "the
         # user declined".
         names_out["fingerprint_requested"] = 1 if fingerprint else 0
+    # Both are needed below whether or not a plan exists: the pools are built
+    # after this point and each is bound to whatever format reads it.
+    digest = b""
+    bound = False
     if plan is not None and fingerprint:
         from .vm.wiring import structural_fingerprint
         digest = structural_fingerprint(plan)
@@ -1305,12 +1331,6 @@ def reconstruct_protected(module: IRModule,
         # `--vm-family` change a program with no VM in it.  The digest is still
         # reported, because it is true; it just authenticates nothing.
         bound = bool(plan.protos)
-        if bound:
-            # The pool is not sealed yet -- interning happens during lowering and
-            # sealing at emit -- so the digest can still bind to it.  Tagged so a
-            # context that happens to end in eight bytes of its own cannot read as
-            # one that was extended here.
-            pool.context = context + _FINGERPRINT_AAD_TAG + digest
         if names_out is not None:
             names_out["fingerprint"] = digest.hex()
             names_out["fingerprint_bound"] = 1 if bound else 0
@@ -1344,11 +1364,88 @@ def reconstruct_protected(module: IRModule,
         if names_out is not None:
             names_out["bank"] = dict(bank_names)
 
+    # ---- constant pool regions (R6) --------------------------------------
+    #
+    # One sealed region per VM group, plus one for everything that stayed
+    # native.  Recovering one accessor used to yield every constant in the
+    # program; now it yields the constants that reach *this* region, and a
+    # blob lifted from one group does not open in another because each is
+    # authenticated against its own interpreter's format.
+    #
+    # A build that virtualized nothing has one region, which is what it had
+    # before -- the split costs nothing until there is something to split by.
+    regions: List[Dict[str, Any]] = []
+
+    def _add_region(tag: str, region_context: bytes, label: str,
+                    pool_names: Optional[Any] = None) -> None:
+        prng = rng.fork("pool:" + tag) if hasattr(rng, "fork") else rng
+        region_pool = ConstantPool(
+            keys, prng, region_context,
+            cache_policy=cache_policy, cache_bound=cache_bound,
+            decoys=pool_decoys, constant_level=constant_level,
+            numeric_level=numeric_level,
+            enc_domain=crypto_enc_domain, mac_domain=crypto_mac_domain,
+            cipher=cipher_spec)
+        mask = (ticket_rng.u32() if hasattr(ticket_rng, "u32")
+                else 0x5A17C0DE) & 0xffffffff
+        if mask == 0:
+            mask = 0x5A17C0DE
+        regions.append({
+            "label": label,
+            "pool": region_pool,
+            # Its own prefix and its own ticket mask: two regions sharing
+            # either would be recognisable as one runtime twice.
+            # The native region keeps the names the build already drew for
+            # the pool, which is what callers (and the report) have always
+            # been handed as `names_out["pool"]`; every other region gets its
+            # own prefix so two regions are not visibly one runtime twice.
+            "names": pool_names if pool_names is not None
+                     else _pool_default_names(fresh_prefix(rng, prefixes)),
+            "mask": mask,
+            "ticket": (lambda slot, m=mask: (int(slot) ^ m) & 0xffffffff),
+            "protos": set(),
+        })
+
     ticket_rng = rng.fork("pool-ticket") if hasattr(rng, "fork") else rng
-    pool_ticket_mask = (ticket_rng.u32() if hasattr(ticket_rng, "u32") else 0x5A17C0DE) & 0xffffffff
-    if pool_ticket_mask == 0:
-        pool_ticket_mask = 0x5A17C0DE
-    pool_ticket = lambda slot: (int(slot) ^ pool_ticket_mask) & 0xffffffff
+
+    from .vm.wiring import group_fingerprint as _group_fingerprint
+    native_context = context
+    if bound:
+        # The native region carries the whole plan's digest, which is what it
+        # was bound to before the split.  Tagged so a context that happens to
+        # end in eight bytes of its own cannot read as one that was extended.
+        native_context = context + _FINGERPRINT_AAD_TAG + digest
+    _add_region("native", native_context, "native", pool_names=names)
+    # Splitting costs a whole runtime per region -- roughly 5 KB on a small
+    # example -- and the size ceiling buys it by giving up the split arms,
+    # control-flow flattening and the edge indirection instead.  One group has
+    # nothing to keep apart from itself, so the split waits until there are
+    # two: below that, every constant sharing one accessor is the better trade.
+    split_regions = plan is not None and len(plan.groups) > 1
+    for group in (plan.groups if split_regions else ()):
+        # Bound to this group's own format, always: a group's constants are
+        # read by that group's interpreter, so the format that has to agree
+        # is that one.  Binding to the whole-plan digest instead would let a
+        # blob from group 0 open under group 1 inside the same artifact.
+        _add_region("vm%d" % group.index,
+                    context + _FINGERPRINT_AAD_TAG + _group_fingerprint(group),
+                    "vm group %d" % group.index)
+        regions[-1]["protos"] = set(group.protos)
+    native = regions[0]
+    pool = native["pool"]
+
+    def _region_for(proto_id: int):
+        for region in regions[1:]:
+            if proto_id in region["protos"]:
+                return region
+        return native
+
+    def _pool_resolver(proto_id: int):
+        region = _region_for(proto_id)
+        return (region["pool"], region["names"]["get"], region["ticket"])
+
+    pool_ticket_mask = native["mask"]
+    pool_ticket = native["ticket"]
     bank_ticket_rng = ((string_rng if string_rng is not None else rng).fork("bank-ticket")
                        if hasattr(string_rng if string_rng is not None else rng, "fork")
                        else ticket_rng)
@@ -1363,7 +1460,9 @@ def reconstruct_protected(module: IRModule,
                         helpers=helper_map,
                         native_prefix=fresh_prefix(rng, prefixes),
                         pool_ticket=pool_ticket,
-                        bank_ticket=bank_ticket)
+                        bank_ticket=bank_ticket,
+                        pool_resolver=(_pool_resolver if split_regions
+                                       else None))
     rec.vm_layout_rng = layout_rng if layout_rng is not None else vm_rng
     # R2's native-side split arms ride the same honesty wire as the VM's
     # predicate tap: `opaque_predicates` is the switch, and the
@@ -1401,21 +1500,30 @@ def reconstruct_protected(module: IRModule,
                     if group.describes(pid)}
             if mine:
                 _validate_payload(mine, group.opmap, group.fmt)
-        pooled = lambda value: "%s(%d)" % (names["get"], pool_ticket(pool.slot(value)))
+        def pooled(value, pid=None):
+            # A prototype's bytecode and constants belong to the region that
+            # serves it, so the interpreter in group 1 reads group 1's blob.
+            region = _region_for(pid) if pid is not None else native
+            return "%s(%d)" % (region["names"]["get"],
+                               region["ticket"](region["pool"].slot(value)))
+
         vm_src = _wiring.prelude_source(plan, rec.vm_encoded, pooled, pooled,
                                         edges_expr=pooled,
                                         entry_guard=guard.entry_lines(),
                                         opaque_predicates=bool(opaque_predicates))
 
-    # A program with no constants at all needs no pool: emitting the runtime
-    # for an empty blob would just be a decoder that never runs.
-    need_pool = len(pool) > 0
+    # A region with no constants in it needs no runtime: emitting one would
+    # just be a decoder that never runs.  A build that virtualized nothing has
+    # exactly one region, so this is the old single-pool case.
+    live = [region for region in regions if len(region["pool"]) > 0]
+    need_pool = bool(live)
     need_bank = bank is not None and len(bank) > 0
 
-    # One crypto module for both, when both exist.  The module is ~8KB; two
-    # copies would be two decoders to find and two places to drift.
+    # One crypto module for every sealed structure in the artifact.  The
+    # module is ~8KB; a copy per region would be several decoders to find and
+    # several places to drift.
     crypto_src = ""
-    if need_pool and need_bank:
+    if len(live) + (1 if need_bank else 0) > 1:
         from .runtime.luau_crypto import crypto_runtime
         crypto_src = ("local %s = (function()\n%s end)()\n" % (
             names["crypto"],
@@ -1433,14 +1541,16 @@ def reconstruct_protected(module: IRModule,
     # and base85 saves ~2.75 source chars per sealed byte against the
     # printer's decimal escapes, so below the threshold hex is the smaller
     # spelling and dense would be pure overhead.
-    sealed = pool.seal() if need_pool else None
+    for region in live:
+        region["sealed"] = region["pool"].seal()
     bank_sealed = bank.seal() if need_bank else None
     dense_codec = None
     dense_skipped = ""
     if blob_encoding == "dense" and (need_pool or need_bank):
         blob_bytes = 0
-        if sealed is not None:
-            blob_bytes += len(sealed.ciphertext) + len(sealed.aad) + 64
+        for region in live:
+            blob_bytes += (len(region["sealed"].ciphertext)
+                           + len(region["sealed"].aad) + 64)
         if bank_sealed is not None:
             blob_bytes += (len(bank_sealed.blob) + len(bank_sealed.ticket_ct)
                            + 64)
@@ -1451,25 +1561,56 @@ def reconstruct_protected(module: IRModule,
         else:
             dense_skipped = "dense-skipped:%d" % blob_bytes
 
-    pool_src = ""
+    pool_srcs: List[str] = []
     if need_pool:
         if names_out is not None:
-            # Read here rather than where the pool was built: constants are
-            # interned while the bodies are lowered, and the decoys are planted as
-            # they go, so any earlier count is a count of a pool that does not
-            # exist yet.
-            names_out["pool_decoys"] = pool.decoys_planted
-        runtime = ConstantPoolRuntime(names, cache_policy=cache_policy,
-                                      cache_bound=cache_bound)
-        pool_src = runtime.emit(sealed.key, sealed.nonce, sealed.tag,
-                                sealed.ciphertext, sealed.aad,
-                                emit_crypto=not crypto_src,
-                                guard_check=runtime_guard_check,
-                                ticket_mask=pool_ticket_mask,
-                                enc_domain=sealed.enc_domain,
-                                mac_domain=sealed.mac_domain,
-                                dense=dense_codec,
-                                cipher=cipher_spec, shape_rng=shape_rng)
+            # Read here rather than where the pools were built: constants are
+            # interned while the bodies are lowered, and the decoys are
+            # planted as they go, so any earlier count is a count of a pool
+            # that does not exist yet.
+            names_out["pool_decoys"] = sum(r["pool"].decoys_planted
+                                           for r in regions)
+            # The AAD is not a secret -- it is a literal in the emitted
+            # artifact -- and reporting it is what makes the claim below
+            # checkable: two regions with the same AAD would be one region
+            # with two names.
+            names_out["pool_regions"] = [
+                {"label": r["label"], "entries": len(r["pool"]),
+                 "protos": len(r["protos"]),
+                 "aad": r["sealed"].aad.hex(),
+                 "get": r["names"]["get"]} for r in live]
+            # "The pool" is now several.  Callers that look for one -- a
+            # validator finding the meta table, a test editing the blob --
+            # get the region that actually carries this program's constants,
+            # which is the first live one rather than the native one: a
+            # program that is entirely virtualized has an empty native
+            # region, and a name that is not in the output at all is worse
+            # than no name.
+            names_out["pool"] = dict(live[0]["names"])
+        for region in live:
+            sealed = region["sealed"]
+            rn = dict(region["names"])
+            if crypto_src:
+                # The shared module exports the *first* region's field names,
+                # so every other region has to call it by those.  Keeping its
+                # own would compile fine and then fail at the first decrypt
+                # with "attempt to call a nil value", because the field simply
+                # is not there.
+                rn["crypto"] = names["crypto"]
+                for role in ("c_xor", "c_sha", "c_mac", "c_open", "c_seal"):
+                    rn[role] = names[role]
+            runtime = ConstantPoolRuntime(rn, cache_policy=cache_policy,
+                                          cache_bound=cache_bound)
+            pool_srcs.append(runtime.emit(
+                sealed.key, sealed.nonce, sealed.tag,
+                sealed.ciphertext, sealed.aad,
+                emit_crypto=not crypto_src,
+                guard_check=runtime_guard_check,
+                ticket_mask=region["mask"],
+                enc_domain=sealed.enc_domain,
+                mac_domain=sealed.mac_domain,
+                dense=dense_codec,
+                cipher=cipher_spec, shape_rng=shape_rng))
 
     bank_src = ""
     if need_bank:
@@ -1514,7 +1655,8 @@ def reconstruct_protected(module: IRModule,
             names_out["blob_encoding"] = "hex"
     crypto_block = _parser.parse(crypto_src, "<crypto>") if crypto_src else None
     dense_block = _parser.parse(dense_src, "<dense>") if dense_src else None
-    pool_block = _parser.parse(pool_src, "<constpool>") if pool_src else None
+    pool_blocks = [_parser.parse(src, "<constpool:" + region["label"] + ">")
+                   for src, region in zip(pool_srcs, live)]
     bank_block = _parser.parse(bank_src, "<stringbank>") if bank_src else None
     # The helper functions have to be in scope too; a loop or a multi-value
     # call anywhere in the body refers to them.
@@ -1530,8 +1672,8 @@ def reconstruct_protected(module: IRModule,
     # a ParseError whose line number points into source nobody wrote.
     vm_block = _parser.parse(vm_src, "<vm>") if vm_src else None
 
-    blocks = [b for b in (crypto_block, dense_block, pool_block, bank_block,
-                          helpers, vm_block) if b is not None]
+    blocks = [b for b in ([crypto_block, dense_block] + pool_blocks +
+                          [bank_block, helpers, vm_block]) if b is not None]
     captured: Dict[str, str] = {}
     if guard.active and blocks:
         # The capture set is decided *here*, once the emitted scaffolding exists:
@@ -1574,7 +1716,10 @@ def reconstruct_protected(module: IRModule,
         "guard": _guard_stmts(),
         "crypto": list(crypto_block.body) if crypto_block is not None else [],
         "dense": list(dense_block.body) if dense_block is not None else [],
-        "pool": list(pool_block.body) if pool_block is not None else [],
+        # Every region's runtime, in emission order: they are independent
+        # sealed structures, so the only ordering that matters is that each
+        # one's accessor exists before the code that calls it.
+        "pool": [stmt for block in pool_blocks for stmt in block.body],
         "bank": list(bank_block.body) if bank_block is not None else [],
         "helpers": list(helpers.body),
         "vm": list(vm_block.body) if vm_block is not None else [],

@@ -127,6 +127,11 @@ class BuildStats:
     #: is the signature -- a build whose drivers all look alike is a build with
     #: one fingerprint, whatever constants each drew.
     driver_shapes: Dict[str, Any] = field(default_factory=dict)
+    #: One entry per sealed constant-pool region (R6): its label, how many
+    #: constants it holds, how many prototypes it serves and the AAD it is
+    #: authenticated against.  Reported because "one pool" is no longer true
+    #: and a reader who thinks it is will misread the artifact.
+    pool_regions: List[Dict[str, Any]] = field(default_factory=list)
     #: One entry per VM group this artifact carries: family, dispatcher, opcode
     #: count, instruction format and how many prototypes it runs.  Read out of the
     #: plan rather than derived from the config, because with `vm_variety` above 1
@@ -461,6 +466,7 @@ def _build_once(source: str, config: Config, seed: bytes, name: str,
     stats.pool_decoys = int(runtime_names.get("pool_decoys") or 0)
     stats.split_arms = int(runtime_names.get("split_arms") or 0)
     stats.driver_shapes = dict(runtime_names.get("driver_shapes") or {})
+    stats.pool_regions = list(runtime_names.get("pool_regions") or [])
     stats.vm_groups = list(runtime_names.get("vm_plan") or [])
     stats.elapsed_ms = (time.perf_counter() - started) * 1000.0
 
@@ -734,6 +740,21 @@ def cost_report(result: BuildResult) -> str:
             "                        running the payload against the pool." % s.pool_decoys)
     else:
         lines.append("pool decoys           : none.  Every entry in the pool is referenced.")
+    if s.pool_regions:
+        labels = ", ".join(r["label"] for r in s.pool_regions)
+        counts = [str(r["entries"]) for r in s.pool_regions]
+        sizes = counts[0] if len(counts) == 1 else (
+            ", ".join(counts[:-1]) + " and " + counts[-1])
+        body = ("%d sealed regions: %s (%s constants).  One per VM group plus "
+                "the native one, each authenticated against the format that "
+                "reads it -- so recovering an accessor yields that region's "
+                "constants, and a blob moved between regions fails the tag "
+                "rather than decrypting."
+                % (len(s.pool_regions), labels, sizes))
+        wrapped = textwrap.wrap(body, width=54) or [""]
+        lines.append("constant pools        : %s" % wrapped[0])
+        for line in wrapped[1:]:
+            lines.append("                        %s" % line)
     if s.split_arms:
         lines.append(
             "split arms            : %d opaque branches added to the flattened native\n"

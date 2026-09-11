@@ -38,6 +38,8 @@ from couxobf.crypto.kdf import KeyMaterial
 from couxobf.runtime.constpool_runtime import (
     FAILURE_MESSAGE, ConstantPoolRuntime, default_names)
 from couxobf.rng import make_domains, new_seed
+from couxobf.config import Config
+from couxobf.pipeline import build
 from couxobf.toolchain import find_toolchain, execute
 
 TOOLCHAIN = find_toolchain()
@@ -660,3 +662,96 @@ def test_the_context_binds_the_pool_to_a_build_and_nothing_else_does():
         open_pool(b.key, b.nonce, a.ciphertext, a.tag, b.aad)
     with pytest.raises(Exception):
         open_pool(a.key, a.nonce, a.ciphertext, a.tag, b.aad)
+
+
+# ---------------------------------------------------------------------------
+# R6: per-group pool regions
+#
+
+
+def _variety_build(name="maze.luau", variety=2, seed=41):
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "..", "examples", name), encoding="utf-8") as fh:
+        # The size ceiling is off: at 24x this example has already given up
+        # its second group, and a test that asked for two and got one would
+        # be asserting nothing.
+        return build(fh.read(), Config(reproducible_seed=seed,
+                                       vm_variety=variety,
+                                       max_output_growth=0),
+                     name=name, verify=False)
+
+
+def test_a_virtualized_build_seals_one_region_per_group_plus_native():
+    """R6: the constants stop sharing one blob and one accessor.
+
+    Recovering one accessor used to yield every constant in the program.  With
+    the split it yields one region's worth, and the report says how many
+    regions the build actually carries rather than implying there is one.
+    """
+    result = _variety_build()
+    regions = result.runtime_names["pool_regions"]
+    labels = [r["label"] for r in regions]
+    assert "native" in labels, labels
+    groups = [r for r in regions if r["label"].startswith("vm group")]
+    assert len(groups) >= 2, labels          # variety=2
+    assert sum(r["protos"] for r in groups) == result.stats.virtualized
+    # Every region is a different sealed structure: different accessor, and a
+    # different AAD, which is the only thing that makes them different pools
+    # rather than one pool declared twice.
+    gets = [r["get"] for r in regions]
+    aads = [r["aad"] for r in regions]
+    assert len(set(gets)) == len(gets), gets
+    assert len(set(aads)) == len(aads), aads
+    for get in gets:
+        assert get in result.source
+    assert "constant pools" in result.report
+
+
+def test_a_blob_lifted_from_one_region_does_not_open_in_another():
+    """The property the split is for, tested rather than asserted.
+
+    Each region is authenticated against the format that reads it -- a group's
+    pool against that group's interpreter -- so a blob moved between regions
+    fails the tag instead of returning the constants of another group.  The
+    contexts here are the ones the build uses: the group fingerprint, not the
+    whole-plan digest, which is what would let group 0's blob open under
+    group 1 inside the same artifact.
+    """
+    from couxobf.crypto.protected import open_ as open_pool
+    from couxobf.constpool import ConstantPool
+    from couxobf.crypto.kdf import KeyMaterial
+    from couxobf.rng import Rng, make_domains
+
+    seed = b"\x71" * 16
+    keys = KeyMaterial.from_seed(seed)
+    contexts = {}
+    result = _variety_build()
+    for region in result.runtime_names["pool_regions"]:
+        contexts[region["label"]] = bytes.fromhex(region["aad"])
+
+    def sealed_with(tag: bytes):
+        pool = ConstantPool(keys, Rng(seed), b"region:" + tag,
+                            cache_policy="none")
+        for value in REAL:
+            pool.slot(value)
+        return pool.seal()
+
+    sealed = {label: sealed_with(label.encode() + aad)
+              for label, aad in contexts.items()}
+    for label, s in sealed.items():
+        assert decode_pool(open_pool(s.key, s.nonce, s.ciphertext, s.tag,
+                                     s.aad, enc_domain=s.enc_domain,
+                                     mac_domain=s.mac_domain,
+                                     cipher=s.cipher))
+    labels = list(sealed)
+    for source in labels:
+        for target in labels:
+            if source == target:
+                continue
+            with pytest.raises(Exception):
+                open_pool(sealed[target].key, sealed[target].nonce,
+                          sealed[source].ciphertext, sealed[source].tag,
+                          sealed[target].aad,
+                          enc_domain=sealed[source].enc_domain,
+                          mac_domain=sealed[source].mac_domain,
+                          cipher=sealed[source].cipher)

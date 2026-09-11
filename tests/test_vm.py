@@ -129,7 +129,7 @@ _DESCRIPTOR_TABLE = "_kVT"
 _TABLES = (_DESCRIPTOR_TABLE, "_kKT", "_kET", "_kRT")
 
 
-def _lit(value) -> str:
+def _lit(value, pid=None) -> str:
     """A constant as Luau source, through the printer's own literal rules.
 
     Going through the printer rather than ``repr`` matters for the bytecode
@@ -534,7 +534,8 @@ def test_vm_row_keys_are_build_specific_tickets():
     assert plan.row_key(7) != 7
     src = wiring.prelude_source(
         plan, {7: type("E", (), {"code": b"abc", "consts": (), "edges": ()})()},
-        const_expr=lambda v: "nil", code_expr=lambda b: '"abc"')
+        const_expr=lambda v, pid=None: "nil",
+        code_expr=lambda b, pid=None: '"abc"')
     assert "[%d]" % plan.row_key(7) in src
     assert "[7] = { code" not in src
 

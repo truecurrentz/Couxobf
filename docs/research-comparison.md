@@ -246,6 +246,10 @@ crypto, text-level hacks).
   ISA subset from `required_ops`. Block permutation + in-block reorder.
   Build-time `integrity.payload` walk validates every payload against its own
   group's format.
+- **Constants.** One sealed region per VM group plus one for the native code
+  (R6), each with its own key, prefix, ticket mask and accessor, and each
+  authenticated against the format that reads it.  Strings that reach the bank
+  are fragmented across shuffled pages and addressed per occurrence.
 - **Native reconstruction.** Multi-block prototypes are emitted as a flattened
   state machine whose *shape* is drawn per function, not only its constants:
   the counter holds either a raw block id -- and arms compare one of five
@@ -341,7 +345,7 @@ P3 = polish. Each item names the axes above.
 | R3 | Regression automation: reuse-audit thresholds as a test; seeded differential fuzz battery | "detect and prevent regressions automatically" | **P0/P1** |
 | R4 | Dense blob encoding: per-build 85-alphabet encoder for pool/bank/payload literals | `\xHH` = 4 chars/byte; hello.luau at 739×; size ceiling forces dropping real protection | **P1 — done** |
 | R5 | Closure-capable virtualization (upvalues via accessor closures behind `vm_upvalues`; varargs via frame field) | our biggest coverage gap vs Prometheus/Clyde | **P2 — varargs and upvalues done; nested closures next** |
-| R6 | Per-group constant pools with group-format AAD binding | one recovered accessor currently yields all constants | **P2** |
+| R6 | Per-group constant pools with group-format AAD binding | one recovered accessor currently yields all constants | **P2 — done** |
 | R7 | Exact integer arithmetic number encoding (split/add/fold) behind `numeric_protection_level=2` | numbers currently only get float-safe disguises | **P2 — done** |
 | R8 | `--!couxobf:` directives (`no_virtualize`, `virtualize`) | per-function user control, Luaq parity | **P2 — done** |
 | R9 | Index-to-number pass for provably-static table keys (opt-in) | structural transform at zero runtime cost | **P3 — done** |
@@ -349,7 +353,7 @@ P3 = polish. Each item names the axes above.
 | R11 | Dispatcher speed option: inlined-chain dispatch for small groups | 2 closure calls/instruction is slow | **P2 — done** |
 | R12 | Remove dead config surface; every remaining field either wired or gone (see G) | 15 pending fields erode trust in the report | **P1 — done** |
 
-Status: R0, R1, R2, R3, R4, R7, R8, R9, R11 and R12 are implemented and measured
+Status: R0, R1, R2, R3, R4, R6, R7, R8, R9, R11 and R12 are implemented and measured
 (see `docs/benchmarks.md`); the fuzz battery is in
 `tests/test_fuzz_differential.py`, and the reuse-audit's verdict is pinned
 as a regression test in `tests/test_reuse_regression.py`.  Everything else
@@ -615,7 +619,7 @@ is no second copy of an upvalue anywhere in the artifact for a dumper to find
 or for semantics to disagree with.
 *Test.* `tests/test_vm_upvalues.py`, differential against the source itself.
 
-### R6 — Per-group pools (P2)
+### R6 — Per-group pools (P2) — **implemented**
 
 *Problem.* One pool per artifact: recovering one accessor yields every
 constant (reviewer point #19).
@@ -626,10 +630,32 @@ constant (reviewer point #19).
 context + group fingerprint; the pool descriptor tables are fragmented per
 group (we already fragment metadata). Native code keeps one shared pool.
 
+*As built.* One sealed region per VM group plus one for everything that stayed
+native, each with its own prefix, its own ticket mask and its own accessor, so
+the regions are not visibly one runtime declared twice. Which region a constant
+is interned into is decided by the prototype it belongs to, and the VM's own
+payload reads go through the region that owns the prototype -- `prelude_source`
+hands its expression callbacks the prototype id for exactly that. Every region
+shares the one crypto module, so the split does not put a second decrypt
+routine in the artifact.
+
+*Measured.* `examples/maze.luau`, seed 41, `vm_variety=2`: three regions
+(native, group 0, group 1) holding 32, 26 and 22 constants, +13 KB over the
+single-pool build. The size ceiling (24x) gives up the second group on this
+example, so multi-group builds are rarer in default configurations than the
+knob suggests — which is a real limitation, not something the report hides.
+
 *Cost.* +1 decrypt per group at load. *Risk.* Low — pool code is unit-tested.
-*Test.* Cross-build/cross-group pool-swap tests must fail authentication;
-existing seal/open suites per group.
-*Default.* On when `vm_variety > 1`.
+*Test.* `test_a_blob_lifted_from_one_region_does_not_open_in_another` seals one
+pool per region context and cross-opens every pair; the build-level test pins
+that a `vm_variety=2` build really seals one region per group, that the
+accessors and AADs differ, and that the report says how many there are.
+*Default.* On when the artifact carries more than one VM group.  Splitting a
+single group's constants out costs a whole runtime (~5 KB on `maze.luau`), and
+the size ceiling pays for it by giving up the split arms, control-flow
+flattening and edge indirection -- measured, that trade is a loss, so one
+group keeps one pool and the split waits until there is something to split
+between.
 
 ### R7 — Exact integer arithmetic encoding (P2) — **implemented**
 
