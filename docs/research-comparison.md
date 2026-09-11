@@ -577,7 +577,8 @@ capturing function with is emitted at the closure site, which puts it
 lexically inside the scope owning the captured variables. It builds, per
 upvalue, a getter and a setter closure over the same expression the native
 reconstruction uses to reach that variable (the owner's register slot, or the
-per-iteration snapshot local where Luau's semantics demand one) and passes
+local holding that iteration's value or cell where Luau's semantics demand
+one) and passes
 the list as a third `enter` argument; `GETUPVAL`/`SETUPVAL` call through it.
 Because the accessors target the very storage native siblings use, reads and
 writes are live and consistent by construction — including a native write
@@ -585,7 +586,9 @@ landing between two of the child's reads, and two VM siblings sharing one
 counter. The cell-table design would have rewritten the parent's accesses to
 go through a cell; the accessor design needs no parent rewrite at all, and
 per-iteration capture comes free because the stub is created per iteration
-and captures the snapshot local. The one line that does not move: an upvalue
+and captures the snapshot local -- or, where the closure writes the variable,
+the cell the parent allocated at the declaration, which is what that local
+holds. The one line that does not move: an upvalue
 whose home prototype is itself virtualized has storage no Luau closure can
 see, so the selector removes such prototypes — a fixpoint, since the relation
 is circular. Today the fixpoint cannot fire (a home creates a closure, which

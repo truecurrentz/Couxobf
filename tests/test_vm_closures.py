@@ -1001,3 +1001,97 @@ def test_a_mutating_capture_inside_a_virtualized_parent():
     # 4 + 7 + 10 == 21 for three iterations, and 4 alone for one -- not
     # 10 + 10 + 10, which is what one shared counter would give.
     _equivalent(src, seed=7, expect_virtualized=2)
+
+
+def test_the_same_inside_a_function_the_vm_does_not_take():
+    """The cell is built by the pass that finishes a *function* body, not the
+    one that finishes the main chunk, and a native function is the ordinary
+    case of it.  Two calls, so a cell that survived from the first one would
+    show up as a different sum."""
+    src = ("local function outer(n)\n"
+           "  local makers = {}\n"
+           "  for i = 1, n do\n"
+           "    local c = i * 2\n"
+           "    makers[i] = function() c += 1 return c end\n"
+           "  end\n"
+           "  local s = 0\n"
+           "  for j = 1, n do s = s + makers[j]() end\n"
+           "  return s\n"
+           "end\n"
+           "print(outer(3))\n"
+           "print(outer(3))\n")
+    assert _both_profiles(src) == "15\n15\n"
+
+
+def test_the_same_in_a_repeat_body():
+    """`repeat` is the loop whose body block is *not* scoped the way `while`
+    and `for` scope theirs: the condition is inside the body's scope, so the
+    cell has to be allocated where the declaration is and nowhere else."""
+    src = ("local makers = {}\n"
+           "local i = 0\n"
+           "repeat\n"
+           "  i += 1\n"
+           "  local n = i * 2\n"
+           "  makers[i] = function() n += 1 return n end\n"
+           "until i >= 3\n"
+           "print(makers[1](), makers[1](), makers[2](), makers[3]())\n")
+    assert _both_profiles(src) == "3\t4\t5\t7\n"
+
+
+def test_two_cells_in_one_iteration_stay_apart():
+    """One closure, two captured locals of the same iteration: a counter it
+    writes and a step it only reads.  Two cells that leaked into each other
+    would answer 11 12 22 33 or similar."""
+    src = ("local fns = {}\n"
+           "for i = 1, 3 do\n"
+           "  local a = i\n"
+           "  local b = i * 10\n"
+           "  fns[i] = function() a += b return a end\n"
+           "end\n"
+           "print(fns[1](), fns[1](), fns[2](), fns[3]())\n")
+    assert _both_profiles(src) == "11\t21\t22\t33\n"
+
+
+def test_a_cell_and_the_loop_variable_captured_together():
+    """The two mechanisms side by side -- a snapshot for the control variable
+    and a cell for the body's local -- in one closure that writes the cell."""
+    src = ("local fns = {}\n"
+           "for i = 1, 3 do\n"
+           "  local c = i * 100\n"
+           "  fns[i] = function() c += i return c end\n"
+           "end\n"
+           "print(fns[1](), fns[2](), fns[3]())\n")
+    assert _both_profiles(src) == "101\t202\t303\n"
+
+
+def test_a_closure_writing_a_cell_runs_from_native_code():
+    """`table.sort` calls the comparator, which writes the cell.  The write
+    lands from C, so there is no interpreter frame in the way -- and no way
+    for the loop body to see it except through the same table."""
+    src = ("local out = {}\n"
+           "local items = {3, 1, 2, 5, 4}\n"
+           "for i = 1, 2 do\n"
+           "  local calls = 0\n"
+           "  table.sort(items, function(a, b)\n"
+           "    calls += 1\n"
+           "    return a < b\n"
+           "  end)\n"
+           "  out[i] = calls\n"
+           "end\n"
+           "print(out[1], out[2], table.concat(items, \",\"))\n")
+    # How many comparisons a sort makes is the sort's business; what matters
+    # is that the protected build counts the same ones, twice over.
+    assert _both_profiles(src)
+
+
+def test_a_cell_holding_a_table_is_mutated_through_it():
+    """The value in the cell is a table, and the closure mutates what is
+    inside it rather than reassigning the local: three iterations, three
+    tables, each moved only by its own closure."""
+    src = ("local fns = {}\n"
+           "for i = 1, 3 do\n"
+           "  local t = {n = i}\n"
+           "  fns[i] = function() t.n += 10 return t.n end\n"
+           "end\n"
+           "print(fns[1](), fns[1](), fns[2](), fns[3]())\n")
+    assert _both_profiles(src) == "11\t21\t12\t13\n"

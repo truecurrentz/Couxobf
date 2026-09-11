@@ -134,8 +134,9 @@ increment, off by default), and they cross differently: the frame still holds
 no captured state. The stub replacing a capturing function is emitted at the
 closure site, so it is lexically inside the scope that owns the variables; it
 builds, per upvalue, a getter and a setter closure over the very expression
-the native reconstruction uses -- the owner's register slot, or the
-per-iteration snapshot local where Luau's semantics demand one -- and hands
+the native reconstruction uses -- the owner's register slot, or the local
+holding that iteration's value or cell where Luau's semantics demand one -- and
+hands
 the list to the interpreter as a third entry argument. `GETUPVAL` and
 `SETUPVAL` call through it, which keeps reads and writes live and consistent
 with any native sibling sharing the variable, including writes that land
@@ -172,9 +173,9 @@ once per closure creation, so the common case allocates *less* than before.
 **What it did not cover, and now does:** a child that captures -- the case
 real callbacks are made of. The fourth increment builds the accessor inside
 the interpreter, which is the one place that can see the frame: a getter and a
-setter closing over the parent's slot, a cell holding a snapshot when the
-variable is a loop variable and Luau gives every iteration its own, and the
-parent's own accessor pair relayed for an upvalue the parent carries. The stub
+setter closing over the parent's slot, or over the cell the parent made when
+the variable is a loop-body local that Luau gives every iteration its own, and
+the parent's own accessor pair relayed for an upvalue the parent carries. The stub
 is `setfenv`'d to the parent's environment, since a closure born inside the
 interpreter would otherwise inherit the interpreter's. Prototype count on the
 corpus goes 118 -> 151. Both flags are still new machinery behind a default of
@@ -384,19 +385,17 @@ and numeric-for coercion through `tonumber`. Every one of those is a place a
 more aggressive transformation would be wrong. Correctness is not negotiable
 here, which caps how far obfuscation can go.
 
-**A captured loop-body local is shared storage, not a per-iteration cell.**
-Luau gives every iteration of a loop its own cell for a local declared in the
-body, and a retained closure must keep seeing that iteration's cell. The
-reconstruction models registers as shared slots, so a closure capturing such a
-local and called after the loop ends reads whatever the last iteration left
-there. Loop *variables* are the exception: they are copied into a
-per-iteration local at the closure site, which is exact while the local is not
-written through the closure -- the moment two closures share a captured local
-and one writes it, a copy is no longer a cell, which is why the copy is not
-extended to loop-body locals. Fixing this needs a real cell model (a fresh
-cell per iteration with every access, native and virtualized alike, routed
-through it) and is a prerequisite of the capturing half of R5's third
-increment, not of any setting in this tool.
+**A captured loop-body local is a cell now, and what is left is cost rather
+than constraint.** Luau gives every iteration of a loop its own cell for a
+local declared in the body, and a retained closure must keep seeing that
+iteration's. The reconstruction models registers as shared slots, so a
+captured loop-body local is no longer one of them: it becomes a table
+allocated at the declaration -- the one site that runs once per iteration --
+and every access goes through it, the loop body's own included, native and
+virtualized alike. Both directions of the old tension then hold at once: a
+reader sees the iteration it was built in, and two closures of one iteration
+sharing a counter share that counter. What the representation costs, and the
+shape it leaves in the output, are written up under the limitations above.
 
 **`#` on a table with nil holes is reproduced in content, not in length.**
 When a multi-value result -- a call return, a vararg list (R5) -- is appended
