@@ -77,6 +77,15 @@ NAMES = {
     # handing out
     "rows": "_kRw",
     "stubs": "_kSb",
+    # R5's fourth increment: the capture descriptors a CLOSURE arm reads to
+    # find out whether the child it is creating captures at all, the
+    # per-iteration snapshot list beside them, and the local alias for
+    # setfenv -- held in a local for the same reason getfenv is, plus one of
+    # its own: the stub a capturing child gets is born inside the interpreter,
+    # so its inherited environment is the interpreter's and not the parent's.
+    "caps": "_kCp",
+    "snaps": "_kSn",
+    "setfenv": "_kSe",
 }
 
 
@@ -1141,10 +1150,15 @@ def test_every_handler_body_uses_only_declared_names(op):
                                  spec)
         declared, used = _handler_names(lines)
         # multi-value packs arrive as table fields; a `for` loop's control
-        # variable is declared by the loop header itself
+        # variable is declared by the loop header itself, and a function's
+        # parameter by its signature -- which is how the accessor closures a
+        # capturing child needs name the value they are handed.
         for line in lines:
             m = re.match(r"\s*for\s+([A-Za-z_][A-Za-z0-9_]*)", line)
             if m:
+                declared.add(m.group(1))
+            for m in re.finditer(r"function\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)",
+                                 line):
                 declared.add(m.group(1))
         free = sorted(n for n in used - declared - _LUAU_GLOBALS
                       # helper locals are named through the NAMES dict

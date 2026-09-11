@@ -142,10 +142,12 @@ with any native sibling sharing the variable, including writes that land
 between two of the child's reads. One line does not move even with the flag:
 a capture whose owning prototype is itself virtualized has its storage inside
 a frame no closure can see, so the selector unselects such a prototype (a
-fixpoint, since the ownership relation is circular). Today an owner can never
-actually be virtualized -- it creates a closure, which the encoder refuses --
-so the fixpoint is a guard for the day closure creation joins the VM -- which
-it now partly has; see the next paragraph.
+fixpoint, since the ownership relation is circular). That rule is what R5's
+fourth increment removes *for builds that turn closures on*: the interpreter
+builds the accessor, and it can see the frame it owns. With `vm_upvalues`
+alone -- the configuration this paragraph describes -- the rule still stands,
+because there the accessors are emitted at a native closure site and no
+virtualized owner's frame is reachable from one.
 
 ### Nested closures that capture nothing (implemented, R5's third increment)
 
@@ -167,12 +169,16 @@ closure tree is one indivisible unit when a build asks for more than one VM.
 **Cost added:** none measurable. Each stub is built once at load rather than
 once per closure creation, so the common case allocates *less* than before.
 
-**What it does not cover:** a child that captures. The variables it names
-would have to live in a VM frame, which is a table no Luau closure can see, so
-such a parent stays native with a reason in the report. That is the case real
-callbacks are made of, and it needs the cell model described under the
-limitations below -- which is why the flag is new machinery behind a default
-of off rather than a change to what every build does.
+**What it did not cover, and now does:** a child that captures -- the case
+real callbacks are made of. The fourth increment builds the accessor inside
+the interpreter, which is the one place that can see the frame: a getter and a
+setter closing over the parent's slot, a cell holding a snapshot when the
+variable is a loop variable and Luau gives every iteration its own, and the
+parent's own accessor pair relayed for an upvalue the parent carries. The stub
+is `setfenv`'d to the parent's environment, since a closure born inside the
+interpreter would otherwise inherit the interpreter's. Prototype count on the
+corpus goes 118 -> 151. Both flags are still new machinery behind a default of
+off rather than a change to what every build does.
 
 **Cost added:** a capturing stub allocates two closures per upvalue per call
 and every `GETUPVAL`/`SETUPVAL` is two indirect calls. That is real, and it is
@@ -315,6 +321,32 @@ hook installed before the artifact loads sees the capture happen; and a debugger
 runs the same language the guard is written in. The artifact's own report states
 what the guard captured and whether it tripped, because a build should not claim
 more than it did.
+
+**A local declared inside a loop body does not get a per-iteration identity.**
+Luau gives every iteration its own copy of a local declared in the loop body,
+so three closures built in three iterations capture three different variables.
+The reconstruction allocates one register per declaration and, for a native
+body, one local per register -- so a program that captures such a local sees
+the last iteration's value in all three closures:
+
+```lua
+local fns = {}
+for i = 1, 3 do
+    local x = i
+    fns[i] = function() return x end
+end
+print(fns[1](), fns[2](), fns[3]())   -- 1 2 3 unprotected; 3 3 3 protected
+```
+
+This predates R5 and is not a VM limitation: it reproduces at the `compact`
+profile, which virtualizes nothing. Loop *control* variables are handled
+correctly (they are marked per-iteration in the IR and captured through a
+snapshot), and so are the closures a virtualized parent builds, because the
+interpreter takes that snapshot itself. What is missing is the general case: a
+cell allocated at the variable's declaration and torn down per iteration, with
+the parent's own reads and writes routed through it. Until then it is a
+correctness difference on programs that capture loop-body locals, and it is
+the one place where the output does not do what the source does.
 
 **One pool and one bank per artifact.** Constant data lives in exactly two places
 -- the sealed pool and the string bank -- each authenticated as a whole. So the

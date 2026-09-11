@@ -1564,11 +1564,30 @@ def reconstruct_protected(module: IRModule,
         # accessors close over the enclosing scope's own storage.
         per_site = {pid for pid in rec.vm_encoded
                     if rec.by_id[pid].upvalues} if plan.upvalues_ok else set()
+        # R5's fourth increment: how a capturing child reaches what it
+        # captures.  Only children of a virtualized parent are described here
+        # -- a child of a *native* parent gets its stub, accessors and all,
+        # emitted at the closure site, which is the path R5 built first.  The
+        # distinction is which side of the boundary owns the storage: a native
+        # parent's locals are real Luau locals, and a virtualized one's live in
+        # a frame only the interpreter can see.
+        capture_desc: Dict[int, Any] = {}
+        if plan.closures_ok and plan.upvalues_ok:
+            for pid in rec.vm_encoded:
+                parent = rec.by_id[pid]
+                for child in parent.children:
+                    if not child.upvalues or child.proto_id not in rec.vm_encoded:
+                        continue
+                    capture_desc[child.proto_id] = [
+                        (uv.from_local, uv.index,
+                         bool(uv.from_local) and uv.index in parent.per_iteration)
+                        for uv in child.upvalues]
         vm_src = _wiring.prelude_source(plan, rec.vm_encoded, pooled, pooled,
                                         edges_expr=pooled,
                                         entry_guard=guard.entry_lines(),
                                         opaque_predicates=bool(opaque_predicates),
-                                        per_site=per_site)
+                                        per_site=per_site,
+                                        caps=capture_desc)
 
     # A region with no constants in it needs no runtime: emitting one would
     # just be a decoder that never runs.  A build that virtualized nothing has

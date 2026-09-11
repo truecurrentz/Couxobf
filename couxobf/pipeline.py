@@ -588,7 +588,16 @@ def _select_for_vm(module, classification, upvalues_ok: bool = False,
                                              closures_ok=closures_ok)
         if ok:
             chosen.add(proto.proto_id)
-    if upvalues_ok and chosen:
+    # Skipped when ``closures_ok`` is on, and that is R5's fourth increment
+    # rather than a shortcut: the reason this rule existed was that a closure
+    # capturing a virtualized prototype's variable would have to close over a
+    # frame slot no Luau closure can see.  Once the *interpreter* builds the
+    # accessors, the frame is no longer invisible -- the closure it hands out
+    # is created inside the loop that owns the frame, so it can close over the
+    # slot directly.  What still cannot happen is a capture whose home is
+    # virtualized while the chain up to it is not, and the tree rule below
+    # refuses exactly that.
+    if upvalues_ok and not closures_ok and chosen:
         homes = _upvalue_home_map(module)
         changed = True
         while changed:
@@ -598,7 +607,6 @@ def _select_for_vm(module, classification, upvalues_ok: bool = False,
                     chosen.discard(pid)
                     changed = True
     if closures_ok and chosen:
-        homes = (_upvalue_home_map(module) if upvalues_ok else {})
         parents = {c.proto_id: p.proto_id
                    for p in module.walk() for c in p.children}
         # Depth-first, so a prototype is always visited before its children
@@ -633,8 +641,10 @@ def _select_for_vm(module, classification, upvalues_ok: bool = False,
                 continue
             if not whole_tree[pid]:
                 continue
-            if any(h in keep for h in homes.get(pid, ())):
-                continue
+            # No upvalue-home test here, for the reason given above: a capture
+            # whose home is in the VM is served by accessors the interpreter
+            # builds over that home's own frame, and the tree rule has already
+            # put every prototype between this one and the home in the VM.
             keep.add(pid)
         chosen = keep
     return chosen

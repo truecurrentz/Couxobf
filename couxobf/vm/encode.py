@@ -182,10 +182,14 @@ def can_virtualize(proto: FuncIR, fmt: Optional[FormatSpec] = None,
         return False, "creates closures"
     if proto.children:
         for child in proto.children:
-            if child.upvalues:
-                return False, ("creates a closure that captures, and a captured "
-                               "variable the VM frame owns is invisible to a "
-                               "real Luau closure")
+            if child.upvalues and not upvalues_ok:
+                # R5's fourth increment builds the accessors *inside* the
+                # interpreter, over the parent's frame slots rather than over
+                # native locals, so a capturing child is servable -- but it is
+                # the same accessor machinery ``vm_upvalues`` gates, and a
+                # build that has not asked for it does not get it.
+                return False, ("creates a closure that captures; building its "
+                               "accessors in the VM needs `vm_upvalues` too")
             if fmt is not None and child.proto_id > fmt.max_wide(("w", "proto")):
                 return False, (f"closure {child.proto_id} does not fit the wire "
                                f"format")

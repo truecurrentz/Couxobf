@@ -345,7 +345,7 @@ P3 = polish. Each item names the axes above.
 | R2 | Real opaque predicates + opaque dispatch arms (build-keyed, never foldable, never dead) | `opaque_predicates` is a tautology today; docs admit the gap | **P1 — done** (VM tap + native split arms) |
 | R3 | Regression automation: reuse-audit thresholds as a test; seeded differential fuzz battery | "detect and prevent regressions automatically" | **P0/P1** |
 | R4 | Dense blob encoding: per-build 85-alphabet encoder for pool/bank/payload literals | `\xHH` = 4 chars/byte; hello.luau at 739×; size ceiling forces dropping real protection | **P1 — done** |
-| R5 | Closure-capable virtualization (upvalues via accessor closures behind `vm_upvalues`; varargs via frame field; nested closures behind `vm_closures`) | our biggest coverage gap vs Prometheus/Clyde | **P2 — varargs, upvalues and captures-free nested closures done; capturing children still need cells** |
+| R5 | Closure-capable virtualization (upvalues via accessor closures behind `vm_upvalues`; varargs via frame field; nested closures behind `vm_closures`) | our biggest coverage gap vs Prometheus/Clyde | **P2 — done: varargs, upvalues, and nested closures whether or not the children capture (151 of 201 corpus prototypes, up from 88)** |
 | R6 | Per-group constant pools with group-format AAD binding | one recovered accessor currently yields all constants | **P2 — done** |
 | R7 | Exact integer arithmetic number encoding (split/add/fold) behind `numeric_protection_level=2` | numbers currently only get float-safe disguises | **P2 — done** |
 | R8 | `--!couxobf:` directives (`no_virtualize`, `virtualize`) | per-function user control, Luaq parity | **P2 — done** |
@@ -547,7 +547,7 @@ skip-threshold behaviour, and dense-vs-hex differential on a real example.
 *Default.* On, with the threshold escape above; `Config.blob_encoding =
 "dense" | "hex"` is wired through the API option surface and the web form.
 
-### R5 — Closure-capable virtualization (P2 — varargs and upvalues done)
+### R5 — Closure-capable virtualization (P2 — varargs, upvalues and nested closures done)
 
 *Problem.* `can_virtualize` refuses any prototype with upvalues, varargs, or
 nested closures — i.e. most real Roblox code (callbacks, state objects).
@@ -642,40 +642,86 @@ over accessor closures built at the site, and Luau gives those a fresh closure
 per execution anyway. That divergence predates this increment; sharing the
 stub is what closes it.
 
-*Still to come (the capturing half).* A child that captures cannot be built
-this way, because the variables it names would have to live in a VM frame,
-which is a table no Luau closure can see. That is what real callbacks are made
-of, and it needs the cell model: a cell per captured variable, created per
-iteration where Luau's semantics demand it, with every access -- native and
-virtualized alike -- routed through it. The frame then holds no state, only
-doors, exactly as the accessor design does for reads and writes today, except
-that the doors have to be reachable from a closure the *interpreter* builds
-rather than one emitted at a native closure site. `can_virtualize` grew two
-capability flags (`upvalues_ok`, `closures_ok`) instead of a blanket refusal;
-the classifier still keeps its size floor for a prototype standing on its
-own -- a child comes in under its parent rather than scoring its way in --
-and the cap that held every closure-creating prototype at LIGHT now lifts with
-the flag.
+*As built (the capturing half).* The line the increment above drew was "a
+child that captures nothing", and the reason for it was sound: the variables a
+capturing child names would have to live in a VM frame, which is a table no
+Luau closure can see. What that argument missed is that one place *can* see
+the frame -- the interpreter running the parent, which owns it. So the
+accessor is built there instead of at a native closure site: `CLOSURE` looks
+the child up in a capture table and, when it finds one, builds a getter and a
+setter closing over `R[slot]` and hands the pair to the interpreter as the
+child's upvalue list, exactly the list the native path builds. Three ways a
+capture is served, because three things can be captured:
+
+*a plain local of the parent's* -- live, not a copy. Both closures close over
+the frame, so a write by either side is seen by the other, which is what a
+captured variable means and what the accessor design already did for reads and
+writes across the native boundary.
+
+*a loop variable* -- Luau gives every iteration its own, so a closure declared
+in the body captures *that* iteration's value while the frame slot keeps
+moving. The accessor therefore closes over a cell holding a snapshot taken at
+the moment the closure is created. This is the per-iteration cell, and it
+lands exactly where the old sketch put it.
+
+*an upvalue of the parent's* -- relayed, not re-derived. The interpreter hands
+the child the parent's own accessor pair, so a chain of captures ends where
+the native site built it however deep it started.
+
+Two consequences worth stating. The stub is born inside the interpreter, whose
+environment is not the parent's, so it is `setfenv`'d to the environment the
+parent's frame was entered with. And it is built fresh every time `CLOSURE`
+runs, where the non-capturing case hands out one shared stub: Luau gives a
+capturing closure a new identity per evaluation and hoists a non-capturing
+one, so the two paths have to differ or `f == f` starts lying.
+
+The one shape the snapshot does *not* reach is a local declared inside a loop
+body and captured there. The IR marks a loop's control variables per-iteration
+and nothing else, so `local x = i` in a loop body is one register for all
+three iterations and the closures share it. That is not a VM limitation -- it
+reproduces at `compact`, which virtualizes nothing -- and it is written up
+under the limitations in `SECURITY.md`. Closing it needs the cell model in
+full: a cell allocated at the declaration, fresh per iteration, with the
+parent's own reads and writes going through it rather than through the
+register.
+
+`can_virtualize` grew two capability flags (`upvalues_ok`, `closures_ok`)
+instead of a blanket refusal; the classifier still keeps its size floor for a
+prototype standing on its own -- a child comes in under its parent rather than
+scoring its way in -- and the cap that held every closure-creating prototype at
+LIGHT now lifts with the flag. The one rule this increment had to *remove* is
+the upvalue-home fixpoint: it existed because a closure capturing a
+virtualized prototype's variable had nowhere to point, and the interpreter is
+now somewhere to point it. R5b on its own keeps the rule.
 
 *Measured.* Coverage on the repo corpus plus the examples -- 28 files, 201
 prototypes, 7 693 IR instructions -- `maximum` profile, seed 41: 88 prototypes
 (45.6 % of instructions) with both capability flags off, 118 (64.1 %) with
-`vm_upvalues`, and 136 (67.0 %) with `vm_upvalues` *and* `vm_closures`. Two
-things about those numbers are the finding. The corpus did not exercise the
-increment at all -- `closures.luau` is deliberately a file of *capturing*
-closures, which is the half still to come -- so the pattern had to be added
-before the increment could be measured: `tests/fixtures/corpus/helpers.luau`
-is the missing half of that pair, and on it alone the VM goes from 1
-prototype (18 instructions) to 17 of 18 (225 of 363). Without that file the
-whole corpus moves 117 -> 119 prototypes, which is what the first version of
-this increment measured and why the selection rule changed.
+`vm_upvalues`, and 151 (69.2 %) with `vm_upvalues` *and* `vm_closures`. The
+capturing half is worth more than the non-capturing one, which is the opposite
+of what the ordering suggests -- `vm_closures` alone moved the corpus 117 ->
+119 prototypes, because almost every closure in real code captures something.
+The files that move are the ones written around callbacks: `closures.luau` 2 ->
+9 prototypes (50 -> 148 instructions), `queue.luau` 6 -> 10, `parse.luau` 8 ->
+10, `errors.luau` 4 -> 6, `inventory.luau` 4 -> 6.
 
-`tests/test_vm_closures.py` is the differential gate -- a nested helper, a
-comparator handed to `table.sort`, three levels of nesting, a closure returned
-past its parent's frame, several children from one parent, a loop-declared
-closure, a self-calling one, multi-group, and the `maximum` profile across
-seeds -- plus the refusal paths (a capturing leaf unselects the whole chain
-above it) and a test that a closure tree lands in one group.
+One number in that table needed a fixture before it could be measured at all:
+the corpus had no non-capturing nested helpers in it -- `closures.luau` is
+deliberately a file of *capturing* closures -- so `tests/fixtures/corpus/helpers.luau`
+was added as the other half of the pair, and on it alone the VM goes from 1
+prototype (18 instructions) to 17 of 18 (225 of 363). Without that file the
+corpus moves 117 -> 119, which is what the third increment measured on the day
+it was written and why its selection rule changed the next day.
+
+`tests/test_vm_closures.py` is the differential gate, 27 tests: a nested
+helper, a comparator handed to `table.sort`, three levels of nesting, several
+children from one parent, a loop-declared closure, a self-calling one,
+multi-group and the `maximum` profile across seeds -- and for the capturing
+half, a live read, a write the parent sees, two children sharing one variable,
+per-iteration capture, a relay through a virtualized parent, a capture two
+frames down, a closure that outlives the frame that built it, a fresh identity
+per evaluation, a comparator called back from C, and the one refusal that is
+left (`vm_closures` without `vm_upvalues`).
 
 *Reference.* Prometheus' upvalue proxies; Clyde's `LOAD_UPVAL/STORE_UPVAL/
 CLOSE_UPVAL` with an `openUVs` table. We did it our way, at the IR level, and

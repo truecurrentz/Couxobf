@@ -272,7 +272,23 @@ _ROLES = ("code", "exec", "enter", "call", "getfenv", "acc", "stack", "sp",
           # closure created inside a loop is the same function value every
           # iteration -- which is what Luau's own compiler produces for a
           # closure that captures nothing.
-          "stubs")
+          "stubs",
+          # R5's fourth increment: how a capturing child reaches what it
+          # captures.  ``caps`` is one entry per upvalue (a parent register to
+          # watch, or an accessor of the parent's to relay); ``snaps`` names
+          # the ones that need a cell holding a snapshot instead, because the
+          # variable is a loop variable and Luau gives each iteration its own.
+          # A child with no entry in ``caps`` has nothing to capture and takes
+          # its stub from the table above.
+          "caps", "snaps", "setfenv")
+
+#: Roles whose names come from their own fork of the vm stream rather than from
+#: the shared block.  A role drawn from the block lengthens it by one, and
+#: everything the plan draws afterwards -- every format, opcode map, cipher and
+#: dispatch key -- moves with it, so a build that gained a name would also
+#: quietly change its VMs.  Forking keeps one decision from moving another; the
+#: block's length is the part that has to stay put.
+_FORKED = ("stubs", "caps", "snaps", "setfenv")
 
 
 def make_plan(rng: Rng, protos: Iterable[int],
@@ -337,12 +353,13 @@ def make_plan(rng: Rng, protos: Iterable[int],
         # that gained a name would also quietly change its VMs.  It comes from
         # a fork instead, which is how the rest of this project keeps one
         # decision from moving another.
-        stream_roles = tuple(r for r in _ROLES if r != "stubs")
+        stream_roles = tuple(r for r in _ROLES if r not in _FORKED)
         drawn = _fresh_names(rng, len(stream_roles), used=used)
         names = dict(zip(stream_roles, drawn))
-        extra = _fresh_names(rng.fork("stubs"), 1, used=used)
-        names["stubs"] = extra[0]
-        used.add(extra[0])
+        for role in _FORKED:
+            extra = _fresh_names(rng.fork(role), 1, used=used)
+            names[role] = extra[0]
+            used.add(extra[0])
     else:
         # A caller-supplied name set: the test harness pins these so a failure
         # names the function it came from.  They must reach the groups too -- a
@@ -637,7 +654,8 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
                    entry_guard: Sequence[str] = (),
                    fragmented: Optional[bool] = None,
                    opaque_predicates: bool = True,
-                   per_site: Optional[Set[int]] = None) -> str:
+                   per_site: Optional[Set[int]] = None,
+                   caps: Optional[Dict[int, Any]] = None) -> str:
     """The interpreters plus the descriptor tables, as Luau source.
 
     One interpreter per VM group, then three tables keyed by prototype id: the
@@ -661,6 +679,15 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
     by its descriptor row, built once here; that is what makes
     ``f == f`` hold across iterations of a loop that declares one, which is
     what plain Luau does with a closure that captures nothing.
+
+    ``caps`` is R5's fourth increment and covers the gap that table leaves: a
+    child of a *virtualized* parent captures from that parent's frame, so its
+    accessors can only be built by the interpreter that owns the frame.  One
+    entry per upvalue -- the parent's register to watch, or the parent's own
+    accessor to relay -- plus, in a second table, the ones that need a cell
+    holding a snapshot because the variable is a loop variable and Luau gives
+    each iteration its own.  A child with no entry here captures nothing and
+    takes its stub from the table above.
     """
     interpreter_parts: List[str] = []
     for group in plan.groups:
@@ -715,6 +742,32 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
                    plan.row_key(pid), group.names["getfenv"]))
 
 
+    # R5's fourth increment: the capture descriptors.  Keyed by row like the
+    # stubs, and read by the same CLOSURE arm that reads them -- one lookup
+    # tells the interpreter whether the child it is creating captures at all.
+    cap_rows: List[str] = []
+    snap_rows: List[str] = []
+    for pid in sorted(caps or ()):
+        if pid not in encoded:
+            continue
+        items: List[str] = []
+        snaps: List[str] = []
+        for i, desc in enumerate(caps[pid]):
+            from_local, index, snapshot = desc
+            # Positive: a register of the parent's, watched live, carried as
+            # the frame slot it lives in -- and the frame is one-based, the
+            # entry point laying parameters down at R[1..n], so register k is
+            # slot k + 1.  Negative: an accessor of the parent's, relayed,
+            # biased the same way so that upvalue 0 is representable in a
+            # table that has no zero key.
+            items.append(str(index + 1) if from_local else str(-(index + 1)))
+            if snapshot:
+                snaps.append(str(i))
+        cap_rows.append("  [%d] = { %s }," % (plan.row_key(pid), ", ".join(items)))
+        if snaps:
+            snap_rows.append("  [%d] = { %s },"
+                             % (plan.row_key(pid), ", ".join(snaps)))
+
     def _finish(metadata: List[str]) -> str:
         if not interpreter_parts:
             combined = metadata
@@ -733,16 +786,21 @@ def prelude_source(plan: VMPlan, encoded: Dict[int, Any],
         # place as the rows table: an interpreter's CLOSURE arm indexes it, and
         # the interpreters are emitted first.
         text = ("local %s\n" % plan.rows_table)
-        if stub_rows:
-            text += "local %s\n" % plan.names["stubs"]
+        for rows, role in ((stub_rows, "stubs"), (cap_rows, "caps"),
+                           (snap_rows, "snaps")):
+            if rows:
+                text += "local %s\n" % plan.names[role]
         text += "\n".join(combined) + "\n"
-        if stub_rows:
-            # The stubs go last, not with the rest of the metadata: each one
-            # closes over its group's ``enter``, which is a local the
-            # interpreter declares, so a stub table emitted before it would
-            # capture a nil global instead.
-            text += ("%s = {\n%s\n}\n"
-                     % (plan.names["stubs"], "\n".join(stub_rows)))
+        for rows, role in ((stub_rows, "stubs"), (cap_rows, "caps"),
+                           (snap_rows, "snaps")):
+            if rows:
+                # The stubs go last, not with the rest of the metadata: each
+                # one closes over its group's ``enter``, which is a local the
+                # interpreter declares, so a stub table emitted before it would
+                # capture a nil global instead.  The capture descriptors ride
+                # along because the same CLOSURE arm reads them.
+                text += ("%s = {\n%s\n}\n"
+                         % (plan.names[role], "\n".join(rows)))
         return text
 
     if fragmented is None:

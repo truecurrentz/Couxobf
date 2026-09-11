@@ -1,28 +1,34 @@
-"""R5 (third increment): virtualizing a function that creates closures.
+"""R5 (third and fourth increments): a function that creates closures.
 
-The first two increments let varargs and upvalue *access* into the VM.  This
-one crosses the last line of the old refusal: a prototype whose body builds
-closures of its own.  The mechanism is deliberately narrow -- only children
-that capture nothing qualify -- and the tests below are mostly about where
-that line falls.
+The first two increments let varargs and upvalue *access* into the VM.  The
+third crosses the old refusal outright: a prototype whose body builds closures
+of its own.  The fourth crosses what the third still drew a line at -- a child
+that *captures* something its virtualized parent owns.
 
-Why the line is there.  A closure the interpreter builds is an ordinary Luau
-function.  Anything it captures has to be reachable from ordinary Luau, and a
-VM frame is a table: a register the parent owns is not.  A child with no
-upvalues needs nothing from the frame it was born in, so the interpreter can
-build its entry point out of its own locals -- the descriptor row, the
-environment, `false` for the accessor list.  A child that captures one
-variable cannot be built that way at all, which is why the refusal stands.
+Why the third increment's line was where it was.  A closure the interpreter
+builds is an ordinary Luau function.  Anything it captures has to be reachable
+from ordinary Luau, and a VM frame is a table: a register the parent owns is
+not.  A child with no upvalues needs nothing from the frame it was born in, so
+the interpreter can hand out a stub built once, in the prelude, out of its own
+locals -- the descriptor row, the environment, `false` for the accessor list.
 
-The second constraint shapes the selection rather than the encoding: the
+What the fourth increment adds is that the interpreter is the one place that
+*can* see the frame.  Building the accessor there, over the parent's own slot,
+is the whole trick: a getter and a setter closing over `R[slot]`, a cell
+holding a snapshot when the variable is a loop variable and Luau gives each
+iteration its own, and the parent's own accessor pair relayed unchanged for an
+upvalue the parent carries.  What still cannot be served is nothing much: the
+only refusal left is a build that has not asked for ``vm_upvalues``, since the
+accessors are that increment's machinery.
+
+The other constraint shapes the selection rather than the encoding: the
 interpreter has no function value for a child left native -- it can name a
 descriptor row or nothing -- so a virtualized prototype takes its whole
 virtualizable subtree in with it.  A helper is usually below the classifier's
 size floor *on its own*, and refusing the parent instead would have made the
 flag near-useless, so small children are pulled in rather than costing their
-parent the VM.  What cannot be pulled in is a child that captures something a
-virtualized ancestor owns; that child unselects its parent, and the removal
-runs to a fixpoint from the leaves up.
+parent the VM.  What cannot be pulled in is a child that cannot be encoded at
+all, which unselects its parent, and its parent's parent.
 """
 
 import os
@@ -317,28 +323,51 @@ def test_a_native_parent_sees_one_stub_per_prototype():
 # where the line falls
 # ---------------------------------------------------------------------------
 
-def test_a_capturing_child_keeps_its_parent_native():
-    """The refusal is per child, and it costs the parent -- with a reason the
-    report can print."""
-    src = ("local x = 3\n" + DIRECT +
-           "local function outer(n)\n"
-           "  local function withcap(k)\n"
-           "    local s = 0\n"
-           "    for i = 1, k do s = s + i + x end\n"
-           "    return s\n"
-           "  end\n"
-           "  local t = 0\n"
-           "  for i = 1, n do t = t + withcap(i) end\n"
-           "  return t\n"
-           "end\n"
-           "print(outer(4))\n")
-    out = build(src, Config(reproducible_seed=81, vm_closures=True,
-                            vm_upvalues=True), name="cl.luau", verify=True)
+CAPTURING = ("local x = 3\n" + DIRECT +
+             "local function outer(n)\n"
+             "  local function withcap(k)\n"
+             "    local s = 0\n"
+             "    for i = 1, k do s = s + i + x end\n"
+             "    return s\n"
+             "  end\n"
+             "  local t = 0\n"
+             "  for i = 1, n do t = t + withcap(i) end\n"
+             "  return t\n"
+             "end\n"
+             "print(outer(4))\n")
+
+
+def test_a_capturing_child_runs_with_its_parent():
+    """R5's fourth increment: the child captures a global of its parent's, and
+    both of them run in the VM anyway -- the interpreter builds the accessor
+    itself, over the frame slot it owns."""
+    out = build(CAPTURING, Config(reproducible_seed=81, vm_closures=True,
+                                  vm_upvalues=True), name="cl.luau",
+                verify=True)
+    assert out.stats.virtualized == 2, out.stats.native_reasons
     reasons = " ".join(out.stats.native_reasons)
-    assert "captures" in reasons, out.stats.native_reasons
+    assert "captures" not in reasons, out.stats.native_reasons
     if not TOOLCHAIN.can_execute:
         pytest.skip("luau runtime not available")
-    want = execute(TOOLCHAIN, src, "want.luau", timeout=30)
+    want = execute(TOOLCHAIN, CAPTURING, "want.luau", timeout=30)
+    got = execute(TOOLCHAIN, out.source, "got.luau", timeout=60)
+    assert got.stdout == want.stdout, (want.stdout[:200], got.stdout[:200],
+                                       got.stderr[:300])
+
+
+def test_a_capturing_child_still_needs_vm_upvalues():
+    """The refusal that is left, and the only one: without ``vm_upvalues`` a
+    capturing child is out, because the accessors are that increment's
+    machinery.  The report names the flag rather than just counting."""
+    out = build(CAPTURING, Config(reproducible_seed=81, vm_closures=True,
+                                  vm_upvalues=False), name="cl.luau",
+                verify=True)
+    assert out.stats.virtualized == 0, out.stats.native_reasons
+    reasons = " ".join(out.stats.native_reasons)
+    assert "vm_upvalues" in reasons, out.stats.native_reasons
+    if not TOOLCHAIN.can_execute:
+        pytest.skip("luau runtime not available")
+    want = execute(TOOLCHAIN, CAPTURING, "want.luau", timeout=30)
     got = execute(TOOLCHAIN, out.source, "got.luau", timeout=60)
     assert got.stdout == want.stdout
 
@@ -421,11 +450,18 @@ def test_a_whole_subtree_comes_in_or_the_parent_stays_native():
                "print(outer(6))\n")
     out = build(blocked, Config(reproducible_seed=91, vm_closures=True,
                                 vm_upvalues=True), name="cl.luau", verify=True)
-    # Not one of the three: the innermost captures, so its parent cannot be
-    # built, so its parent's parent cannot either.
-    assert out.stats.virtualized == 0, out.stats.native_reasons
-    reasons = " ".join(out.stats.native_reasons)
-    assert "captures" in reasons, out.stats.native_reasons
+    # All three, not none of them: R5's fourth increment builds the innermost
+    # capture over its parent's frame, so a capture is no longer what takes a
+    # tree out of the VM.  What still takes one out is a child that cannot be
+    # encoded at all, and with the capture servable there is nothing left here
+    # to refuse.
+    assert out.stats.virtualized == 3, out.stats.native_reasons
+    if not TOOLCHAIN.can_execute:
+        pytest.skip("luau runtime not available")
+    want = execute(TOOLCHAIN, blocked, "want.luau", timeout=30)
+    got = execute(TOOLCHAIN, out.source, "got.luau", timeout=60)
+    assert got.stdout == want.stdout, (want.stdout[:200], got.stdout[:200],
+                                       got.stderr[:300])
 
 
 def test_a_closure_lands_in_its_parents_group():
@@ -490,3 +526,203 @@ def test_maximum_profile_across_seeds():
         got = execute(TOOLCHAIN, out.source, "got.luau", timeout=120)
         assert got.returncode == 0, (seed, got.stderr[:400])
         assert got.stdout == want.stdout, (seed, got.stdout[:200])
+
+
+
+# ---------------------------------------------------------------------------
+# the capturing half (R5's fourth increment)
+# ---------------------------------------------------------------------------
+#
+# Everything above draws the line at a child that captures.  This section is
+# the other side of it: a child that captures a variable its virtualized
+# parent owns, which lives in a frame table no Luau closure can see -- unless
+# the closure is built by the interpreter that owns the frame, which is what
+# makes it work.  The tests are about the three ways a capture has to be
+# served, and about the semantics that are easy to get wrong in each.
+
+
+def test_a_capturing_child_sees_the_parents_live_variable():
+    """Reads through the accessor are live, not a copy: the child is created
+    before the parent writes again, and it sees the later value."""
+    src = (DIRECT +
+           "local function outer(n)\n"
+           "  local scale = 3\n"
+           "  local function scale_it(x) return x * scale end\n"
+           "  local t = 0\n"
+           "  for i = 1, n do t = t + scale_it(i) end\n"
+           "  return t\n"
+           "end\n"
+           "print(outer(4))\n"
+           "print(outer(1))\n")
+    # 3 * (1+2+3+4) = 30, and 3 again for n = 1 -- not the 4 of `n`, which is
+    # what an off-by-one in the frame slot reads.
+    _equivalent(src, seed=7, expect_virtualized=2)
+
+
+def test_a_capturing_child_writes_through_to_the_parent():
+    """The setter closes over the same slot, so a write the child makes is a
+    write the parent sees.  A snapshot would lose every one of them."""
+    src = (DIRECT +
+           "local function outer(n)\n"
+           "  local count = 0\n"
+           "  local function bump() count += 1 end\n"
+           "  for i = 1, n do bump() end\n"
+           "  return count\n"
+           "end\n"
+           "print(outer(5))\n"
+           "print(outer(0))\n")
+    _equivalent(src, seed=7, expect_virtualized=2)
+
+
+def test_two_children_share_the_variable_they_capture():
+    """Both accessors close over one slot, so the two children are looking at
+    one variable and not at two copies of it."""
+    src = (DIRECT +
+           "local function outer(n)\n"
+           "  local total = 0\n"
+           "  local function add(x) total += x end\n"
+           "  local function get() return total end\n"
+           "  for i = 1, n do add(i) end\n"
+           "  return get()\n"
+           "end\n"
+           "print(outer(5))\n")
+    _equivalent(src, seed=7, expect_virtualized=3)
+
+
+def test_a_loop_variable_is_captured_per_iteration():
+    """Luau gives every iteration its own loop variable, so a closure declared
+    in the body captures *that* iteration's value.  The frame slot keeps
+    moving, so the accessor has to close over a cell holding a snapshot."""
+    src = (DIRECT +
+           "local function outer(n)\n"
+           "  local fns = {}\n"
+           "  for i = 1, n do\n"
+           "    fns[i] = function() return i * i end\n"
+           "  end\n"
+           "  local s = 0\n"
+           "  for j = 1, n do s = s + fns[j]() end\n"
+           "  return s\n"
+           "end\n"
+           "print(outer(3))\n"
+           "print(outer(1))\n")
+    # 1 + 4 + 9 == 14.  A shared slot answers 9 + 9 + 9, or 1 + 1 + 1.
+    _equivalent(src, seed=7, expect_virtualized=2)
+
+
+def test_a_capture_relayed_through_a_virtualized_parent():
+    """The child names a variable its parent only has as an upvalue of its
+    own.  The interpreter relays the parent's accessor pair rather than
+    re-deriving one, so a chain ends where the native site built it."""
+    src = ("local x = 7\n" + DIRECT +
+           "local function mid(n)\n"
+           "  local function inner(v) return v + x end\n"
+           "  local s = 0\n"
+           "  for i = 1, n do s = s + inner(i) end\n"
+           "  return s\n"
+           "end\n"
+           "print(mid(3))\n")
+    _equivalent(src, seed=7, expect_virtualized=2)
+
+
+def test_three_levels_with_the_capture_at_the_bottom():
+    """A capture two frames down: the deepest prototype names a variable of
+    the outermost one, relayed through the middle."""
+    src = (DIRECT +
+           "local function outer(n)\n"
+           "  local k = 2\n"
+           "  local function mid(x)\n"
+           "    local function deep(y) return y * k + x end\n"
+           "    return deep(x) + 1\n"
+           "  end\n"
+           "  local t = 0\n"
+           "  for i = 1, n do t = t + mid(i) end\n"
+           "  return t\n"
+           "end\n"
+           "print(outer(4))\n")
+    _equivalent(src, seed=7, expect_virtualized=3)
+
+
+def test_a_capturing_closure_outlives_its_parents_frame():
+    """The closure is handed back to native code and called after the frame
+    that built it is gone.  The slot it closed over has to stay reachable,
+    which it does because the closure holds the frame -- not a copy of it."""
+    src = (DIRECT +
+           "local function make(scale)\n"
+           "  local function apply(x) return x * scale end\n"
+           "  return apply\n"
+           "end\n"
+           "local f = make(5)\n"
+           "print(f(3), f(4))\n")
+    _equivalent(src, seed=7, expect_virtualized=2)
+
+
+def test_a_capturing_child_is_a_fresh_value_every_time():
+    """Luau builds a new closure each time a capturing closure expression is
+    evaluated -- the opposite of the non-capturing case, which it hoists.
+    Two closures from one site are therefore different values, and a build
+    that shared one stub would answer `==` differently."""
+    src = (DIRECT +
+           "local function outer(n)\n"
+           "  local first = nil\n"
+           "  local same = 0\n"
+           "  for i = 1, n do\n"
+           "    local f = function() return n end\n"
+           "    if first == nil then\n"
+           "      first = f\n"
+           "    elseif first == f then\n"
+           "      same += 1\n"
+           "    end\n"
+           "  end\n"
+           "  return same\n"
+           "end\n"
+           "print(outer(4))\n")
+    _equivalent(src, seed=7, expect_virtualized=2)
+
+
+def test_a_capturing_child_is_handed_to_native_code():
+    """table.sort calls back into the VM-built closure from C.  The value the
+    interpreter builds has to be an ordinary Luau function, not something
+    only the interpreter can call."""
+    src = (DIRECT +
+           "local function rank(words)\n"
+           "  local bias = 2\n"
+           "  local function score(w) return #w + bias end\n"
+           "  table.sort(words, function(a, b) return score(a) < score(b) end)\n"
+           "  return table.concat(words, \",\")\n"
+           "end\n"
+           "print(rank({\"aaa\", \"a\", \"aaaaa\", \"aa\"}))\n"
+           "print(rank({\"xx\", \"y\"}))\n")
+    _equivalent(src, seed=7, expect_virtualized=3)
+
+
+def test_the_capturing_half_under_the_maximum_profile():
+    """Every knob at once, several groups, seeds 1..3: the capture table rides
+    the same plan as everything else, and a group that is not group 0 has to
+    build its own accessors from its own frame."""
+    src = (DIRECT +
+           "local function outer(n)\n"
+           "  local scale = 3\n"
+           "  local function helper(x)\n"
+           "    local s = 0\n"
+           "    for i = 1, x do s = s + i * scale end\n"
+           "    return s\n"
+           "  end\n"
+           "  local t = 0\n"
+           "  for i = 1, n do t = t + helper(i) end\n"
+           "  return t\n"
+           "end\n"
+           "print(outer(4))\n")
+    if not TOOLCHAIN.can_execute:
+        pytest.skip("luau runtime not available")
+    want = execute(TOOLCHAIN, src, "want.luau", timeout=30)
+    for seed in (1, 2, 3):
+        config = Config.maximum()
+        config.reproducible_seed = seed
+        config.vm_closures = True
+        config.vm_upvalues = True
+        out = build(src, config, name="cl.luau", verify=True)
+        assert out.stats.virtualized >= 2, out.stats.native_reasons
+        got = execute(TOOLCHAIN, out.source, "got.luau", timeout=120)
+        assert got.returncode == 0, got.stderr[:300]
+        assert got.stdout == want.stdout, (seed, want.stdout[:200],
+                                           got.stdout[:200])

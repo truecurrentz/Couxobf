@@ -262,9 +262,86 @@ def _body(op: str, fam: Family, n: Dict[str, str], fmt: FormatSpec,
         # the descriptor table is keyed by; the mask travels as a literal
         # rather than as a table, so the artifact carries no map from
         # prototype to interpreter.
+        # Every name here is read tolerantly, and for one reason: a caller may
+        # hand in a partial name table (the tests do, to pin the names a
+        # failure should report), and the arm is generated for every opcode in
+        # the map whether or not this build will ever run it.  An undeclared
+        # name is a nil global in Luau, which is harmless for a table this arm
+        # only ever looks up a key in -- and a KeyError at *build* time is not
+        # harmless at all.
         stubs = n.get("stubs") or "stubs"
-        return fam.store("R[a]", "%s[bit32.bxor(pid, %d)]"
-                         % (stubs, int(row_mask) & 0xffffffff))
+        caps = n.get("caps") or "caps"
+        snaps = n.get("snaps") or "snaps"
+        rows = n.get("rows") or "rows"
+        uvs = n.get("uvs") or "uvs"
+        getter = n.get("getfenv") or "getfenv"
+        setter = n.get("setfenv") or "setfenv"
+        enter = n.get("enter") or "enter"
+        key = "bit32.bxor(pid, %d)" % (int(row_mask) & 0xffffffff)
+        # R5's fourth increment: a child that *captures* has no stub in the
+        # table, because the accessors it needs close over this frame -- the
+        # parent's register slots, or the parent's own accessor list for an
+        # upvalue the parent relays.  Nothing outside the running interpreter
+        # can name those, so the stub is built here, at the closure site, and
+        # it is built fresh: Luau gives a capturing closure a new identity per
+        # evaluation, unlike the hoisted, non-capturing case above.
+        return [
+            # ``and`` because either table may be absent: a build with no
+            # capturing child emits no descriptor table at all, and an
+            # undeclared name in Luau is a nil global rather than a syntax
+            # error -- which is the friendliest possible failure to debug and
+            # the least friendly to leave in a shipped artifact.
+            "local _zc = %s and %s[%s]" % (caps, caps, key),
+            "if not _zc then",
+        ] + ["  " + _l for _l in fam.store("R[a]", "%s[%s]" % (stubs, key))] + [
+            "else",
+            "  local _zu = {}",
+            "  for _zi = 1, #_zc do",
+            "    local _zd = _zc[_zi]",
+            "    if _zd > 0 then",
+            # A plain local of the parent's: live, not a copy.  Both closures
+            # close over the frame, so a write by either side is seen by the
+            # other -- which is what the native path's accessors do over the
+            # owner's register.  Registers captured by a closure are pinned at
+            # lowering time (``_FuncBuilder.captured``), so the slot is never
+            # handed to a sibling after the block that owns it closes.
+            # One-based, like every other register the frame holds: the entry
+            # point lays the parameters down at R[1..n], so register 0 of the
+            # prototype is never a slot anything reads.
+            "      local _zs = _zd",
+            "      _zu[_zi * 2 - 1] = function() return R[_zs] end",
+            "      _zu[_zi * 2] = function(_zv) R[_zs] = _zv end",
+            "    else",
+            # An upvalue of the parent's: relay its accessor pair rather than
+            # re-deriving it, so a chain of captures ends at the same closures
+            # the native site built, whatever depth it started at.
+            "      local _zu2 = -_zd - 1",
+            "      _zu[_zi * 2 - 1] = R.%s[_zu2 * 2 + 1]" % uvs,
+            "      _zu[_zi * 2] = R.%s[_zu2 * 2 + 2]" % uvs,
+            "    end",
+            "  end",
+            # A loop variable is fresh per iteration in Luau, so a closure
+            # declared in the body captures *that* iteration's value.  The
+            # frame slot keeps moving, so the accessor closes over a cell
+            # holding a snapshot taken now instead.
+            "  local _zn = %s and %s[%s]" % (snaps, snaps, key),
+            "  if _zn then",
+            "    for _zj = 1, #_zn do",
+            "      local _zk = _zn[_zj]",
+            "      local _zcell = { R[_zc[_zk + 1]] }",
+            "      _zu[_zk * 2 + 1] = function() return _zcell[1] end",
+            "      _zu[_zk * 2 + 2] = function(_zv) _zcell[1] = _zv end",
+            "    end",
+            "  end",
+            # setfenv, not getfenv: this closure is born inside the
+            # interpreter, so its inherited environment is the interpreter's
+            # and not the parent's.  E is the environment the parent's frame
+            # was entered with, which is the one a child of it should see.
+        ] + ["  " + _l for _l in fam.store(
+            "R[a]", "%s(function(...) return %s(%s[%s], %s(1), _zu, ...) end, E)"
+            % (setter, enter, rows, key, getter))] + [
+            "end",
+        ]
     if op in _ARITH:
         sym = _ARITH[op]
         if variant % 3 == 1:
@@ -952,6 +1029,11 @@ def interpreter_source(opmap: OpcodeMap, names: Dict[str, str],
         # sees the real globals -- including getfenv itself.  Measured: calling
         # it through the swapped env fails with "attempt to call a nil value".
         f"local {n['getfenv']} = getfenv",
+        # setfenv for the same reason, and for one more: R5's fourth increment
+        # builds a capturing child's entry stub *inside* the interpreter, whose
+        # environment is not the virtualised parent's.  Held in a local so a
+        # swapped environment cannot take it away from the build.
+        f"local {n.get('setfenv') or 'setfenv'} = setfenv",
         f"local {n['call']} = function(R, base, argc, tail)",
         "  local f = R[base]",
         "  if tail >= 0 then",

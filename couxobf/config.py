@@ -210,9 +210,11 @@ class Config:
     #: build its entry stub from its own locals -- and a virtualized prototype
     #: takes its virtualizable subtree in with it, because the interpreter has
     #: no function value for a child left native and a helper is usually too
-    #: small to earn a place of its own.  A child that captures is refused:
-    #: its captured variables would have to live in a VM frame, which no Luau
-    #: closure can see.  Off by default for the same reason ``vm_upvalues``
+    #: small to earn a place of its own.  A child that captures is served by
+    #: accessors the interpreter builds over the parent's frame -- the one
+    #: place that can see it -- which is why capturing children need
+    #: ``vm_upvalues`` as well: it is the same accessor machinery.  Off by
+    #: default for the same reason ``vm_upvalues``
     #: is: it is new machinery, and tests/test_vm_closures.py is the gate.
     vm_closures: bool = False
     #: Keep control-flow edges out of the instruction stream: the payload
