@@ -30,6 +30,7 @@ import struct
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from .crypto.cipher import CipherSpec, default_spec
 from .crypto.kdf import KeyMaterial
 from .crypto.protected import ENC_DOMAIN, MAC_DOMAIN, open_, seal
 from .rng import Rng
@@ -226,13 +227,17 @@ class SealedPool:
     mask_add: int
     mask_shift: int
     count: int
+    #: The drawn cipher, carried so the emitter and the report describe the
+    #: payload the artifact actually carries.
+    cipher: Any = None
 
     def open_plaintext(self) -> bytes:
         """Decrypt on the Python side -- used to cross-check the Luau runtime."""
         from .crypto.protected import open_
 
         return open_(self.key, self.nonce, self.ciphertext, self.tag, self.aad,
-                     enc_domain=self.enc_domain, mac_domain=self.mac_domain)
+                     enc_domain=self.enc_domain, mac_domain=self.mac_domain,
+                     cipher=self.cipher)
 
 
 class ConstantPool:
@@ -250,6 +255,7 @@ class ConstantPool:
         numeric_level: int = 0,
         enc_domain: bytes = None,
         mac_domain: bytes = None,
+        cipher: Any = None,
     ) -> None:
         if cache_policy not in CACHE_POLICIES:
             raise ConstantPoolError(f"unknown cache policy {cache_policy!r}")
@@ -262,6 +268,10 @@ class ConstantPool:
         self.numeric_level = max(0, min(3, int(numeric_level)))
         self.enc_domain = enc_domain
         self.mac_domain = mac_domain
+        #: Which stream cipher this pool is sealed with.  Drawn per build --
+        #: see :mod:`couxobf.crypto.cipher`.  ``None`` means the historical
+        #: ChaCha20 form.
+        self.cipher = cipher if cipher is not None else default_spec()
         self._values: List[Any] = []
         self._index: Dict[Tuple[Any, ...], int] = {}
         self._sealed: Optional[SealedPool] = None
@@ -398,7 +408,8 @@ class ConstantPool:
         mac_domain = self.mac_domain if self.mac_domain is not None else MAC_DOMAIN
         nonce_out, ciphertext, tag = seal(key, plaintext, aad, nonce=nonce,
                                           enc_domain=enc_domain,
-                                          mac_domain=mac_domain)
+                                          mac_domain=mac_domain,
+                                          cipher=self.cipher)
         self._sealed = SealedPool(
             key=key,
             nonce=nonce_out,
@@ -411,6 +422,7 @@ class ConstantPool:
             mask_add=self._mask_add,
             mask_shift=self._mask_shift,
             count=len(self._values),
+            cipher=self.cipher,
         )
         return self._sealed
 

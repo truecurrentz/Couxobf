@@ -296,7 +296,11 @@ def test_fixpoint_unselects_a_proto_whose_upvalue_home_is_virtualized():
     # Forced blessing: everything "encodes", so the home lands in the
     # selection and the fixpoint must evict the capturing prototype.
     saved = _encode.can_virtualize
-    _encode.can_virtualize = lambda proto, fmt=None, upvalues_ok=False: (True, "")
+    # ``closures_ok`` in the signature because the selector passes it: R5's
+    # third increment added it, and a stand-in that drops keyword arguments
+    # would break here rather than in the feature it is standing in for.
+    _encode.can_virtualize = lambda proto, fmt=None, upvalues_ok=False, \
+        closures_ok=False: (True, "")
     try:
         chosen = pipeline._select_for_vm(module, _All(), upvalues_ok=True)
     finally:

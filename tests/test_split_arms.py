@@ -21,7 +21,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from couxobf import lower_back, parser
+from couxobf import ast_nodes, lower_back, parser
 from couxobf.config import Config
 from couxobf.pipeline import build
 from couxobf.rng import Rng
@@ -58,6 +58,10 @@ def _enc(mode, salt, mul, modulus, block_id):
         return (block_id - salt) % modulus
     if mode == 2:
         return (((block_id + salt) * mul) + (salt % 251)) % modulus
+    if mode == 3:
+        return ((block_id * mul) % modulus) + salt
+    if mode == 4:
+        return ((block_id + salt) * mul) % modulus
     return ((block_id * mul) + salt) % modulus
 
 
@@ -100,6 +104,138 @@ def test_every_decoy_state_is_unreachable_and_arms_stay_unique():
                 assert len(satisfiable) == 1
                 assert not any(v == _enc(mode, salt, mul, mod, block_id)
                                for _b, v, _t in log["decoys"])
+
+
+def _walk(node):
+    """Every AST node under `node`, parents first."""
+    yield node
+    for _field, value in getattr(node, "__dict__", {}).items():
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                if hasattr(item, "__dict__"):
+                    yield from _walk(item)
+                elif isinstance(item, tuple):
+                    for sub in item:
+                        if hasattr(sub, "__dict__"):
+                            yield from _walk(sub)
+        elif hasattr(value, "__dict__"):
+            yield from _walk(value)
+
+
+def _drivers(root):
+    """Classify every flattened driver in a reconstructed module.
+
+    A driver is a loop whose body opens with the dispatch ``if``: the
+    counter/selector is compared against the encoded block states.  Returns
+    one record per driver, described by what an analyst would actually see.
+    """
+    out = []
+    for loop in _walk(root):
+        if not isinstance(loop, (ast_nodes.While, ast_nodes.Repeat)):
+            continue
+        body = loop.body.body
+        if not body:
+            continue
+        dispatch = None
+        for stmt in body:
+            if isinstance(stmt, ast_nodes.If) and len(stmt.arms) >= 1:
+                dispatch = stmt
+                break
+        if dispatch is None:
+            continue
+        conds = [arm[0] for arm in dispatch.arms]
+        # Encoded state compares the counter itself; raw state compares an
+        # arithmetic image of it -- either inline as a compound Bin, or, for
+        # the binary search, hoisted into a local ahead of the tree.
+        hoisted = any(isinstance(s, ast_nodes.Local) and s.values
+                      and isinstance(s.values[0], ast_nodes.Bin)
+                      for s in body)
+        state = "encoded"
+        if hoisted or any(isinstance(c.left, ast_nodes.Bin) for c in conds
+                          if isinstance(c, ast_nodes.Bin)):
+            state = "raw"
+        if isinstance(loop, ast_nodes.Repeat):
+            skeleton = "repeat"
+        elif isinstance(loop.cond, ast_nodes.Bool):
+            skeleton = "while_break"
+        else:
+            skeleton = "while"
+        ops = {c.op for c in conds if isinstance(c, ast_nodes.Bin)}
+        out.append({
+            "state": state,
+            "skeleton": skeleton,
+            "dispatch": "binary" if "<" in ops else "chain",
+        })
+    return out
+
+
+def test_the_driver_shape_is_drawn_not_fixed():
+    """Weakness #4: the flattened driver must not be one repeated signature.
+
+    One shape on every function -- `while pc do if (pc*mul+salt)%65536 == ...`
+    -- is a fingerprint no matter how the constants are drawn, so the state,
+    the loop skeleton and the dispatch are drawn per function too.  This pins
+    that they really vary, and that the AST a reader sees agrees with what the
+    build recorded.
+    """
+    seen_shapes = set()
+    seen_states = set()
+    for seed in range(16):
+        rec = lower_back.Reconstructor()
+        rec.vm_layout_rng = Rng(bytes([(seed * 11 + i) & 0xFF for i in range(16)]))
+        rec.split_arms_rate = 0.0          # shape, not decoys
+        root = rec.reconstruct(_module())
+        logs = list(rec.split_log)
+        assert logs, seed
+        drivers = _drivers(root)
+        assert len(drivers) == len(logs), (seed, len(drivers), len(logs))
+        for log in logs:
+            shape = (log["state"], log["skeleton"], log["dispatch"])
+            seen_shapes.add(shape)
+            seen_states.add(log["state"])
+            assert log["state"] in ("raw", "encoded"), log
+            assert log["skeleton"] in ("while", "while_break", "repeat"), log
+            assert log["dispatch"] in ("chain", "binary"), log
+            assert log["shuffled"] in (True, False), log
+        # The AST has to show what the log claims: one driver per flattened
+        # proto, of the shape that was drawn for it.
+        for record, log in zip(drivers, logs):
+            assert record["state"] == log["state"], (seed, record, log)
+            assert record["skeleton"] == log["skeleton"], (seed, record, log)
+            assert record["dispatch"] == log["dispatch"], (seed, record, log)
+    # Every dimension must actually move over a handful of builds.
+    assert len(seen_shapes) >= 6, sorted(seen_shapes)
+    assert seen_states == {"raw", "encoded"}, sorted(seen_states)
+    assert {shape[1] for shape in seen_shapes} == {"while", "while_break", "repeat"}
+    assert {shape[2] for shape in seen_shapes} == {"chain", "binary"}
+
+
+def test_encoded_state_drivers_never_carry_a_bare_block_id():
+    """The counter of an encoded driver holds an image, never a block id.
+
+    If any transition escaped the fold, the driver would fall through to its
+    terminating arm and the function would silently return nil -- which is why
+    the fold is keyed by the counter's own name and not by whichever prototype
+    the lowering happens to be inside.
+    """
+    for seed in range(24):
+        rec = lower_back.Reconstructor()
+        rec.vm_layout_rng = Rng(bytes([(seed * 7 + i * 3) & 0xFF for i in range(16)]))
+        rec.split_arms_rate = 1.0
+        root = rec.reconstruct(_module())
+        for log in rec.split_log:
+            if log["state"] != "encoded":
+                continue
+            image = set(log["encoded"])
+            for block_id in log["block_ids"]:
+                # Encoded state: the values in the arms are the image, and the
+                # reachable states are exactly that image.
+                assert _enc(log["mode"], log["salt"], log["mul"], log["modulus"],
+                            block_id) in image
+            # ...so a bare block id reaching the counter would have to be an
+            # image element by coincidence; require the image to be well away
+            # from the small dense block ids, or the check means nothing.
+            assert min(image) > max(log["block_ids"]) or not set(log["block_ids"]) & image
 
 
 def test_no_rate_means_no_arms_and_no_log_decoys():

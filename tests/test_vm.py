@@ -72,6 +72,20 @@ NAMES = {
     "vnp": "_kVn",
     # R5's second increment: frame key holding the upvalue accessor list
     "uvs": "_kUv",
+    # R5's third increment: the descriptor row table, and the table of
+    # per-prototype entry stubs a CLOSURE arm indexes to find the child it is
+    # handing out
+    "rows": "_kRw",
+    "stubs": "_kSb",
+    # R5's fourth increment: the capture descriptors a CLOSURE arm reads to
+    # find out whether the child it is creating captures at all, the per-entry
+    # reading of them -- live, snapshot, or cell -- and the local alias for
+    # setfenv -- held in a local for the same reason getfenv is, plus one of
+    # its own: the stub a capturing child gets is born inside the interpreter,
+    # so its inherited environment is the interpreter's and not the parent's.
+    "caps": "_kCp",
+    "kinds": "_kKd",
+    "setfenv": "_kSe",
 }
 
 
@@ -129,7 +143,7 @@ _DESCRIPTOR_TABLE = "_kVT"
 _TABLES = (_DESCRIPTOR_TABLE, "_kKT", "_kET", "_kRT")
 
 
-def _lit(value) -> str:
+def _lit(value, pid=None) -> str:
     """A constant as Luau source, through the printer's own literal rules.
 
     Going through the printer rather than ``repr`` matters for the bytecode
@@ -274,9 +288,18 @@ def test_encoded_stream_walks_clean():
             # the ISA can carry -- including those two.  The walk only reads
             # bytes; the accessor closures exist at the stub, not in the
             # stream, so nothing here needs a runtime to run them.
-            if not encode.can_virtualize(proto, upvalues_ok=True)[0]:
+            # ``closures_ok`` on purpose, for the same reason as
+            # ``upvalues_ok``: CLOSURE has been encodable since R5's third
+            # increment, and the walk's job is to prove the encoder and
+            # ``operand_size`` agree for every opcode the ISA can carry.  A
+            # prototype that creates closures is only *selected* in a build
+            # that asked for them, which is a different question -- the bytes
+            # are the same either way.
+            if not encode.can_virtualize(proto, upvalues_ok=True,
+                                         closures_ok=True)[0]:
                 continue
-            enc = encode.encode_proto(proto, opmap, upvalues_ok=True)
+            enc = encode.encode_proto(proto, opmap, upvalues_ok=True,
+                                      closures_ok=True)
             pc, code = enc.lua_entry - 1, enc.code
             while pc < len(code):
                 name = opmap.to_op[code[pc]]
@@ -343,7 +366,14 @@ def test_identity_map_starts_at_one():
 # ---------------------------------------------------------------------------
 
 def _corpus():
+    from tests.corpus import REPO_CORPUS
     files = sorted(glob.glob(os.path.join(MICRO_DIR, "*.luau")))
+    # The repo-local corpus always runs, exactly as in the pipeline suite:
+    # it is written and versioned here, so a checkout with no upstream Luau
+    # source tree still walks enough real programs for the coverage floors
+    # below to mean something (R0).
+    files += [p for p in REPO_CORPUS
+              if os.path.basename(p) not in {os.path.basename(f) for f in files}]
     conf = _conformance_dir()
     if conf:
         files += sorted(glob.glob(os.path.join(conf, "*.luau")))
@@ -527,7 +557,8 @@ def test_vm_row_keys_are_build_specific_tickets():
     assert plan.row_key(7) != 7
     src = wiring.prelude_source(
         plan, {7: type("E", (), {"code": b"abc", "consts": (), "edges": ()})()},
-        const_expr=lambda v: "nil", code_expr=lambda b: '"abc"')
+        const_expr=lambda v, pid=None: "nil",
+        code_expr=lambda b, pid=None: '"abc"')
     assert "[%d]" % plan.row_key(7) in src
     assert "[7] = { code" not in src
 
@@ -986,6 +1017,7 @@ def test_required_ops_over_approximates_rather_than_guesses():
     from couxobf.vm.format import FusionRule
 
     src = "local function f(a) return a + 1 end\nprint(f(2))\n"
+    mangled_src = src
     module = ir.Lowerer().lower(parser.parse(src, "over.luau"))
     proto = next(q for q in _all_protos(module) if q.proto_id == 1)
     plain = encode.required_ops(proto)
@@ -997,13 +1029,32 @@ def test_required_ops_over_approximates_rather_than_guesses():
     assert {"LOADK", "ADD"} <= both
     # A prototype whose instructions cannot all be named gets no answer at all,
     # which the caller reads as "do not narrow" -- the fail-safe direction, since
-    # the alternative is a group with a handler missing.
-    m2 = ir.Lowerer().lower(parser.parse(
-        "local function g(...)<NEWLINE>  local n = select(2, ...)\n  return n\nend\n"
-        "print(g(1, 2))\n".replace("<NEWLINE>", " "), "var.luau"))
-    unknown = [q for q in _all_protos(m2)
+    # the alternative is a group with a handler missing.  Every IR opcode now
+    # has a VM entry (CLOSURE got one in R5's third increment), so the branch is
+    # reached through the other thing it exists for: an instruction whose
+    # operand count disagrees with the opcode it claims to be.
+    broken = ir.Lowerer().lower(parser.parse(mangled_src, "arity.luau"))
+    victim = next(q for q in _all_protos(broken) if q.proto_id == 1)
+    victim.blocks[0].instrs[0].args = victim.blocks[0].instrs[0].args[:1]
+    unknown = [q for q in _all_protos(broken)
                if encode.required_ops(q) is None]
     assert unknown, "expected a prototype required_ops cannot answer for"
+    # And the closure subtree is folded in only when the caller asks: a
+    # prototype that creates closures needs its children's opcodes in the same
+    # group, which is what ``children`` is for.
+    tree = ir.Lowerer().lower(parser.parse(
+        "local function outer(n)\n"
+        "  local function child(x)\n"
+        "    return x * 2\n"
+        "  end\n"
+        "  return child(n) + 1\n"
+        "end\n"
+        "print(outer(3))\n", "tree.luau"))
+    outer = next(q for q in _all_protos(tree) if q.proto_id == 1)
+    # MUL is the child's alone -- the parent adds and calls, so seeing it in
+    # the parent's answer is the subtree having been folded in.
+    assert ir.OP.MUL not in encode.required_ops(outer, children=False)
+    assert ir.OP.MUL in encode.required_ops(outer, children=True)
 
 
 def test_permuted_arms_test_the_same_numbers_in_a_different_order():
@@ -1099,10 +1150,15 @@ def test_every_handler_body_uses_only_declared_names(op):
                                  spec)
         declared, used = _handler_names(lines)
         # multi-value packs arrive as table fields; a `for` loop's control
-        # variable is declared by the loop header itself
+        # variable is declared by the loop header itself, and a function's
+        # parameter by its signature -- which is how the accessor closures a
+        # capturing child needs name the value they are handed.
         for line in lines:
             m = re.match(r"\s*for\s+([A-Za-z_][A-Za-z0-9_]*)", line)
             if m:
+                declared.add(m.group(1))
+            for m in re.finditer(r"function\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)",
+                                 line):
                 declared.add(m.group(1))
         free = sorted(n for n in used - declared - _LUAU_GLOBALS
                       # helper locals are named through the NAMES dict
@@ -1171,3 +1227,58 @@ def test_a_jump_leaves_pc_where_its_own_mode_measures_from(fmt):
         elif op in runtime._NO_ADVANCE:
             assert "pc = tgt + 1" in lines, (
                 f"{op} transfers control without setting pc from the target")
+
+
+def test_fresh_names_share_one_history():
+    """Two draws from one build must not be able to hand out the same name.
+
+    ``used`` is the shared history: it is reserved against and updated, so a
+    later draw cannot repeat an earlier one.  This pins the threading itself,
+    deterministically.
+    """
+    rng = rngmod.Rng(bytes(range(16)))
+    used = set()
+    first = wiring._fresh_names(rng, 8, used=used)
+    second = wiring._fresh_names(rng, 8, used=used)
+    assert len(set(first)) == 8
+    assert len(set(second)) == 8
+    assert not set(first) & set(second), (first, second)
+    assert used == set(first) | set(second)
+
+
+def test_plan_names_are_unique_across_every_draw():
+    """A plan's tables, roles and per-group entry points must all differ.
+
+    `make_plan` draws them in four separate calls, and each call used to build
+    its own :class:`NameGenerator` with an empty history -- so nothing stopped
+    two of them from handing out the same identifier.  The second declaration
+    shadows the first wherever both are in scope, and the artifact then raises
+    at the first call instead of running.  It took roughly one build in three
+    thousand to hit, which is often enough to ship and rare enough that no
+    test caught it: the sweep that found it was a `pcall` fixture printing
+    `attempt to index function with number` because a prototype table and an
+    entry point had both been named the same thing.
+
+    Unthreaded, about 2% of plans collide -- 39 of the 2000 below -- so this
+    loop is not a needle in a haystack.  The check reads the drawn names
+    directly rather than executing anything, because the failure is a
+    collision of *names*, not of semantics.
+    """
+    for seed in range(400):
+        rng = rngmod.Rng(bytes([(seed * 13 + i * 5) & 0xFF for i in range(16)]))
+        plan = wiring.make_plan(rng, [0, 1, 2], variety=2)
+        drawn = [plan.table, plan.consts_table, plan.edges_table,
+                 plan.rows_table]
+        # ``rows`` is excluded because it is not a drawn name: it is the row
+        # table's own identifier, listed in ``plan.names`` so the interpreter's
+        # CLOSURE arm can index it.  Counting it would report a collision
+        # between a table and itself.
+        drawn += [value for key, value in plan.names.items()
+                  if key not in ("append", "iter", "iterpack", "itercheck",
+                                 "rows")]
+        for group in plan.groups:
+            drawn += [group.names["exec"], group.names["enter"]]
+        dupes = sorted({name for name in drawn if drawn.count(name) > 1})
+        assert not dupes, (
+            "seed %d drew the same VM identifier twice (%s): the second "
+            "declaration shadows the first" % (seed, ", ".join(dupes)))

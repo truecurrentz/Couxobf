@@ -52,7 +52,7 @@ import struct
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..crypto.chacha20 import chacha20_xor
+from ..crypto.cipher import CipherSpec, default_spec
 from ..crypto.protected import ENC_DOMAIN, MAC_DOMAIN, open_ as _open
 from ..crypto.protected import seal as _seal
 from ..rng import Rng
@@ -139,14 +139,20 @@ class StringBank:
                  per_occurrence: bool = True,
                  randomized_ids: bool = False,
                  enc_domain: bytes = None,
-                 mac_domain: bytes = None) -> None:
-        if page_size < 64:
-            raise StringBankError("page size must be at least 64 bytes")
-        if page_size % 64 != 0:
-            # The keystream is addressed in 64-byte blocks; a page size that is
+                 mac_domain: bytes = None,
+                 cipher: Any = None) -> None:
+        # The block size is the drawn cipher's, not a constant of the tool:
+        # a build that drew AES-128 seeks its keystream in 16-byte blocks, so
+        # the page geometry has to be expressed in the same unit.
+        self.cipher = cipher if cipher is not None else default_spec()
+        block = self.cipher.block_size
+        if page_size < block:
+            raise StringBankError(f"page size must be at least {block} bytes")
+        if page_size % block != 0:
+            # The keystream is addressed in cipher blocks; a page size that is
             # not a multiple would make page and block boundaries interact in
             # ways the runtime does not model.
-            raise StringBankError("page size must be a multiple of 64")
+            raise StringBankError(f"page size must be a multiple of {block}")
         self.keys = keys
         self.rng = rng
         self.context = context
@@ -272,7 +278,7 @@ class StringBank:
         # around without changing how it decrypts.
         stream_nonce = self.rng.bytes(12)
         key = self.keys.region_key("string-bank", self._region)
-        cipher = chacha20_xor(key, stream_nonce, flat, counter=1)
+        cipher = self.cipher.xor_bytes(key, stream_nonce, flat, counter=1)
 
         order = list(range(page_count))
         self.rng.shuffle(order)          # order[stored] = logical
@@ -297,7 +303,8 @@ class StringBank:
         nonce, ct, tag = _seal(ticket_key, ticket_plain, ticket_aad,
                                nonce=self.rng.bytes(12),
                                enc_domain=enc_domain,
-                               mac_domain=mac_domain)
+                               mac_domain=mac_domain,
+                               cipher=self.cipher)
 
         self._sealed = SealedBank(
             blob=bytes(blob),
@@ -349,7 +356,7 @@ class StringBank:
                                            b"tickets\0" + self._region),
                       sealed.ticket_nonce, sealed.ticket_ct, sealed.ticket_tag,
                       sealed.ticket_aad, enc_domain=sealed.enc_domain,
-                      mac_domain=sealed.mac_domain)
+                      mac_domain=sealed.mac_domain, cipher=self.cipher)
         if plain is None:
             raise StringBankError("ticket table failed authentication")
         tickets, page_count, page_size = struct.unpack_from(">III", plain, 0)
@@ -393,10 +400,11 @@ class StringBank:
             in_page = offset - logical_page * page_size
             ct = sealed.blob[stored * page_size + in_page:
                              stored * page_size + in_page + length]
-            block = offset // 64
-            intra = offset % 64
-            ks = chacha20_xor(key, sealed.stream_nonce,
-                              bytes(intra + length), counter=1 + block)
+            block = offset // self.cipher.block_size
+            intra = offset % self.cipher.block_size
+            ks = self.cipher.xor_bytes(key, sealed.stream_nonce,
+                                       bytes(intra + length),
+                                       counter=1 + block)
             masked = _xor(ct, ks[intra:])
             out += _xor(masked, _mask_bytes(seed, length, sealed.mask_mul,
                                            sealed.mask_add, sealed.mask_shift))

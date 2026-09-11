@@ -140,7 +140,8 @@ class EncodedProto:
 
 
 def can_virtualize(proto: FuncIR, fmt: Optional[FormatSpec] = None,
-                   upvalues_ok: bool = False) -> Tuple[bool, str]:
+                   upvalues_ok: bool = False,
+                   closures_ok: bool = False) -> Tuple[bool, str]:
     """Whether this prototype can run in the VM, and why not if it cannot.
 
     The boundary is about *reachability*: the VM frame is an ordinary table, so
@@ -159,6 +160,14 @@ def can_virtualize(proto: FuncIR, fmt: Optional[FormatSpec] = None,
     prototype (the pipeline enforces that; this function cannot see the
     module).
 
+    ``closures_ok`` is R5's third increment: a prototype that *creates*
+    closures may run in the VM when every child captures nothing, because a
+    child with no upvalues needs no state from the frame it was born in -- the
+    interpreter can build its entry stub from nothing but its own locals.  A
+    child that captures is still refused, and a virtualized parent demands
+    that every child be virtualized too (the selector enforces that; this
+    function cannot see the module).
+
     ``fmt`` adds the size constraints that belong to a *format*: a jump target
     has to fit in the field that carries it, and an absolute target has to fit
     in the widest field, which is why the check runs here rather than as an
@@ -169,8 +178,21 @@ def can_virtualize(proto: FuncIR, fmt: Optional[FormatSpec] = None,
         return False, "main chunk bootstraps the runtime"
     if proto.num_regs > MAX_REGISTERS:
         return False, f"{proto.num_regs} registers exceeds the VM's {MAX_REGISTERS}"
-    if proto.children:
+    if proto.children and not closures_ok:
         return False, "creates closures"
+    if proto.children:
+        for child in proto.children:
+            if child.upvalues and not upvalues_ok:
+                # R5's fourth increment builds the accessors *inside* the
+                # interpreter, over the parent's frame slots rather than over
+                # native locals, so a capturing child is servable -- but it is
+                # the same accessor machinery ``vm_upvalues`` gates, and a
+                # build that has not asked for it does not get it.
+                return False, ("creates a closure that captures; building its "
+                               "accessors in the VM needs `vm_upvalues` too")
+            if fmt is not None and child.proto_id > fmt.max_wide(("w", "proto")):
+                return False, (f"closure {child.proto_id} does not fit the wire "
+                               f"format")
     if proto.upvalues and not upvalues_ok:
         return False, "captures upvalues"
     if proto.upvalues:
@@ -518,6 +540,13 @@ def _field_values(ins: Instr, op: str, fmt: FormatSpec, nconsts: int,
         values[("r", 0)] = r(0)
         packed = int(a[1]) if len(a) > 1 else 0
         values[("w", "packed")] = _wide(packed, op, "packed", limit)
+    elif op == OP.CLOSURE:
+        # args are (dst, child prototype); the operand is the child's id, and
+        # the interpreter turns it into a descriptor row key.  Carried raw
+        # rather than pre-masked because the mask lives with the plan, and the
+        # encoder only sees the IR.
+        values[("r", 0)] = r(0)
+        values[("w", "proto")] = _wide(int(a[1].proto_id), op, "proto", limit)
     else:  # pragma: no cover - can_virtualize rejects anything unsupported
         raise EncodingError(f"{op} has no encoder")
     return values
@@ -529,7 +558,8 @@ def _instruction_size(ins: Instr, fmt: Optional[FormatSpec] = None) -> int:
 
 
 def required_ops(proto: FuncIR, fmt: Optional[FormatSpec] = None, *,
-                 permuted_blocks: bool = False) -> Optional[Set[str]]:
+                 permuted_blocks: bool = False,
+                 children: bool = False) -> Optional[Set[str]]:
     """The VM opcodes one prototype needs, or None if it cannot be answered here.
 
     This is the input to per-group instruction sets: a group that only runs three
@@ -562,6 +592,17 @@ def required_ops(proto: FuncIR, fmt: Optional[FormatSpec] = None, *,
                 return None
     if permuted_blocks:
         ops.add(OP.JMP)
+    # R5's third increment: a prototype that creates closures carries its
+    # children's opcodes too, because the children run in this group as well
+    # (the grouping puts a child with its parent).  A superset is the safe
+    # direction here for the same reason it is for fusion rules.
+    if children:
+        for child in proto.children:
+            got = required_ops(child, fmt, permuted_blocks=permuted_blocks,
+                               children=True)
+            if got is None:
+                return None
+            ops |= got
     for rule in spec.fused:
         ops.add(rule.first)
         ops.add(rule.second)
@@ -573,7 +614,8 @@ def encode_proto(proto: FuncIR, opmap: OpcodeMap,
                  fmt: Optional[FormatSpec] = None,
                  rng: Any = None,
                  alias_chance: float = 0.0,
-                 upvalues_ok: bool = False) -> EncodedProto:
+                 upvalues_ok: bool = False,
+                 closures_ok: bool = False) -> EncodedProto:
     """Encode one prototype.  Raises if it cannot be virtualized.
 
     ``order`` is the block emission order, as a sequence of block ids.  It
@@ -587,7 +629,8 @@ def encode_proto(proto: FuncIR, opmap: OpcodeMap,
     against a chosen format.
     """
     spec = fmt if fmt is not None else LEGACY_SPEC
-    ok, reason = can_virtualize(proto, spec, upvalues_ok=upvalues_ok)
+    ok, reason = can_virtualize(proto, spec, upvalues_ok=upvalues_ok,
+                                closures_ok=closures_ok)
     if not ok:
         raise EncodingError(f"prototype {proto.proto_id} is not virtualizable: "
                             f"{reason}")

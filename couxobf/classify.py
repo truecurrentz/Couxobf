@@ -236,11 +236,16 @@ def classify_module(module: IRModule, config: Config, rng: Rng,
         else:
             level = _level_for(value, cap, config)
             reason = f"score {value:.1f}"
-        # A prototype that creates closures cannot yet be virtualized above
-        # LIGHT: the VM would have to build a closure whose upvalues point into
-        # VM state, and that path is not implemented.  Excluding it is honest;
-        # silently miscompiling it would not be.
-        if proto.closure_count > 0 and level > int(VirtualizationLevel.LIGHT):
+        # R5's third increment: with ``vm_closures`` a prototype that creates
+        # closures runs in the VM like any other, so the cap is gone and the
+        # decision moves to the encoder -- which is the only place that can
+        # see whether the children capture.  It refuses the ones that do, and
+        # the report prints why, so nothing is silently miscompiled either way.
+        # Without the flag the old line stands: a closure-creating prototype
+        # cannot be virtualized above LIGHT, because the VM would have to
+        # build a closure whose upvalues point into VM state.
+        if (proto.closure_count > 0 and not getattr(config, "vm_closures", False)
+                and level > int(VirtualizationLevel.LIGHT)):
             level = int(VirtualizationLevel.LIGHT)
             reason += "; creates closures; capped at LIGHT"
 

@@ -17,6 +17,7 @@ They are not; see ``docs/SECURITY.md``.
 """
 
 import glob
+import itertools
 import math
 import os
 import struct
@@ -38,6 +39,8 @@ from couxobf.crypto.kdf import KeyMaterial
 from couxobf.runtime.constpool_runtime import (
     FAILURE_MESSAGE, ConstantPoolRuntime, default_names)
 from couxobf.rng import make_domains, new_seed
+from couxobf.config import Config
+from couxobf.pipeline import build
 from couxobf.toolchain import find_toolchain, execute
 
 TOOLCHAIN = find_toolchain()
@@ -237,11 +240,19 @@ def test_reproducible_for_a_fixed_seed():
 # the Luau decoder
 
 
-def _luau_checks(names, sealed, values):
-    """Build a script that reads every slot and prints whether it is correct."""
-    rt = ConstantPoolRuntime(names, cache_policy="full")
-    src = rt.emit(sealed.key, sealed.nonce, sealed.tag, sealed.ciphertext, sealed.aad)
-    lines = [f"local v{i} = {rt.accessor}({i})" for i in range(1, len(values) + 1)]
+def _luau_checks(names, sealed, values, shape=None, order=None):
+    """Build a script that reads every slot and prints whether it is correct.
+
+    ``order`` reads the slots back in an order other than 1..N, which is what
+    catches an index that only works when it is walked from the start.
+    """
+    rt = ConstantPoolRuntime(names, cache_policy="full", shape=shape)
+    src = rt.emit(sealed.key, sealed.nonce, sealed.tag, sealed.ciphertext, sealed.aad,
+                  shape=shape)
+    slots = list(range(1, len(values) + 1))
+    if order == "reverse":
+        slots = list(reversed(slots))
+    lines = [f"local v{i} = {rt.accessor}({i})" for i in slots]
     for i, v in enumerate(values, start=1):
         if isinstance(v, float) and math.isnan(v):
             lines.append(f'print({i}, v{i} ~= v{i})')
@@ -276,6 +287,62 @@ def test_luau_decoder_matches_python(policy):
     assert len(lines) == len(TRICKY)
     bad = [l for l in lines if not l.rstrip().endswith("true")]
     assert not bad, f"policy={policy}: {bad}"
+
+
+@pytest.mark.parametrize("order", ["forward", "reverse"])
+def test_every_drawn_decoder_shape_decodes_the_same_pool(order):
+    """The decoder's shape is drawn per region, so every combination has to work.
+
+    Three axes: whether the entry offsets are built all at load time or scanned
+    forward on demand, how the ticket mask is folded back into a slot number,
+    and whether a type byte reaches its materializer through an if-chain or a
+    table.  All twelve decode the same pool -- they exist so two regions of one
+    artifact are not the same runtime with the names changed.
+
+    Reading the slots backwards is the case the incremental scan has to get
+    right: it can only walk forward, so a slot already passed has to have been
+    remembered.
+    """
+    if not TOOLCHAIN.can_execute:
+        pytest.skip("luau runtime not available")
+    pool = make_pool()
+    for v in TRICKY:
+        pool.slot(v)
+    sealed = pool.seal()
+    combos = [
+        dict(zip(ConstantPoolRuntime.SHAPES, pick))
+        for pick in itertools.product(*ConstantPoolRuntime.SHAPES.values())
+    ]
+    assert len(combos) == 12, combos
+    for shape in combos:
+        src = _luau_checks(default_names(), sealed, TRICKY, shape=shape,
+                           order=order)
+        result = execute(TOOLCHAIN, src, "pool.luau", timeout=30)
+        assert result.returncode == 0, "%s: %s" % (shape, result.stderr[:400])
+        lines = [l for l in result.stdout.strip().split("\n") if l.strip()]
+        assert len(lines) == len(TRICKY), (shape, len(lines))
+        bad = [l for l in lines if not l.rstrip().endswith("true")]
+        assert not bad, f"shape={shape} order={order}: {bad}"
+
+
+def test_the_shape_draw_really_varies():
+    """A shape that never moves is a fixed signature with extra steps.
+
+    One build draws one shape per region; across builds every axis has to
+    appear.
+    """
+    seen = {key: set() for key in ConstantPoolRuntime.SHAPES}
+    for seed in range(24):
+        result = build("local a = 1\nprint(a)\n",
+                       Config(reproducible_seed=seed), name="s.luau",
+                       verify=False)
+        for region in result.runtime_names.get("pool_regions") or ():
+            drawn = dict(zip(sorted(ConstantPoolRuntime.SHAPES),
+                             region["shape"].split("/")))
+            for key, value in drawn.items():
+                seen[key].add(value)
+    for key, allowed in ConstantPoolRuntime.SHAPES.items():
+        assert seen[key] == set(allowed), (key, sorted(seen[key]))
 
 
 def test_runtime_literals_are_masked_fragments_not_whole_blobs():
@@ -660,3 +727,96 @@ def test_the_context_binds_the_pool_to_a_build_and_nothing_else_does():
         open_pool(b.key, b.nonce, a.ciphertext, a.tag, b.aad)
     with pytest.raises(Exception):
         open_pool(a.key, a.nonce, a.ciphertext, a.tag, b.aad)
+
+
+# ---------------------------------------------------------------------------
+# R6: per-group pool regions
+#
+
+
+def _variety_build(name="maze.luau", variety=2, seed=41):
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "..", "examples", name), encoding="utf-8") as fh:
+        # The size ceiling is off: at 24x this example has already given up
+        # its second group, and a test that asked for two and got one would
+        # be asserting nothing.
+        return build(fh.read(), Config(reproducible_seed=seed,
+                                       vm_variety=variety,
+                                       max_output_growth=0),
+                     name=name, verify=False)
+
+
+def test_a_virtualized_build_seals_one_region_per_group_plus_native():
+    """R6: the constants stop sharing one blob and one accessor.
+
+    Recovering one accessor used to yield every constant in the program.  With
+    the split it yields one region's worth, and the report says how many
+    regions the build actually carries rather than implying there is one.
+    """
+    result = _variety_build()
+    regions = result.runtime_names["pool_regions"]
+    labels = [r["label"] for r in regions]
+    assert "native" in labels, labels
+    groups = [r for r in regions if r["label"].startswith("vm group")]
+    assert len(groups) >= 2, labels          # variety=2
+    assert sum(r["protos"] for r in groups) == result.stats.virtualized
+    # Every region is a different sealed structure: different accessor, and a
+    # different AAD, which is the only thing that makes them different pools
+    # rather than one pool declared twice.
+    gets = [r["get"] for r in regions]
+    aads = [r["aad"] for r in regions]
+    assert len(set(gets)) == len(gets), gets
+    assert len(set(aads)) == len(aads), aads
+    for get in gets:
+        assert get in result.source
+    assert "constant pools" in result.report
+
+
+def test_a_blob_lifted_from_one_region_does_not_open_in_another():
+    """The property the split is for, tested rather than asserted.
+
+    Each region is authenticated against the format that reads it -- a group's
+    pool against that group's interpreter -- so a blob moved between regions
+    fails the tag instead of returning the constants of another group.  The
+    contexts here are the ones the build uses: the group fingerprint, not the
+    whole-plan digest, which is what would let group 0's blob open under
+    group 1 inside the same artifact.
+    """
+    from couxobf.crypto.protected import open_ as open_pool
+    from couxobf.constpool import ConstantPool
+    from couxobf.crypto.kdf import KeyMaterial
+    from couxobf.rng import Rng, make_domains
+
+    seed = b"\x71" * 16
+    keys = KeyMaterial.from_seed(seed)
+    contexts = {}
+    result = _variety_build()
+    for region in result.runtime_names["pool_regions"]:
+        contexts[region["label"]] = bytes.fromhex(region["aad"])
+
+    def sealed_with(tag: bytes):
+        pool = ConstantPool(keys, Rng(seed), b"region:" + tag,
+                            cache_policy="none")
+        for value in REAL:
+            pool.slot(value)
+        return pool.seal()
+
+    sealed = {label: sealed_with(label.encode() + aad)
+              for label, aad in contexts.items()}
+    for label, s in sealed.items():
+        assert decode_pool(open_pool(s.key, s.nonce, s.ciphertext, s.tag,
+                                     s.aad, enc_domain=s.enc_domain,
+                                     mac_domain=s.mac_domain,
+                                     cipher=s.cipher))
+    labels = list(sealed)
+    for source in labels:
+        for target in labels:
+            if source == target:
+                continue
+            with pytest.raises(Exception):
+                open_pool(sealed[target].key, sealed[target].nonce,
+                          sealed[source].ciphertext, sealed[source].tag,
+                          sealed[target].aad,
+                          enc_domain=sealed[source].enc_domain,
+                          mac_domain=sealed[source].mac_domain,
+                          cipher=sealed[source].cipher)

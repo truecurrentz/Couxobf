@@ -51,6 +51,13 @@ const SPEC = [
        "the native code uses, so reads and writes stay live and shared with any " +
        "native sibling. A capture whose owner is itself virtualized still keeps " +
        "the function native. Off by default."],
+      ["vm_closures", "Virtualize functions that build closures", "bool",
+       "Lets a virtualized function create closures of its own, when the " +
+       "children it creates capture nothing: the interpreter hands out the " +
+       "child's entry point instead of the source declaring it. The children " +
+       "run in the VM too, and stay in their parent's group, so the artifact " +
+       "carries no table mapping functions to interpreters. A child that " +
+       "captures still keeps its parent native. Off by default."],
     ],
   },
   {

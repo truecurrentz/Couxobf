@@ -261,8 +261,13 @@ def test_environment_guard_is_separate_from_vm_entry():
     check = out.runtime_names["guard"]["locals"]["check"]
     # The entry point's signature is ``enter(p, env, uvs, ...)`` since R5's
     # second increment added the upvalue accessor list as a third argument.
+    # It is *assigned* rather than declared as a ``local function`` since the
+    # third: the name is declared before the interpreter so its CLOSURE arm can
+    # call it, which is the only way an arm inside ``exec`` can see a local
+    # that ``exec`` is written above.
     enters = re.findall(
-        r"local function \w+\(p,\s*\w+,\s*\w+,\s*\.\.\.\)(.{0,140})",
+        r"(?:local function \w+|\w+\s*=\s*function)\(p,\s*\w+,\s*\w+,"
+        r"\s*\.\.\.\)(.{0,140})",
         out.source, re.S)
     assert enters, "no VM entry points in a build that virtualized functions"
     for head in enters:

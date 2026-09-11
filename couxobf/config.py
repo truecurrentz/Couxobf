@@ -204,6 +204,19 @@ class Config:
     #: accessor closures are new machinery and the fixture list in
     #: tests/test_vm_upvalues.py is the gate that argues for turning it on.
     vm_upvalues: bool = False
+    #: R5's third increment: virtualize a function that *creates* closures.
+    #: Only children that capture nothing qualify -- a child with no upvalues
+    #: needs nothing from the frame it was born in, so the interpreter can
+    #: build its entry stub from its own locals -- and a virtualized prototype
+    #: takes its virtualizable subtree in with it, because the interpreter has
+    #: no function value for a child left native and a helper is usually too
+    #: small to earn a place of its own.  A child that captures is served by
+    #: accessors the interpreter builds over the parent's frame -- the one
+    #: place that can see it -- which is why capturing children need
+    #: ``vm_upvalues`` as well: it is the same accessor machinery.  Off by
+    #: default for the same reason ``vm_upvalues``
+    #: is: it is new machinery, and tests/test_vm_closures.py is the gate.
+    vm_closures: bool = False
     #: Keep control-flow edges out of the instruction stream: the payload
     #: carries an ordinal and the destinations live in their own blob.
     edge_indirection: bool = True
@@ -457,6 +470,7 @@ class Config:
         "opcode_cipher",
         "vm_isa_subset",
         "vm_upvalues",
+        "vm_closures",
         "edge_indirection",
         "dispatcher_family",
         "metadata_fragmentation",

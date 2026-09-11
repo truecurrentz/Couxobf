@@ -103,7 +103,9 @@ class StringBankRuntime:
         return self.n["get"]
 
     def emit(self, sealed, crypto_src: str = "", guard_check: str = "",
-             ticket_mask: int = 0, dense: Any = None) -> str:
+             ticket_mask: int = 0, dense: Any = None,
+             block_size: int = 64, cipher: Any = None,
+             shape_rng: Any = None) -> str:
         n = self.n
         ticket_mask &= 0xffffffff
         def fail(site: bytes) -> str:
@@ -140,7 +142,8 @@ class StringBankRuntime:
                                              "mac": n["c_mac"], "open": n["c_open"],
                                              "seal": n["c_seal"]},
                                             enc_domain=getattr(sealed, "enc_domain", None),
-                                            mac_domain=getattr(sealed, "mac_domain", None))
+                                            mac_domain=getattr(sealed, "mac_domain", None),
+                                            cipher=cipher, rng=shape_rng)
             head = f"local {n['crypto']} = (function()\n{crypto_src}end)()\n"
         else:
             # The constant pool already declared it; a second copy would be a
@@ -189,6 +192,11 @@ class StringBankRuntime:
 
         blob_expr = (dense.expr(sealed.blob) if dense is not None
                      else byte_literal(sealed.blob))
+        # The keystream block size this build's cipher advances by.  It is a
+        # build constant, not a constant of the tool: a ChaCha20 build seeks
+        # in 64-byte blocks and an AES-128 build in 16-byte ones, and the
+        # runtime has to divide by the same number the encoder did.
+        block = int(block_size)
         return f"""{head}local {n['blob']} = {blob_expr}
 local {meta_name} = {{{meta_rows}}}
 local function {unwrap_name}(v, m)
@@ -255,8 +263,8 @@ local function {n['frag']}({n['f_off']}, {n['f_len']}, {n['f_seed']})
   local {n['f_inpage']} = {n['f_off']} - {n['f_page']} * {n['psize']}
   local {n['f_at']} = ({n['f_stored']} - 1) * {n['psize']} + {n['f_inpage']}
   local {n['f_ct']} = string.sub({n['blob']}, {n['f_at']} + 1, {n['f_at']} + {n['f_len']})
-  local {n['f_block']} = {n['f_off']} // 64
-  local {n['f_intra']} = {n['f_off']} - {n['f_block']} * 64
+  local {n['f_block']} = {n['f_off']} // __BLOCK_SIZE__
+  local {n['f_intra']} = {n['f_off']} - {n['f_block']} * __BLOCK_SIZE__
   local {n['f_ks']} = {n['crypto']}.{n['c_xor']}({unwrap_name}({meta_name}[{meta_index['skey']}], {n['blob']} .. {meta_name}[{meta_index['btag']}] .. {meta_name}[{meta_index['snonce']}]), {meta_name}[{meta_index['snonce']}], string.rep("\\0", {n['f_intra']} + {n['f_len']}), 1 + {n['f_block']})
   local {n['f_out']} = table.create({n['f_len']})
   for i = 1, {n['f_len']} do
@@ -322,4 +330,4 @@ local function {n['resolve_alt2']}(ticket)
   end
   return out
 end
-{cache_block}"""
+{cache_block}""".replace("__BLOCK_SIZE__", str(block))

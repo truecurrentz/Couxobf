@@ -246,9 +246,20 @@ crypto, text-level hacks).
   ISA subset from `required_ops`. Block permutation + in-block reorder.
   Build-time `integrity.payload` walk validates every payload against its own
   group's format.
-- **Native reconstruction.** Multi-block prototypes are *always* emitted as a
-  `while pc do if/elseif ...` state machine with one of three affine state
-  encodings drawn per function; single-block bodies stay straight-line.
+- **Constants.** One sealed region per VM group plus one for the native code
+  (R6), each with its own key, prefix, ticket mask, accessor and drawn decoder
+  *shape* (R7), and each authenticated against the format that reads it.
+  Strings that reach the bank are fragmented across shuffled pages and
+  addressed per occurrence.
+- **Native reconstruction.** Multi-block prototypes are emitted as a flattened
+  state machine whose *shape* is drawn per function, not only its constants:
+  the counter holds either a raw block id -- and arms compare one of five
+  arithmetic images of it -- or an encoded image, in which case no encoding
+  expression is emitted at all and arms compare the counter directly;
+  dispatch is either a flat equality chain or a balanced binary search over
+  the image; the driver loop is a `while` on the counter, an infinite loop
+  exited with `break`, or a `repeat/until`. Arm order is shuffled on some
+  functions. Single-block bodies stay straight-line.
 - **Honest gaps (config-declared, not wired).** `opaque_predicates` emits one
   boundary tautology only; `vm_variety` is pinned to 1 in `pipeline.py` (the
   maximum profile's `vm_variety=3` is silently ignored — a real defect);
@@ -334,16 +345,17 @@ P3 = polish. Each item names the axes above.
 | R2 | Real opaque predicates + opaque dispatch arms (build-keyed, never foldable, never dead) | `opaque_predicates` is a tautology today; docs admit the gap | **P1 — done** (VM tap + native split arms) |
 | R3 | Regression automation: reuse-audit thresholds as a test; seeded differential fuzz battery | "detect and prevent regressions automatically" | **P0/P1** |
 | R4 | Dense blob encoding: per-build 85-alphabet encoder for pool/bank/payload literals | `\xHH` = 4 chars/byte; hello.luau at 739×; size ceiling forces dropping real protection | **P1 — done** |
-| R5 | Closure-capable virtualization (upvalues via accessor closures behind `vm_upvalues`; varargs via frame field) | our biggest coverage gap vs Prometheus/Clyde | **P2 — varargs and upvalues done; nested closures next** |
-| R6 | Per-group constant pools with group-format AAD binding | one recovered accessor currently yields all constants | **P2** |
+| R5 | Closure-capable virtualization (upvalues via accessor closures behind `vm_upvalues`; varargs via frame field; nested closures behind `vm_closures`) | our biggest coverage gap vs Prometheus/Clyde | **P2 — done: varargs, upvalues, and nested closures whether or not the children capture (151 of 201 corpus prototypes, up from 88)** |
+| R6 | Per-group constant pools with group-format AAD binding | one recovered accessor currently yields all constants | **P2 — done** |
 | R7 | Exact integer arithmetic number encoding (split/add/fold) behind `numeric_protection_level=2` | numbers currently only get float-safe disguises | **P2 — done** |
 | R8 | `--!couxobf:` directives (`no_virtualize`, `virtualize`) | per-function user control, Luaq parity | **P2 — done** |
 | R9 | Index-to-number pass for provably-static table keys (opt-in) | structural transform at zero runtime cost | **P3 — done** |
 | R10 | Inline-small-helpers AST pass (opt-in, node cap) | glue-code reduction, Luaq parity | **P3** |
 | R11 | Dispatcher speed option: inlined-chain dispatch for small groups | 2 closure calls/instruction is slow | **P2 — done** |
 | R12 | Remove dead config surface; every remaining field either wired or gone (see G) | 15 pending fields erode trust in the report | **P1 — done** |
+| R13 | Per-region pool decoder shape: draw how the decoder finds an entry, folds a ticket and dispatches a type byte | R6 gave every region its own key but the same decoder code, so one pattern-match gets them all | **P2 — done** |
 
-Status: R0, R1, R2, R3, R4, R7, R8, R9, R11 and R12 are implemented and measured
+Status: R0, R1, R2, R3, R4, R6, R7, R8, R9, R11, R12 and R13 are implemented and measured
 (see `docs/benchmarks.md`); the fuzz battery is in
 `tests/test_fuzz_differential.py`, and the reuse-audit's verdict is pinned
 as a regression test in `tests/test_reuse_regression.py`.  Everything else
@@ -535,7 +547,7 @@ skip-threshold behaviour, and dense-vs-hex differential on a real example.
 *Default.* On, with the threshold escape above; `Config.blob_encoding =
 "dense" | "hex"` is wired through the API option surface and the web form.
 
-### R5 — Closure-capable virtualization (P2 — varargs and upvalues done)
+### R5 — Closure-capable virtualization (P2 — varargs, upvalues and nested closures done)
 
 *Problem.* `can_virtualize` refuses any prototype with upvalues, varargs, or
 nested closures — i.e. most real Roblox code (callbacks, state objects).
@@ -565,7 +577,8 @@ capturing function with is emitted at the closure site, which puts it
 lexically inside the scope owning the captured variables. It builds, per
 upvalue, a getter and a setter closure over the same expression the native
 reconstruction uses to reach that variable (the owner's register slot, or the
-per-iteration snapshot local where Luau's semantics demand one) and passes
+local holding that iteration's value or cell where Luau's semantics demand
+one) and passes
 the list as a third `enter` argument; `GETUPVAL`/`SETUPVAL` call through it.
 Because the accessors target the very storage native siblings use, reads and
 writes are live and consistent by construction — including a native write
@@ -573,7 +586,9 @@ landing between two of the child's reads, and two VM siblings sharing one
 counter. The cell-table design would have rewritten the parent's accesses to
 go through a cell; the accessor design needs no parent rewrite at all, and
 per-iteration capture comes free because the stub is created per iteration
-and captures the snapshot local. The one line that does not move: an upvalue
+and captures the snapshot local -- or, where the closure writes the variable,
+the cell the parent allocated at the declaration, which is what that local
+holds. The one line that does not move: an upvalue
 whose home prototype is itself virtualized has storage no Luau closure can
 see, so the selector removes such prototypes — a fixpoint, since the relation
 is circular. Today the fixpoint cannot fire (a home creates a closure, which
@@ -584,13 +599,144 @@ sibling pair, per-iteration capture of a loop variable, two upvalues with a
 local, capture composed with varargs, `pcall` through a VM closure,
 relay-chained captures through native scopes, and the refusal paths.
 
-*Still to come (nested closures).* A virtualized prototype that creates
-closures of its own is still refused. The uncaptured children are the easy
-half (hoistable as constants); children captured by later code need VM-state
-cells visible to Luau closures, which is the hard case and the reason the
-cell model was not thrown away above. `can_virtualize` grew a capability flag
-(`upvalues_ok`) instead of a blanket refusal; the classifier keeps the size
-floor.
+*As built (nested closure increment).* A virtualized prototype may now create
+closures of its own -- when the children it creates capture nothing. A child
+with no upvalues needs nothing from the frame it was born in, so the
+interpreter can hand out its entry stub itself: `CLOSURE d, pid` stores
+`stubs[pid ^ row_mask]` in a register, and the stub is the same plain Luau
+function the native reconstruction would have emitted at the closure site.
+Two constraints come with it, and both are the point rather than the price.
+
+The first: the children have to come into the VM with their parent. The
+interpreter can name a descriptor row or nothing -- it has no function value
+for a child left native -- so a virtualized prototype takes its whole
+virtualizable subtree in with it, however small the children are. Refusing
+the parent instead was the first implementation, and measuring it is what
+changed the rule: a nested helper is almost always below the classifier's
+size floor *on its own*, so "every child must already be selected" left the
+flag able to prove itself only on functions whose helpers were large -- and a
+comparator, a callback or a helper beside the loop that calls it is exactly
+the small case. The other half of the rule is the refusal: a child that
+cannot be built in the VM at all (it captures something a virtualized
+ancestor owns) unselects its parent, and that unravels upwards from the
+leaves, so a tree is all-or-nothing and the report prints the *child's*
+refusal as the parent's reason. Deciding it takes no fixpoint, because
+everything a prototype's decision depends on is a fact about its ancestors:
+encodability is computed bottom-up, then the set is decided top-down. The second: a child
+belongs to its parent's
+*group*, because the parent's CLOSURE arm names this interpreter's entry
+point, and the artifact carries no map from prototype to interpreter. With
+`vm_variety > 1` a closure tree is therefore one indivisible unit, and the
+group count is capped by the number of trees rather than the number of
+prototypes: a request for three VMs against one tree is really a request for
+one, and emitting two interpreters for one tree would be dead weight an
+analyst could read for free.
+
+One thing this increment had to get right that is not about closures at all.
+Luau hoists a closure that captures nothing: `f == f` holds across iterations
+of the loop that declares it, and across calls of the function containing it.
+A stub built per execution answers that differently and silently -- nothing
+raises, the comparison is simply false -- and the old code built one per
+closure site for *every* virtualized prototype, including a leaf declared
+inside a native loop. The stubs are now built once per prototype in the
+prelude and keyed by descriptor row, so both paths agree with plain Luau.
+Capturing prototypes are excluded from the table on purpose: their stub closes
+over accessor closures built at the site, and Luau gives those a fresh closure
+per execution anyway. That divergence predates this increment; sharing the
+stub is what closes it.
+
+*As built (the capturing half).* The line the increment above drew was "a
+child that captures nothing", and the reason for it was sound: the variables a
+capturing child names would have to live in a VM frame, which is a table no
+Luau closure can see. What that argument missed is that one place *can* see
+the frame -- the interpreter running the parent, which owns it. So the
+accessor is built there instead of at a native closure site: `CLOSURE` looks
+the child up in a capture table and, when it finds one, builds a getter and a
+setter closing over `R[slot]` and hands the pair to the interpreter as the
+child's upvalue list, exactly the list the native path builds. Three ways a
+capture is served, because three things can be captured:
+
+*a plain local of the parent's* -- live, not a copy. Both closures close over
+the frame, so a write by either side is seen by the other, which is what a
+captured variable means and what the accessor design already did for reads and
+writes across the native boundary.
+
+*a loop variable* -- Luau gives every iteration its own, so a closure declared
+in the body captures *that* iteration's value while the frame slot keeps
+moving. The accessor therefore closes over a cell holding a snapshot taken at
+the moment the closure is created. This is the per-iteration cell, and it
+lands exactly where the old sketch put it.
+
+*an upvalue of the parent's* -- relayed, not re-derived. The interpreter hands
+the child the parent's own accessor pair, so a chain of captures ends where
+the native site built it however deep it started.
+
+Two consequences worth stating. The stub is born inside the interpreter, whose
+environment is not the parent's, so it is `setfenv`'d to the environment the
+parent's frame was entered with. And it is built fresh every time `CLOSURE`
+runs, where the non-capturing case hands out one shared stub: Luau gives a
+capturing closure a new identity per evaluation and hoists a non-capturing
+one, so the two paths have to differ or `f == f` starts lying.
+
+One shape the snapshot does *not* reach, and the reason the cell exists: a
+closure that *writes* the loop-body local it captured. Reading and writing
+pull in opposite directions here -- a per-iteration copy is right for a
+reader, and wrong for two closures sharing a counter within one iteration --
+so a captured loop-body local is not represented by its register at all. It
+becomes a cell: one table allocated at the declaration, which is the one place
+that runs exactly once per iteration, whose single field is the variable, and
+through which every access goes, the loop body's own included. A reader gets
+the iteration's value because the table is the iteration's; a writer shares it
+with every other closure of that iteration because they all captured the same
+table. Both halves of the rule the old sketch had to choose between, from one
+representation.
+
+The rewrite is a pass over the finished body, because which locals a closure
+captured is only known once it is finished, and it is confined to the range
+where the register *is* the variable: a register is scratch before the
+declaration -- a numeric `for` spends its preheader calling the coercion
+helper with the register its body's first local is about to be handed -- and
+scratch again after the block closes, when a call may use it as an argument
+slot, which no rewrite can follow because the slot is a number in the operand
+list rather than an operand.
+
+`can_virtualize` grew two capability flags (`upvalues_ok`, `closures_ok`)
+instead of a blanket refusal; the classifier still keeps its size floor for a
+prototype standing on its own -- a child comes in under its parent rather than
+scoring its way in -- and the cap that held every closure-creating prototype at
+LIGHT now lifts with the flag. The one rule this increment had to *remove* is
+the upvalue-home fixpoint: it existed because a closure capturing a
+virtualized prototype's variable had nowhere to point, and the interpreter is
+now somewhere to point it. R5b on its own keeps the rule.
+
+*Measured.* Coverage on the repo corpus plus the examples -- 28 files, 201
+prototypes, 7 693 IR instructions -- `maximum` profile, seed 41: 88 prototypes
+(45.6 % of instructions) with both capability flags off, 118 (64.1 %) with
+`vm_upvalues`, and 151 (69.2 %) with `vm_upvalues` *and* `vm_closures`. The
+capturing half is worth more than the non-capturing one, which is the opposite
+of what the ordering suggests -- `vm_closures` alone moved the corpus 117 ->
+119 prototypes, because almost every closure in real code captures something.
+The files that move are the ones written around callbacks: `closures.luau` 2 ->
+9 prototypes (50 -> 148 instructions), `queue.luau` 6 -> 10, `parse.luau` 8 ->
+10, `errors.luau` 4 -> 6, `inventory.luau` 4 -> 6.
+
+One number in that table needed a fixture before it could be measured at all:
+the corpus had no non-capturing nested helpers in it -- `closures.luau` is
+deliberately a file of *capturing* closures -- so `tests/fixtures/corpus/helpers.luau`
+was added as the other half of the pair, and on it alone the VM goes from 1
+prototype (18 instructions) to 17 of 18 (225 of 363). Without that file the
+corpus moves 117 -> 119, which is what the third increment measured on the day
+it was written and why its selection rule changed the next day.
+
+`tests/test_vm_closures.py` is the differential gate, 27 tests: a nested
+helper, a comparator handed to `table.sort`, three levels of nesting, several
+children from one parent, a loop-declared closure, a self-calling one,
+multi-group and the `maximum` profile across seeds -- and for the capturing
+half, a live read, a write the parent sees, two children sharing one variable,
+per-iteration capture, a relay through a virtualized parent, a capture two
+frames down, a closure that outlives the frame that built it, a fresh identity
+per evaluation, a comparator called back from C, and the one refusal that is
+left (`vm_closures` without `vm_upvalues`).
 
 *Reference.* Prometheus' upvalue proxies; Clyde's `LOAD_UPVAL/STORE_UPVAL/
 CLOSE_UPVAL` with an `openUVs` table. We did it our way, at the IR level, and
@@ -609,7 +755,7 @@ is no second copy of an upvalue anywhere in the artifact for a dumper to find
 or for semantics to disagree with.
 *Test.* `tests/test_vm_upvalues.py`, differential against the source itself.
 
-### R6 — Per-group pools (P2)
+### R6 — Per-group pools (P2) — **implemented**
 
 *Problem.* One pool per artifact: recovering one accessor yields every
 constant (reviewer point #19).
@@ -620,10 +766,103 @@ constant (reviewer point #19).
 context + group fingerprint; the pool descriptor tables are fragmented per
 group (we already fragment metadata). Native code keeps one shared pool.
 
+*As built.* One sealed region per VM group plus one for everything that stayed
+native, each with its own prefix, its own ticket mask and its own accessor, so
+the regions are not visibly one runtime declared twice. Which region a constant
+is interned into is decided by the prototype it belongs to, and the VM's own
+payload reads go through the region that owns the prototype -- `prelude_source`
+hands its expression callbacks the prototype id for exactly that. Every region
+shares the one crypto module, so the split does not put a second decrypt
+routine in the artifact.
+
+*Measured.* `examples/maze.luau`, seed 41, `vm_variety=2`: three regions
+(native, group 0, group 1) holding 32, 26 and 22 constants, +13 KB over the
+single-pool build. The size ceiling (24x) gives up the second group on this
+example, so multi-group builds are rarer in default configurations than the
+knob suggests — which is a real limitation, not something the report hides.
+
 *Cost.* +1 decrypt per group at load. *Risk.* Low — pool code is unit-tested.
-*Test.* Cross-build/cross-group pool-swap tests must fail authentication;
-existing seal/open suites per group.
-*Default.* On when `vm_variety > 1`.
+*Test.* `test_a_blob_lifted_from_one_region_does_not_open_in_another` seals one
+pool per region context and cross-opens every pair; the build-level test pins
+that a `vm_variety=2` build really seals one region per group, that the
+accessors and AADs differ, and that the report says how many there are.
+*Default.* On when the artifact carries more than one VM group.  Splitting a
+single group's constants out costs a whole runtime (~5 KB on `maze.luau`), and
+the size ceiling pays for it by giving up the split arms, control-flow
+flattening and edge indirection -- measured, that trade is a loss, so one
+group keeps one pool and the split waits until there is something to split
+between.
+
+### R13 — Per-region pool decoder shape (P2) — **implemented**
+
+*Problem.* R6 gave each region its own key, prefix, ticket mask and accessor,
+but every region still ran *the same decoder code*: one offset table built in
+`load()` from a walking `q`, one `bit32.bxor` against one 4-byte mask literal,
+one if-chain on the type byte. Identifiers are drawn per build; the structure
+is not. So an artifact with three regions carries three copies of one decoder
+under different names, and a single pattern-match — or a single
+deobfuscation script written against any artifact we have shipped — gets all
+of them. That is the technique checklist's #24 ("different helper
+implementations for equivalent operations", scored ⬜ — one implementation
+each) landing on the pool, with reviewer point #19's split already in place
+and the names already drawn: what is left is the shape.
+
+*Reference.* The reference tools are worse here, not better: Prometheus,
+Ironbrew-ish derivatives and Clyde each ship one decoder shape for everyone,
+which is why "unpack the constants" scripts exist for them at all. The idea of
+drawing a shape comes from our own R11 dispatcher work and from the driver
+shapes in `lower_back.driver_shape_counts()` — the same reasoning, now applied
+to the constant pool instead of the state machine: two artifacts should not
+share recognisable machinery even when they share a design.
+
+*Change.* Three axes, drawn per region from that region's own forked RNG, and
+declared in one place (`ConstantPoolRuntime.SHAPES`) so the menu is auditable:
+
+| axis | choices | what actually differs |
+|---|---|---|
+| `offsets` | `eager` / `scan` | `eager` builds the whole entry-offset table during `load()`, as before. `scan` keeps a cursor and walks the stream forward on demand, remembering each offset as it passes it — so the artifact never holds a table of every entry position, and `load()` no longer touches the whole blob. |
+| `deticket` | `xor` / `split` / `sum` | All three are the same XOR of the same 32-bit mask. `xor` keeps the mask as one 4-byte literal (as before); `split` does two XORs with two literals whose XOR is the mask; `sum` does one XOR with the sum of two literals whose masked sum is the mask. In the last two the mask never appears as a literal at all. |
+| `material` | `chain` / `table` | `chain` dispatches the type byte through the if-chain (as before); `table` dispatches it through a table of per-type reader closures, so the decoder body carries no type tests. |
+
+Twelve combinations, all decoding the same pool. They are structural, not
+cosmetic: two of them remove the mask literal, one removes the eager offset
+table, one removes the type tests.
+
+*As built.* The shape is drawn per region where the region's RNG is already
+forked (`rng.fork("pool:" + tag)`), stored on the region, passed to
+`ConstantPoolRuntime.emit()`, and printed per region in the report — a build
+that drew `native (sum/table/eager), vm group 0 (sum/table/scan), vm group 1
+(split/table/eager)` says so. Every region still shares the one crypto module,
+so the split still does not put a second decrypt routine in the artifact.
+
+*Measured.* All twelve shapes are checked against one sealed pool in Luau,
+reading the slots forwards *and* backwards — the reverse order is the case the
+`scan` shape has to get right, since it can only walk forward and must have
+remembered a slot it already passed
+(`test_every_drawn_decoder_shape_decodes_the_same_pool`).
+`test_the_shape_draw_really_varies` pins that every axis really is drawn:
+across 24 seeds, each of the three axes takes every value it can take. Size on
+`examples/maze.luau` (seed 41, default profile): the twelve shapes span under
+1 KB, which is inside the noise of the drawn identifier lengths — the draw is
+free. Runtime: `scan` walks each entry once and memoises it, so it is O(1)
+amortised per lookup and strictly less work up front than `eager`; `table`
+trades the if-chain's average three compares for one index.
+
+*What it does not buy.* The menu is fixed at twelve and it is written down in
+this document, so an analyst who has read it knows the shapes exist. Varying
+the shape does not raise the cost of the underlying attack — find the `load()`
+call, dump the plaintext at its end — by one step; what it raises is the cost
+of writing *one* script that works against two artifacts, and the probability
+that a bytestream signature matches the family. The security still rests on
+the AEAD and on R6's per-region binding, not here. The string bank's reader is
+still one implementation (checklist #24 stays 🔶 for it), and the handlers are
+still one implementation each.
+
+*Cost.* None measurable. *Risk.* Low — the axis code is a pure restructuring
+of one emitter and every combination is differentially tested. *Default.* On,
+always: unlike R6's region split there is nothing to pay for it.
+*Test.* `tests/test_constpool.py` (the two above) plus every existing pool
+test, which now runs with a drawn shape rather than a fixed one.
 
 ### R7 — Exact integer arithmetic encoding (P2) — **implemented**
 

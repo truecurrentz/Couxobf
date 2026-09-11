@@ -48,7 +48,16 @@ _PATTERNS = {
         re.S,
     ),
     "flat_opcode_chain": re.compile(r"\b(?:if|elseif)\s+op\s*==|\bop\s*<=|\(op\s*\*\s*\d+\)\s*%"),
-    "xor_crypto": re.compile(r"bit32\.bxor|1103515|1103515245|3141786300|chacha|sha256", re.I),
+    # The keystream application is the one thing every build must contain,
+    # whichever core it drew and whatever the helpers are called: a byte of
+    # plaintext XORed with a byte of keystream and put back into a string.
+    # The name-independent half of this pattern is what still fires now that
+    # the library references are injected as parameters and the LCG constants
+    # are drawn per build; the literal markers stay because a build that leaks
+    # the words "chacha"/"sha256" is worse than one that does not.
+    "xor_crypto": re.compile(
+        r"bit32\.bxor|1103515|1103515245|3141786300|chacha|sha256"
+        r"|char\s*\(\s*[\w.:]*\bbxor\s*\(\s*[\w.:]*byte\s*\(", re.I),
     "string_decoder": re.compile(r"ticket\s*%\s*3|page\s*=\s*off\s*//|fragment", re.I),
     "constant_pipeline": re.compile(r"\b(?:plain|perm|index|psize)\b.{0,80}\b(?:string\.unpack|page|ticket)", re.S),
 }

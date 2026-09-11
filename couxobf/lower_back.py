@@ -312,6 +312,22 @@ def _const_expr(value: Any) -> A.Expr:
     raise ReconstructionError(f"cannot emit constant {value!r}")
 
 
+def _capture_kind(parent: Any, uv: Any) -> int:
+    """How a virtualized child reaches this upvalue of its parent's.
+
+    ``0`` watches the register live.  ``1`` snapshots it into a cell, because
+    the register belongs to a loop iteration that will move on.  ``2`` reads
+    the register as a cell table, the parent having turned that local into one
+    -- a snapshot would give a closure that *writes* the variable a copy all
+    of its own, and every closure of the same iteration has to share.
+    """
+    if not uv.from_local:
+        return 0
+    if uv.index in parent.cells:
+        return 2
+    return 1 if uv.index in parent.per_iteration else 0
+
+
 class Reconstructor:
     def __init__(self, pool: Any = None, accessor: Optional[str] = None,
                  vm: Any = None, bank: Any = None,
@@ -319,7 +335,8 @@ class Reconstructor:
                  helpers: Optional[Dict[str, str]] = None,
                  native_prefix: str = PREFIX,
                  pool_ticket: Optional[Any] = None,
-                 bank_ticket: Optional[Any] = None) -> None:
+                 bank_ticket: Optional[Any] = None,
+                 pool_resolver: Optional[Any] = None) -> None:
         """``pool`` is a :class:`~couxobf.constpool.ConstantPool`.
 
         When one is supplied, no literal reaches the output: every constant is
@@ -330,6 +347,12 @@ class Reconstructor:
         ``vm`` is an optional :class:`~couxobf.vm.wiring.VMPlan`.  Prototypes it
         selects are encoded to bytecode and replaced by a closure that enters
         the interpreter; everything else is reconstructed natively as usual.
+
+        ``pool_resolver`` splits the pool by prototype (R6): given a prototype
+        id it returns ``(pool, accessor_name, ticket_function)``, so each VM
+        group's constants are interned into that group's own sealed region
+        instead of one shared blob.  Without one, every constant goes to
+        ``pool``.
         """
         self.parents: Dict[int, Optional[FuncIR]] = {}
         self.by_id: Dict[int, FuncIR] = {}
@@ -338,6 +361,11 @@ class Reconstructor:
         self.snapshots: Dict[Tuple[int, int], str] = {}
         self.pool = pool
         self.accessor = accessor
+        #: Optional ``proto_id -> (pool, accessor, ticket)``.  A build with one
+        #: pool leaves it None and every read goes through ``self.pool``; a
+        #: build with per-group regions uses it to keep one group's constants
+        #: out of another group's blob.
+        self.pool_resolver = pool_resolver
         #: Slot numbers are not passed to the runtime directly.  The pool
         #: accessor receives a per-build ticket and decodes it locally, so a dump
         #: of call-site constants is not an index over the decrypted table.
@@ -377,6 +405,13 @@ class Reconstructor:
         #: exactly-one-satisfiable invariant symbolically; production never
         #: looks at it.
         self.split_log: List[Dict[str, Any]] = []
+        # State fold per counter variable, for the drivers that keep the
+        # counter encoded.  Keyed by the counter's own name rather than held
+        # as one field because a nested prototype is lowered in the middle of
+        # its parent's arms: a single slot would come back from the child
+        # cleared, and the parent's remaining transitions would then write raw
+        # block ids into a counter whose arms compare images of them.
+        self._pc_enc: Dict[str, Any] = {}
         if (pool is None) != (accessor is None):
             raise ReconstructionError("pool and accessor must be given together")
 
@@ -396,6 +431,54 @@ class Reconstructor:
             params.append(A.Param(name=None))
         return A.Func(params=params, body=A.Block(body=self._proto_body(proto)))
 
+    def _vm_encode(self, proto: FuncIR) -> bool:
+        """Encode ``proto`` for the VM.  True when its bytecode now exists.
+
+        Split out of :meth:`_vm_closure` because R5's third increment needs the
+        encoding without the stub: a virtualized prototype's children are never
+        visited by the native reconstruction -- the parent's body is encoded,
+        not printed -- so nothing else would ever produce their bytecode, and
+        the interpreter would build an entry stub for a row that is not there.
+
+        Children first, then the parent: if a child cannot be encoded, the
+        parent falls back to native and no rows have been written for a tree
+        that will not run in the VM.
+        """
+        from .vm import encode as _encode
+
+        if proto.proto_id in self.vm_encoded:
+            return True
+        # The plan, not a default: which group owns this prototype decides the
+        # opcode map, the instruction format *and* the interpreter that will run
+        # it.  Asking those three questions separately is how a build ends up
+        # executing bytes encoded for a different machine -- and eligibility has
+        # to be judged against the format in play, because a wide operand that
+        # fits a three-byte field does not fit a two-byte one.
+        fmt = self.vm.fmt_for(proto.proto_id)
+        ok, _reason = _encode.can_virtualize(
+            proto, fmt, upvalues_ok=self.vm.upvalues_ok,
+            closures_ok=self.vm.closures_ok)
+        if not ok:
+            return False
+        if proto.children and self.vm.closures_ok:
+            for child in proto.children:
+                # A child left native cannot be built by a CLOSURE arm -- the
+                # interpreter has no function value to hand out -- so the whole
+                # subtree stays native instead of half of it.
+                if not self.vm.selects(child) or not self._vm_encode(child):
+                    return False
+        order = None
+        if self.vm.permute_blocks and self.vm.layout_rng is not None:
+            from .vm import layout as _layout
+            order = _layout.permuted_order(proto, self.vm.layout_rng)
+        self.vm_encoded[proto.proto_id] = _encode.encode_proto(
+            proto, self.vm.opmap_for(proto.proto_id), order=order, fmt=fmt,
+            rng=self.vm_layout_rng,
+            alias_chance=self.vm.alias_chance,
+            upvalues_ok=self.vm.upvalues_ok,
+            closures_ok=self.vm.closures_ok)
+        return True
+
     def _vm_closure(self, proto: FuncIR) -> Optional[A.Func]:
         """Encode ``proto`` and return the Luau closure that runs it.
 
@@ -405,29 +488,8 @@ class Reconstructor:
         was made; this second check is cheap insurance against the plan and the
         encoder disagreeing.
         """
-        from .vm import encode as _encode
-
-        # The plan, not a default: which group owns this prototype decides the
-        # opcode map, the instruction format *and* the interpreter that will run
-        # it.  Asking those three questions separately is how a build ends up
-        # executing bytes encoded for a different machine -- and eligibility has
-        # to be judged against the format in play, because a wide operand that
-        # fits a three-byte field does not fit a two-byte one.
-        group = self.vm.group_for(proto.proto_id)
-        fmt = self.vm.fmt_for(proto.proto_id)
-        ok, _reason = _encode.can_virtualize(
-            proto, fmt, upvalues_ok=self.vm.upvalues_ok)
-        if not ok:
+        if not self._vm_encode(proto):
             return None
-        order = None
-        if self.vm.permute_blocks and self.vm.layout_rng is not None:
-            from .vm import layout as _layout
-            order = _layout.permuted_order(proto, self.vm.layout_rng)
-        self.vm_encoded[proto.proto_id] = _encode.encode_proto(
-            proto, self.vm.opmap_for(proto.proto_id), order=order, fmt=fmt,
-            rng=self.vm_layout_rng,
-            alias_chance=self.vm.alias_chance,
-            upvalues_ok=self.vm.upvalues_ok)
         # A vararg parameter list, not the prototype's declared parameters:
         # the descriptor carries the real count and the interpreter distributes
         # the arguments itself.  From the caller's side this is an ordinary
@@ -439,6 +501,16 @@ class Reconstructor:
         # virtualised function would be ignored.  `_gf` is an upvalue rather
         # than a global lookup, because a swapped environment does not contain
         # getfenv either.
+        #
+        # A prototype that captures nothing does not need any of that: its stub
+        # was built once in the prelude and this site only names it.  Sharing
+        # it is not an optimisation -- Luau's own compiler hoists a closure
+        # that captures nothing, so a function declared inside a loop is one
+        # value across every iteration, and a stub rebuilt per execution would
+        # answer `f == f` differently from the unprotected program.
+        if not proto.upvalues:
+            return A.Index(obj=A.Name(name=self.vm.names["stubs"]),
+                           key=_num(self.vm.row_key(proto.proto_id)))
         # `enter_for` is this prototype's *group's* entry point, and the row it
         # is handed comes out of the assembled descriptor table.  Naming the
         # interpreter in the closure rather than storing "which VM" in the
@@ -497,6 +569,32 @@ class Reconstructor:
     def _pc_name(self, proto_id: int) -> str:
         return f"{self.native_prefix}c{proto_id}"
 
+    def driver_shape_counts(self) -> Dict[str, Any]:
+        """How many flattened drivers this build emitted, by the shape they drew.
+
+        The driver's shape is drawn per function, so the count exists to show
+        that it varied: a build whose drivers are all one shape carries one
+        signature, however the constants were drawn.
+        """
+        out: Dict[str, Any] = {"total": 0, "state": {}, "skeleton": {},
+                              "dispatch": {}, "shuffled": 0}
+        for log in self.split_log:
+            out["total"] += 1
+            for key in ("state", "skeleton", "dispatch"):
+                value = log[key]
+                out[key][value] = out[key].get(value, 0) + 1
+            if log["shuffled"]:
+                out["shuffled"] += 1
+        return out
+
+    def _sel_name(self, proto_id: int) -> str:
+        """The hoisted dispatch selector of a prototype's flattened driver.
+
+        Only the binary-search driver uses one; it needs somewhere to keep the
+        encoded state instead of recomputing it at every node.
+        """
+        return f"{self.native_prefix}s{proto_id}"
+
     def _param_name(self, proto_id: int, i: int) -> str:
         return f"{self.native_prefix}p{proto_id}_{i}"
 
@@ -511,13 +609,27 @@ class Reconstructor:
         local copy would silently break ``SETUPVAL``.
         """
         snap = self.snapshots.get((proto.proto_id, i))
-        if snap is not None:
-            return _name(snap)
         desc = proto.upvalues[i]
         par = self.parents.get(proto.proto_id)
         if par is None:
             raise ReconstructionError(
                 f"upvalue {i} of {proto.name} has no enclosing prototype")
+        home_pid, home_reg = self._upvalue_home(proto, i)
+        if home_reg in self.by_id[home_pid].cells:
+            # A cell: the table is the variable, and the variable is its
+            # field.  Dereferencing is what makes a write through the closure
+            # land in the cell every closure of this iteration shares, rather
+            # than in a copy of it, and what makes a read see the current
+            # value instead of the one the register held when the closure was
+            # built.  The chain is walked to the owning prototype because that
+            # is whose register the field belongs to, whatever depth the
+            # capture started at -- and a snapshot local, where there is one,
+            # is already the iteration's own table.
+            held = (_name(snap) if snap is not None
+                    else self._reg(self.by_id[home_pid], home_reg))
+            return A.Index(obj=held, key=_num(1))
+        if snap is not None:
+            return _name(snap)
         if desc.from_local:
             return self._reg(par, desc.index)
         return self._upvalue_expr(par, desc.index)
@@ -530,12 +642,20 @@ class Reconstructor:
             return (par.proto_id, desc.index)
         return self._upvalue_home(par, desc.index)
 
+    def _pool_trio(self, proto_id: int):
+        """The (pool, accessor, ticket) a prototype's constants belong to."""
+        if self.pool_resolver is not None:
+            trio = self.pool_resolver(proto_id)
+            if trio is not None:
+                return trio
+        return (self.pool, self.accessor, self.pool_ticket)
+
     def _operand(self, proto: FuncIR, op: Any) -> A.Expr:
         if isinstance(op, Reg):
             return self._reg(proto, op.index)
         if isinstance(op, Kon):
             if self.pool is not None:
-                return self._pool_ref(proto.consts[op.index])
+                return self._pool_ref(proto, proto.consts[op.index])
             return _const_expr(proto.consts[op.index])
         if isinstance(op, Up):
             return self._upvalue_expr(proto, op.index)
@@ -553,12 +673,18 @@ class Reconstructor:
             ticket = self.bank.ticket(value)
             return A.Call(fn=_name(self.bank_accessor),
                           args=[_num(self.bank_ticket(ticket))])
-        return self._pool_ref(value)
+        return self._pool_ref(proto, value)
 
-    def _pool_ref(self, value: Any) -> A.Expr:
-        """A runtime read of one pooled constant."""
-        slot = self.pool.slot(value)
-        return A.Call(fn=_name(self.accessor), args=[_num(self.pool_ticket(slot))])
+    def _pool_ref(self, proto: FuncIR, value: Any) -> A.Expr:
+        """A runtime read of one pooled constant.
+
+        Which pool it is interned into depends on the prototype: with R6's
+        per-group regions, a group's constants live in that group's blob and
+        are read back through that group's accessor.
+        """
+        pool, accessor, ticket = self._pool_trio(proto.proto_id)
+        slot = pool.slot(value)
+        return A.Call(fn=_name(accessor), args=[_num(ticket(slot))])
 
     def _global_expr(self, proto: FuncIR, k: Kon) -> A.Expr:
         """The expression naming a global.
@@ -599,34 +725,67 @@ class Reconstructor:
             stmts.append(A.Assign(targets=[self._reg(proto, i)],
                                   values=[_name(self._param_name(pid, i))]))
         pc = self._pc_name(pid)
-        stmts.append(A.Local(names=[_local_name(pc)], values=[_num(proto.entry)]))
+        pc_local = A.Local(names=[_local_name(pc)], values=[_num(proto.entry)])
+        stmts.append(pc_local)
         if len(proto.blocks) == 1:
             stmts.extend(self._block_body(proto, proto.blocks[0], pc))
             return stmts
 
-        # The native flattened driver varies per function: some blocks use an
-        # affine image of the state, some a shifted image, and single-block
-        # functions above bypass the driver entirely.  That keeps reconstructed
-        # native code from becoming one giant repeated state-machine signature.
+        # The native flattened driver varies per function, and not only in its
+        # constants.  A single shape -- `while pc do if (pc*mul+salt)%65536 ==
+        # ... end end` -- repeated on every flattened function is one enormous
+        # signature no matter how the numbers are drawn, so four independent
+        # choices are drawn here:
+        #
+        #   state     raw     the counter holds the block id and every arm
+        #                     recomputes an affine image of it
+        #             encoded the counter holds the image directly, so the
+        #                     dispatcher compares a plain local and no
+        #                     encoding expression is ever emitted
+        #   skeleton  the loop that drives it: a condition on the counter, an
+        #             infinite loop exited by `break`, or a repeat/until
+        #   dispatch  a flat equality chain or a binary search over the
+        #             encoded states
+        #   order     the arms in block order or shuffled
+        #
+        # All of them are semantically identical: the encoding is a bijection
+        # of the block ids, so exactly one arm can match any counter the
+        # driver can hold, which is the same invariant the decoy arms below
+        # trade on.
+        enc_modes = 5
         salt = 0
         mul = 1
         modulus = 65536
         mode = 0
-        if self.vm_layout_rng is not None:
+        state = "raw"
+        skeleton = "while"
+        dispatch = "chain"
+        shuffled = False
+        lay = self.vm_layout_rng
+        if lay is not None:
             try:
-                salt = 17 + self.vm_layout_rng.randbelow(60000)
-                mul = 3 + 2 * self.vm_layout_rng.randbelow(20000)
-                mode = self.vm_layout_rng.randbelow(3)
+                salt = 17 + lay.randbelow(60000)
+                mul = 3 + 2 * lay.randbelow(20000)
+                mode = lay.randbelow(enc_modes)
+                state = ("raw", "encoded")[lay.randbelow(2)]
+                skeleton = ("while", "while_break", "repeat")[lay.randbelow(3)]
+                dispatch = ("chain", "binary")[lay.randbelow(2)]
+                shuffled = lay.randbelow(2) == 1
             except AttributeError:
                 salt = 0
                 mul = 1
                 mode = 0
+                state = "raw"
+                skeleton = "while"
+                dispatch = "chain"
+                shuffled = False
+                lay = None
 
         # The state encoding, split into its two halves so the real arms and
         # the split-arm decoys cannot drift apart: ``enc_of`` is the value a
         # block's id maps to, ``enc_expr`` a fresh copy of the left-hand
-        # side (two arms must never share an AST node).  All three forms are
-        # bijections of the state -- mul is drawn odd against a power-of-two
+        # side (two arms must never share an AST node).  Every form is a
+        # bijection of the state -- mul is drawn odd against a power-of-two
         # modulus -- so a value outside the image of the block ids is
         # provably unreachable, which is what the decoy arms below trade on.
         def enc_of(block_id: int) -> int:
@@ -634,6 +793,10 @@ class Reconstructor:
                 return (block_id - salt) % modulus
             if mode == 2:
                 return (((block_id + salt) * mul) + (salt % 251)) % modulus
+            if mode == 3:
+                return ((block_id * mul) % modulus) + salt
+            if mode == 4:
+                return ((block_id + salt) * mul) % modulus
             return ((block_id * mul) + salt) % modulus
 
         def enc_expr() -> A.Expr:
@@ -647,6 +810,16 @@ class Reconstructor:
                                         left=A.Bin(op="*", left=A.Bin(op="+", left=_name(pc), right=_num(salt)), right=_num(mul)),
                                         right=_num(salt % 251)),
                              right=_num(modulus))
+            if mode == 3:
+                return A.Bin(op="+",
+                             left=A.Bin(op="%",
+                                        left=A.Bin(op="*", left=_name(pc), right=_num(mul)),
+                                        right=_num(modulus)),
+                             right=_num(salt))
+            if mode == 4:
+                return A.Bin(op="%",
+                             left=A.Bin(op="*", left=A.Bin(op="+", left=_name(pc), right=_num(salt)), right=_num(mul)),
+                             right=_num(modulus))
             return A.Bin(
                 op="%",
                 left=A.Bin(op="+",
@@ -655,18 +828,45 @@ class Reconstructor:
                 right=_num(modulus),
             )
 
+        # Encoded state writes the image into the counter itself, so every
+        # transition -- jumps, fallthrough, loop back-edges -- has to go
+        # through the same fold the arms were built with.
+        if state == "encoded":
+            self._pc_enc[pc] = enc_of
+            pc_local.values = [_num(enc_of(proto.entry))]
+        else:
+            self._pc_enc.pop(pc, None)
+
+        # What the arms select on.  Encoded state compares the counter
+        # directly; raw state compares an image of it, hoisted into a local
+        # when the binary search would otherwise recompute it at every node.
+        sel_name = self._sel_name(pid)
+        pre: List[A.Stmt] = []
+        if state == "encoded":
+            selector = lambda: _name(pc)  # noqa: E731
+        elif dispatch == "binary":
+            # Hoisted, but *inside* the driver: the counter moves on every
+            # iteration, so a selector computed once before the loop would
+            # dispatch the first block forever.
+            pre.append(A.Local(names=[_local_name(sel_name)],
+                               values=[enc_expr()]))
+            selector = lambda: _name(sel_name)  # noqa: E731
+        else:
+            selector = enc_expr
+
         encoded = {enc_of(b.id) for b in proto.blocks}
         rate = float(self.split_arms_rate)
-        draw = self.vm_layout_rng if (rate > 0 and self.vm_layout_rng is not None) else None
-        arms: List[Tuple[A.Expr, A.Block]] = []
+        draw = lay if (rate > 0 and lay is not None) else None
+        # (encoded state, body) pairs.  Decoy arms are entries like any other
+        # -- they sort into the dispatcher by value and simply never match.
+        entries: List[Tuple[int, List[A.Stmt]]] = []
         decoys: List[Tuple[int, int, int]] = []
         for b in proto.blocks:
             body = self._block_body(proto, b, pc)
-            cond = A.Bin(op="==", left=enc_expr(), right=_num(enc_of(b.id)))
-            arms.append((cond, A.Block(body=body)))
-            # R2's native-side split arm: an ``elseif`` whose encoded state
-            # no reachable pc can take (pc is only ever set to a block id,
-            # and the decoy value is outside the encoding's image of them),
+            entries.append((enc_of(b.id), body))
+            # R2's native-side split arm: an arm whose encoded state no
+            # reachable pc can take (pc is only ever set to a block id, and
+            # the decoy value is outside the encoding's image of them),
             # carrying a copy of the real block's tail assignments.  There is
             # no dead branch -- only a branch the build can prove unreachable
             # but a reader cannot without solving the flattened CFG.  The
@@ -682,30 +882,96 @@ class Reconstructor:
                     continue            # a pathological block table; skip
                 tail_n = min(len(body), 1 + draw.randbelow(3))
                 tail = copy.deepcopy(body[-tail_n:])
-                arms.append((A.Bin(op="==", left=enc_expr(), right=_num(v)),
-                             A.Block(body=tail)))
+                entries.append((v, tail))
                 decoys.append((b.id, v, tail_n))
                 self.split_arms_emitted += 1
+        if shuffled and lay is not None and len(entries) > 1:
+            for i in range(len(entries) - 1, 0, -1):
+                j = lay.randbelow(i + 1)
+                entries[i], entries[j] = entries[j], entries[i]
         self.split_log.append({
             "proto": proto.proto_id,
             "mode": mode,
             "salt": salt,
             "mul": mul,
             "modulus": modulus,
+            "state": state,
+            "skeleton": skeleton,
+            "dispatch": dispatch,
+            "shuffled": shuffled,
             "block_ids": [b.id for b in proto.blocks],
             "encoded": [enc_of(b.id) for b in proto.blocks],
             "decoys": decoys,
         })
-        stmts.append(A.While(
-            cond=_name(pc),
-            body=A.Block(body=[A.If(arms=arms,
-                                    otherwise=A.Block(body=[
-                                        A.Assign(targets=[_name(pc)],
-                                                 values=[A.Nil()])]))])))
+
+        # How the driver stops: by clearing the counter, or by leaving an
+        # infinite loop.  Reached only by states outside the image, which the
+        # build can prove unreachable and a reader cannot.
+        if skeleton == "while_break":
+            stop: A.Stmt = A.Break()
+        else:
+            stop = A.Assign(targets=[_name(pc)], values=[A.Nil()])
+
+        if dispatch == "binary":
+            ordered = sorted(entries, key=lambda e: e[0])
+
+            def node(items: List[Tuple[int, List[A.Stmt]]],
+                     tail: Optional[A.Stmt] = None) -> A.Stmt:
+                """A balanced search over the encoded states.
+
+                ``tail`` is threaded down the right-hand spine, where it
+                lands as the outermost ``else``: states above every encoded
+                value, which the build knows are unreachable.
+                """
+                if len(items) == 1:
+                    v, body = items[0]
+                    return A.If(arms=[(A.Bin(op="==", left=selector(),
+                                             right=_num(v)),
+                                       A.Block(body=body))],
+                                otherwise=(A.Block(body=[tail])
+                                           if tail is not None else None))
+                if len(items) == 2:
+                    return A.If(
+                        arms=[(A.Bin(op="==", left=selector(),
+                                     right=_num(items[0][0])),
+                               A.Block(body=items[0][1])),
+                              (A.Bin(op="==", left=selector(),
+                                     right=_num(items[1][0])),
+                               A.Block(body=items[1][1]))],
+                        otherwise=(A.Block(body=[tail])
+                                   if tail is not None else None))
+                mid = len(items) // 2
+                return A.If(
+                    arms=[(A.Bin(op="<", left=selector(),
+                                 right=_num(items[mid][0])),
+                           A.Block(body=[node(items[:mid])]))],
+                    otherwise=A.Block(body=[node(items[mid:], tail)]))
+
+            driver = node(ordered, stop)
+        else:
+            driver = A.If(
+                arms=[(A.Bin(op="==", left=selector(), right=_num(v)),
+                       A.Block(body=body)) for v, body in entries],
+                otherwise=A.Block(body=[stop]))
+
+        if skeleton == "repeat":
+            stmts.append(A.Repeat(body=A.Block(body=pre + [driver]),
+                                  cond=A.Bin(op="==", left=_name(pc),
+                                             right=A.Nil())))
+        elif skeleton == "while_break":
+            stmts.append(A.While(cond=A.Bool(value=True),
+                                 body=A.Block(body=pre + [driver])))
+        else:
+            stmts.append(A.While(cond=_name(pc),
+                                 body=A.Block(body=pre + [driver])))
         return stmts
 
     def _set_pc(self, pc: str, target: int) -> A.Assign:
-        return A.Assign(targets=[_name(pc)], values=[_num(target)])
+        # Encoded-state drivers hold an image of the block id, so the fold is
+        # applied here and the counter never carries a bare block id at all.
+        fold = self._pc_enc.get(pc)
+        value = target if fold is None else fold(target)
+        return A.Assign(targets=[_name(pc)], values=[_num(value)])
 
     def _block_body(self, proto: FuncIR, b, pc: str) -> List[A.Stmt]:
         out: List[A.Stmt] = []
@@ -791,15 +1057,29 @@ class Reconstructor:
             snaps: List[Tuple[str, A.Expr]] = []
             for i in range(len(child.upvalues)):
                 home_pid, home_reg = self._upvalue_home(child, i)
-                if home_reg in self.by_id[home_pid].per_iteration:
+                home_proto = self.by_id[home_pid]
+                if (home_reg in home_proto.per_iteration
+                        or home_reg in home_proto.cells):
                     # Luau gives every loop iteration its own variable, so a
                     # closure built inside the body captures that iteration's
-                    # value.  Reading the shared register later would report
-                    # the final one instead, so capture through a local that is
+                    # one.  Reading the shared register later would report the
+                    # final one instead, so capture through a local that is
                     # fresh each time this block runs.
+                    #
+                    # What the local holds is the difference between the two
+                    # cases, and it is the register's own shape that decides:
+                    # a per-iteration value is copied into a private cell,
+                    # while a cell *is* the iteration's variable, so the local
+                    # takes the table itself and every closure of the
+                    # iteration ends up sharing it.
                     nm = f"{PREFIX}U{child.proto_id}_{i}"
                     self.snapshots[(child.proto_id, i)] = nm
-                    snaps.append((nm, self._reg(self.by_id[home_pid], home_reg)))
+                    # A cell is caught *as itself*: the table is the
+                    # iteration's variable, so a closure of this iteration
+                    # shares it with every other one.  Anything else is a
+                    # copy, because a value type in a Luau local already is
+                    # one and the register will move on.
+                    snaps.append((nm, self._reg(home_proto, home_reg)))
             fn = self.function_expr(child)
             self.snapshots = saved
             assign = self._assign(proto, a[0], fn)
@@ -996,6 +1276,7 @@ def reconstruct_protected(module: IRModule,
                           alias_ratio: float = 0.0,
                           alias_chance: float = 0.0,
                           vm_upvalues: bool = False,
+                          vm_closures: bool = False,
                           env_guard: int = 0,
                           dump_guard: int = 0,
                           guard_policy: str = "fail",
@@ -1020,7 +1301,8 @@ def reconstruct_protected(module: IRModule,
     from . import parser as _parser
     from .constpool import ConstantPool
     from .emit import printer as _printer
-    from .runtime.constpool_runtime import ConstantPoolRuntime, default_names
+    from .runtime.constpool_runtime import (ConstantPoolRuntime, default_names,
+                                            default_names as _pool_default_names)
 
     prefixes: Set[str] = set()
     # Its own prefix again: the guard's locals are the one part of the artifact
@@ -1045,13 +1327,18 @@ def reconstruct_protected(module: IRModule,
         _optimize.optimize_module(module)
     crypto_enc_domain = rng.bytes(24)
     crypto_mac_domain = rng.bytes(24)
-    pool = ConstantPool(keys, rng, context,
-                        cache_policy=cache_policy, cache_bound=cache_bound,
-                        decoys=pool_decoys,
-                        constant_level=constant_level,
-                        numeric_level=numeric_level,
-                        enc_domain=crypto_enc_domain,
-                        mac_domain=crypto_mac_domain)
+    # Which stream cipher this build uses, and the stream its emitted shape is
+    # drawn from.  Forked rather than taken off the main stream so adding or
+    # removing a draw elsewhere cannot move every later decision in the build.
+    from .crypto import cipher as _cipher_mod
+    cipher_rng = rng.fork("cipher") if hasattr(rng, "fork") else rng
+    shape_rng = rng.fork("crypto-shape") if hasattr(rng, "fork") else rng
+    cipher_spec = _cipher_mod.draw(cipher_rng)
+    if names_out is not None:
+        names_out["cipher"] = cipher_spec.summary()
+    # The pools are built below, once the plan (and therefore the grouping) is
+    # known: R6 gives each VM group its own sealed region, so the pool that
+    # holds a constant depends on which group the prototype belongs to.
 
     # Selected after optimization, so prototypes the optimizer shrank below the
     # size floor are not virtualized on the strength of code that no longer
@@ -1089,8 +1376,12 @@ def reconstruct_protected(module: IRModule,
                                  # "which opcodes does this function need" is a
                                  # question about its instructions, not about any
                                  # of the names the config has.
+                                 # Grouping a closure with its parent (and the
+                                 # per-group opcode subset folding in children)
+                                 # both need the IR objects, not just the ids.
                                  protos_by_id=({q.proto_id: q for q in module.protos}
-                                                if isa_subset else None),
+                                                if (isa_subset or vm_closures)
+                                                else None),
                                  isa_subset=bool(isa_subset),
                                  # R5's second increment: whether upvalue-capturing
                                  # prototypes may ride the VM.  The eligibility and
@@ -1098,6 +1389,10 @@ def reconstruct_protected(module: IRModule,
                                  # by the selector; this only tells the stub whether
                                  # to hand ``enter`` an accessor list.
                                  upvalues_ok=bool(vm_upvalues),
+                                 # R5's third increment: whether a prototype
+                                 # that creates closures may ride the VM, and
+                                 # whether its children have to come with it.
+                                 closures_ok=bool(vm_closures),
                                  # wiring indexes this positionally as
                                  # (append, iter, iterpack, itercheck); passing
                                  # the dict would hand it the role *keys*.
@@ -1111,6 +1406,10 @@ def reconstruct_protected(module: IRModule,
         # plan, so nothing gets digested, and the report must not read that as "the
         # user declined".
         names_out["fingerprint_requested"] = 1 if fingerprint else 0
+    # Both are needed below whether or not a plan exists: the pools are built
+    # after this point and each is bound to whatever format reads it.
+    digest = b""
+    bound = False
     if plan is not None and fingerprint:
         from .vm.wiring import structural_fingerprint
         digest = structural_fingerprint(plan)
@@ -1122,12 +1421,6 @@ def reconstruct_protected(module: IRModule,
         # `--vm-family` change a program with no VM in it.  The digest is still
         # reported, because it is true; it just authenticates nothing.
         bound = bool(plan.protos)
-        if bound:
-            # The pool is not sealed yet -- interning happens during lowering and
-            # sealing at emit -- so the digest can still bind to it.  Tagged so a
-            # context that happens to end in eight bytes of its own cannot read as
-            # one that was extended here.
-            pool.context = context + _FINGERPRINT_AAD_TAG + digest
         if names_out is not None:
             names_out["fingerprint"] = digest.hex()
             names_out["fingerprint_bound"] = 1 if bound else 0
@@ -1151,7 +1444,8 @@ def reconstruct_protected(module: IRModule,
                           context, page_size=string_page_size,
                           randomized_ids=True,
                           enc_domain=crypto_enc_domain,
-                          mac_domain=crypto_mac_domain)
+                          mac_domain=crypto_mac_domain,
+                          cipher=cipher_spec)
         # Its own prefix, drawn from the string stream: sharing the constant
         # pool's prefix would make the two runtimes recognisable as a pair.
         bank_names = bank_default_names(
@@ -1160,11 +1454,94 @@ def reconstruct_protected(module: IRModule,
         if names_out is not None:
             names_out["bank"] = dict(bank_names)
 
+    # ---- constant pool regions (R6) --------------------------------------
+    #
+    # One sealed region per VM group, plus one for everything that stayed
+    # native.  Recovering one accessor used to yield every constant in the
+    # program; now it yields the constants that reach *this* region, and a
+    # blob lifted from one group does not open in another because each is
+    # authenticated against its own interpreter's format.
+    #
+    # A build that virtualized nothing has one region, which is what it had
+    # before -- the split costs nothing until there is something to split by.
+    regions: List[Dict[str, Any]] = []
+
+    def _add_region(tag: str, region_context: bytes, label: str,
+                    pool_names: Optional[Any] = None) -> None:
+        prng = rng.fork("pool:" + tag) if hasattr(rng, "fork") else rng
+        region_pool = ConstantPool(
+            keys, prng, region_context,
+            cache_policy=cache_policy, cache_bound=cache_bound,
+            decoys=pool_decoys, constant_level=constant_level,
+            numeric_level=numeric_level,
+            enc_domain=crypto_enc_domain, mac_domain=crypto_mac_domain,
+            cipher=cipher_spec)
+        mask = (ticket_rng.u32() if hasattr(ticket_rng, "u32")
+                else 0x5A17C0DE) & 0xffffffff
+        if mask == 0:
+            mask = 0x5A17C0DE
+        # The decoder's shape is drawn too, so two regions are not the same
+        # runtime with the names changed.
+        shape = {}
+        for key, allowed in ConstantPoolRuntime.SHAPES.items():
+            shape[key] = allowed[prng.randbelow(len(allowed))]
+        regions.append({
+            "label": label,
+            "pool": region_pool,
+            "shape": shape,
+            # Its own prefix and its own ticket mask: two regions sharing
+            # either would be recognisable as one runtime twice.
+            # The native region keeps the names the build already drew for
+            # the pool, which is what callers (and the report) have always
+            # been handed as `names_out["pool"]`; every other region gets its
+            # own prefix so two regions are not visibly one runtime twice.
+            "names": pool_names if pool_names is not None
+                     else _pool_default_names(fresh_prefix(rng, prefixes)),
+            "mask": mask,
+            "ticket": (lambda slot, m=mask: (int(slot) ^ m) & 0xffffffff),
+            "protos": set(),
+        })
+
     ticket_rng = rng.fork("pool-ticket") if hasattr(rng, "fork") else rng
-    pool_ticket_mask = (ticket_rng.u32() if hasattr(ticket_rng, "u32") else 0x5A17C0DE) & 0xffffffff
-    if pool_ticket_mask == 0:
-        pool_ticket_mask = 0x5A17C0DE
-    pool_ticket = lambda slot: (int(slot) ^ pool_ticket_mask) & 0xffffffff
+
+    from .vm.wiring import group_fingerprint as _group_fingerprint
+    native_context = context
+    if bound:
+        # The native region carries the whole plan's digest, which is what it
+        # was bound to before the split.  Tagged so a context that happens to
+        # end in eight bytes of its own cannot read as one that was extended.
+        native_context = context + _FINGERPRINT_AAD_TAG + digest
+    _add_region("native", native_context, "native", pool_names=names)
+    # Splitting costs a whole runtime per region -- roughly 5 KB on a small
+    # example -- and the size ceiling buys it by giving up the split arms,
+    # control-flow flattening and the edge indirection instead.  One group has
+    # nothing to keep apart from itself, so the split waits until there are
+    # two: below that, every constant sharing one accessor is the better trade.
+    split_regions = plan is not None and len(plan.groups) > 1
+    for group in (plan.groups if split_regions else ()):
+        # Bound to this group's own format, always: a group's constants are
+        # read by that group's interpreter, so the format that has to agree
+        # is that one.  Binding to the whole-plan digest instead would let a
+        # blob from group 0 open under group 1 inside the same artifact.
+        _add_region("vm%d" % group.index,
+                    context + _FINGERPRINT_AAD_TAG + _group_fingerprint(group),
+                    "vm group %d" % group.index)
+        regions[-1]["protos"] = set(group.protos)
+    native = regions[0]
+    pool = native["pool"]
+
+    def _region_for(proto_id: int):
+        for region in regions[1:]:
+            if proto_id in region["protos"]:
+                return region
+        return native
+
+    def _pool_resolver(proto_id: int):
+        region = _region_for(proto_id)
+        return (region["pool"], region["names"]["get"], region["ticket"])
+
+    pool_ticket_mask = native["mask"]
+    pool_ticket = native["ticket"]
     bank_ticket_rng = ((string_rng if string_rng is not None else rng).fork("bank-ticket")
                        if hasattr(string_rng if string_rng is not None else rng, "fork")
                        else ticket_rng)
@@ -1179,7 +1556,9 @@ def reconstruct_protected(module: IRModule,
                         helpers=helper_map,
                         native_prefix=fresh_prefix(rng, prefixes),
                         pool_ticket=pool_ticket,
-                        bank_ticket=bank_ticket)
+                        bank_ticket=bank_ticket,
+                        pool_resolver=(_pool_resolver if split_regions
+                                       else None))
     rec.vm_layout_rng = layout_rng if layout_rng is not None else vm_rng
     # R2's native-side split arms ride the same honesty wire as the VM's
     # predicate tap: `opaque_predicates` is the switch, and the
@@ -1195,6 +1574,7 @@ def reconstruct_protected(module: IRModule,
     # off, which the report then says.
     if names_out is not None:
         names_out["split_arms"] = rec.split_arms_emitted
+        names_out["driver_shapes"] = rec.driver_shape_counts()
 
     # The VM's bytecode and constants are interned here, before the pool is
     # sealed below.  Doing it after would hand out slot numbers the encrypted
@@ -1216,21 +1596,55 @@ def reconstruct_protected(module: IRModule,
                     if group.describes(pid)}
             if mine:
                 _validate_payload(mine, group.opmap, group.fmt)
-        pooled = lambda value: "%s(%d)" % (names["get"], pool_ticket(pool.slot(value)))
+        def pooled(value, pid=None):
+            # A prototype's bytecode and constants belong to the region that
+            # serves it, so the interpreter in group 1 reads group 1's blob.
+            region = _region_for(pid) if pid is not None else native
+            return "%s(%d)" % (region["names"]["get"],
+                               region["ticket"](region["pool"].slot(value)))
+
+        # Prototypes whose stub has to be built where the closure is created
+        # rather than once in the prelude: the ones that capture, whose
+        # accessors close over the enclosing scope's own storage.
+        per_site = {pid for pid in rec.vm_encoded
+                    if rec.by_id[pid].upvalues} if plan.upvalues_ok else set()
+        # R5's fourth increment: how a capturing child reaches what it
+        # captures.  Only children of a virtualized parent are described here
+        # -- a child of a *native* parent gets its stub, accessors and all,
+        # emitted at the closure site, which is the path R5 built first.  The
+        # distinction is which side of the boundary owns the storage: a native
+        # parent's locals are real Luau locals, and a virtualized one's live in
+        # a frame only the interpreter can see.
+        capture_desc: Dict[int, Any] = {}
+        if plan.closures_ok and plan.upvalues_ok:
+            for pid in rec.vm_encoded:
+                parent = rec.by_id[pid]
+                for child in parent.children:
+                    if not child.upvalues or child.proto_id not in rec.vm_encoded:
+                        continue
+                    capture_desc[child.proto_id] = [
+                        (uv.from_local, uv.index,
+                         _capture_kind(parent, uv))
+                        for uv in child.upvalues]
         vm_src = _wiring.prelude_source(plan, rec.vm_encoded, pooled, pooled,
                                         edges_expr=pooled,
                                         entry_guard=guard.entry_lines(),
-                                        opaque_predicates=bool(opaque_predicates))
+                                        opaque_predicates=bool(opaque_predicates),
+                                        per_site=per_site,
+                                        caps=capture_desc)
 
-    # A program with no constants at all needs no pool: emitting the runtime
-    # for an empty blob would just be a decoder that never runs.
-    need_pool = len(pool) > 0
+    # A region with no constants in it needs no runtime: emitting one would
+    # just be a decoder that never runs.  A build that virtualized nothing has
+    # exactly one region, so this is the old single-pool case.
+    live = [region for region in regions if len(region["pool"]) > 0]
+    need_pool = bool(live)
     need_bank = bank is not None and len(bank) > 0
 
-    # One crypto module for both, when both exist.  The module is ~8KB; two
-    # copies would be two decoders to find and two places to drift.
+    # One crypto module for every sealed structure in the artifact.  The
+    # module is ~8KB; a copy per region would be several decoders to find and
+    # several places to drift.
     crypto_src = ""
-    if need_pool and need_bank:
+    if len(live) + (1 if need_bank else 0) > 1:
         from .runtime.luau_crypto import crypto_runtime
         crypto_src = ("local %s = (function()\n%s end)()\n" % (
             names["crypto"],
@@ -1238,7 +1652,8 @@ def reconstruct_protected(module: IRModule,
                             "mac": names["c_mac"], "open": names["c_open"],
                             "seal": names["c_seal"]},
                            enc_domain=crypto_enc_domain,
-                           mac_domain=crypto_mac_domain)))
+                           mac_domain=crypto_mac_domain,
+                           cipher=cipher_spec, rng=shape_rng)))
 
     runtime_guard_check = ""
 
@@ -1247,14 +1662,16 @@ def reconstruct_protected(module: IRModule,
     # and base85 saves ~2.75 source chars per sealed byte against the
     # printer's decimal escapes, so below the threshold hex is the smaller
     # spelling and dense would be pure overhead.
-    sealed = pool.seal() if need_pool else None
+    for region in live:
+        region["sealed"] = region["pool"].seal()
     bank_sealed = bank.seal() if need_bank else None
     dense_codec = None
     dense_skipped = ""
     if blob_encoding == "dense" and (need_pool or need_bank):
         blob_bytes = 0
-        if sealed is not None:
-            blob_bytes += len(sealed.ciphertext) + len(sealed.aad) + 64
+        for region in live:
+            blob_bytes += (len(region["sealed"].ciphertext)
+                           + len(region["sealed"].aad) + 64)
         if bank_sealed is not None:
             blob_bytes += (len(bank_sealed.blob) + len(bank_sealed.ticket_ct)
                            + 64)
@@ -1265,24 +1682,59 @@ def reconstruct_protected(module: IRModule,
         else:
             dense_skipped = "dense-skipped:%d" % blob_bytes
 
-    pool_src = ""
+    pool_srcs: List[str] = []
     if need_pool:
         if names_out is not None:
-            # Read here rather than where the pool was built: constants are
-            # interned while the bodies are lowered, and the decoys are planted as
-            # they go, so any earlier count is a count of a pool that does not
-            # exist yet.
-            names_out["pool_decoys"] = pool.decoys_planted
-        runtime = ConstantPoolRuntime(names, cache_policy=cache_policy,
-                                      cache_bound=cache_bound)
-        pool_src = runtime.emit(sealed.key, sealed.nonce, sealed.tag,
-                                sealed.ciphertext, sealed.aad,
-                                emit_crypto=not crypto_src,
-                                guard_check=runtime_guard_check,
-                                ticket_mask=pool_ticket_mask,
-                                enc_domain=sealed.enc_domain,
-                                mac_domain=sealed.mac_domain,
-                                dense=dense_codec)
+            # Read here rather than where the pools were built: constants are
+            # interned while the bodies are lowered, and the decoys are
+            # planted as they go, so any earlier count is a count of a pool
+            # that does not exist yet.
+            names_out["pool_decoys"] = sum(r["pool"].decoys_planted
+                                           for r in regions)
+            # The AAD is not a secret -- it is a literal in the emitted
+            # artifact -- and reporting it is what makes the claim below
+            # checkable: two regions with the same AAD would be one region
+            # with two names.
+            names_out["pool_regions"] = [
+                {"label": r["label"], "entries": len(r["pool"]),
+                 "protos": len(r["protos"]),
+                 "aad": r["sealed"].aad.hex(),
+                 "get": r["names"]["get"],
+                 "shape": "/".join(r["shape"][k] for k in sorted(r["shape"]))}
+                for r in live]
+            # "The pool" is now several.  Callers that look for one -- a
+            # validator finding the meta table, a test editing the blob --
+            # get the region that actually carries this program's constants,
+            # which is the first live one rather than the native one: a
+            # program that is entirely virtualized has an empty native
+            # region, and a name that is not in the output at all is worse
+            # than no name.
+            names_out["pool"] = dict(live[0]["names"])
+        for region in live:
+            sealed = region["sealed"]
+            rn = dict(region["names"])
+            if crypto_src:
+                # The shared module exports the *first* region's field names,
+                # so every other region has to call it by those.  Keeping its
+                # own would compile fine and then fail at the first decrypt
+                # with "attempt to call a nil value", because the field simply
+                # is not there.
+                rn["crypto"] = names["crypto"]
+                for role in ("c_xor", "c_sha", "c_mac", "c_open", "c_seal"):
+                    rn[role] = names[role]
+            runtime = ConstantPoolRuntime(rn, cache_policy=cache_policy,
+                                          cache_bound=cache_bound)
+            pool_srcs.append(runtime.emit(
+                sealed.key, sealed.nonce, sealed.tag,
+                sealed.ciphertext, sealed.aad,
+                emit_crypto=not crypto_src,
+                guard_check=runtime_guard_check,
+                ticket_mask=region["mask"],
+                enc_domain=sealed.enc_domain,
+                mac_domain=sealed.mac_domain,
+                dense=dense_codec,
+                cipher=cipher_spec, shape_rng=shape_rng,
+                shape=region["shape"]))
 
     bank_src = ""
     if need_bank:
@@ -1309,10 +1761,13 @@ def reconstruct_protected(module: IRModule,
                             "mac": bn["c_mac"], "open": bn["c_open"],
                             "seal": bn["c_seal"]},
                            enc_domain=crypto_enc_domain,
-                           mac_domain=crypto_mac_domain) if not crypto_src else "",
+                           mac_domain=crypto_mac_domain,
+                           cipher=cipher_spec, rng=shape_rng) if not crypto_src else "",
             guard_check=runtime_guard_check,
             ticket_mask=bank_ticket_mask,
-            dense=dense_codec)
+            dense=dense_codec,
+            block_size=cipher_spec.block_size,
+            cipher=cipher_spec, shape_rng=shape_rng)
 
     dense_src = dense_codec.source(rng) if dense_codec is not None else ""
     if names_out is not None:
@@ -1324,7 +1779,8 @@ def reconstruct_protected(module: IRModule,
             names_out["blob_encoding"] = "hex"
     crypto_block = _parser.parse(crypto_src, "<crypto>") if crypto_src else None
     dense_block = _parser.parse(dense_src, "<dense>") if dense_src else None
-    pool_block = _parser.parse(pool_src, "<constpool>") if pool_src else None
+    pool_blocks = [_parser.parse(src, "<constpool:" + region["label"] + ">")
+                   for src, region in zip(pool_srcs, live)]
     bank_block = _parser.parse(bank_src, "<stringbank>") if bank_src else None
     # The helper functions have to be in scope too; a loop or a multi-value
     # call anywhere in the body refers to them.
@@ -1340,8 +1796,8 @@ def reconstruct_protected(module: IRModule,
     # a ParseError whose line number points into source nobody wrote.
     vm_block = _parser.parse(vm_src, "<vm>") if vm_src else None
 
-    blocks = [b for b in (crypto_block, dense_block, pool_block, bank_block,
-                          helpers, vm_block) if b is not None]
+    blocks = [b for b in ([crypto_block, dense_block] + pool_blocks +
+                          [bank_block, helpers, vm_block]) if b is not None]
     captured: Dict[str, str] = {}
     if guard.active and blocks:
         # The capture set is decided *here*, once the emitted scaffolding exists:
@@ -1384,7 +1840,10 @@ def reconstruct_protected(module: IRModule,
         "guard": _guard_stmts(),
         "crypto": list(crypto_block.body) if crypto_block is not None else [],
         "dense": list(dense_block.body) if dense_block is not None else [],
-        "pool": list(pool_block.body) if pool_block is not None else [],
+        # Every region's runtime, in emission order: they are independent
+        # sealed structures, so the only ordering that matters is that each
+        # one's accessor exists before the code that calls it.
+        "pool": [stmt for block in pool_blocks for stmt in block.body],
         "bank": list(bank_block.body) if bank_block is not None else [],
         "helpers": list(helpers.body),
         "vm": list(vm_block.body) if vm_block is not None else [],
